@@ -12,9 +12,12 @@ crate-type = ["cdylib"]
 napi        = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "3"
 
-# async-рантайм и HTTP-стек (пока только объявлены — задействуются в M1)
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+# async-рантайм и HTTP-стек
+tokio          = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+hyper          = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util     = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes          = "1"
 
 [build-dependencies]
 napi-build = "2"
