@@ -1,19 +1,31 @@
 #![deny(clippy::all)]
 
-//! `@oxide/http` — нативный аддон (napi-rs). См. DESIGN.md / IMPLEMENTATION.md.
+//! `@oxide/http` — нативный аддон (napi-rs). Публичный JS-API живёт в обёртке
+//! `js/index.js`; здесь — низкоуровневый `RustServer`. См. DESIGN.md / IMPLEMENTATION.md.
 
 mod bridge;
+mod router;
 mod server;
 
 use std::sync::{Arc, Mutex};
 
-use napi::bindgen_prelude::Function;
+use napi::bindgen_prelude::{Function, Promise};
 use napi::Result;
 use napi_derive::napi;
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 
-use crate::bridge::{Handler, JsRequest, JsResponse};
+use crate::bridge::{Handler, JsResponse, MatchedRequest};
+use crate::router::{RouteDef as RRouteDef, Routes};
+use crate::server::{serve, Shared};
+
+/// Определение маршрута из JS-обёртки (path уже склеен с baseUrl/групповым префиксом).
+#[napi(object)]
+pub struct RouteDef {
+    pub method: String,
+    pub path: String,
+    pub leaf_id: i32,
+}
 
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
 struct Running {
@@ -21,39 +33,52 @@ struct Running {
     shutdown: Arc<Notify>,
 }
 
-/// Публичный класс сервера. На M1 — минимальный: `listen(port, handler)` / `close()`.
+/// Низкоуровневый сервер. Оборачивается JS-классом `Server`.
 #[napi]
-pub struct Server {
+pub struct RustServer {
     state: Mutex<Option<Running>>,
 }
 
 #[napi]
-impl Server {
+impl RustServer {
     #[napi(constructor)]
     #[allow(clippy::new_without_default)] // конструктор экспортируется в JS
     pub fn new() -> Self {
-        Server {
+        RustServer {
             state: Mutex::new(None),
         }
     }
 
-    /// Поднять HTTP/1.1 на `port`. Каждый запрос уходит в `handler`.
+    /// Поднять HTTP/1.1 на `host:port` с таблицей маршрутов.
     ///
-    /// Неблокирующий: собственный tokio-рантайм крутит accept-цикл в фоне,
-    /// JS event loop свободен. `handler: (req) => Promise<res>`.
+    /// Роутинг/`404`/`405`/авто-`OPTIONS` — в Rust; попадание в лист зовёт
+    /// `dispatch(req) => Promise<res>`. Неблокирующий (accept-цикл в фоне).
     #[napi]
     pub fn listen(
         &self,
         port: u16,
-        handler: Function<JsRequest, napi::bindgen_prelude::Promise<JsResponse>>,
+        host: String,
+        routes: Vec<RouteDef>,
+        has_not_found: bool,
+        dispatch: Function<MatchedRequest, Promise<JsResponse>>,
     ) -> Result<()> {
+        // Компилируем деревья ДО bind: конфликты/невалидные паттерны → ранняя ошибка.
+        let route_defs = routes
+            .into_iter()
+            .map(|r| RRouteDef {
+                method: r.method,
+                path: r.path,
+                leaf_id: r.leaf_id,
+            })
+            .collect();
+        let routes = Routes::build(route_defs).map_err(napi::Error::from_reason)?;
+
         // TSFN строим синхронно, пока JS-функция жива; дальше она 'static + Send.
-        let tsfn: Handler = handler.build_threadsafe_function().build()?;
-        let tsfn = Arc::new(tsfn);
+        let tsfn: Handler = dispatch.build_threadsafe_function().build()?;
 
         // Слушаем сокет синхронно → ошибки bind (EADDRINUSE и т.п.) отдаём сразу.
-        let std_listener = std::net::TcpListener::bind(("0.0.0.0", port))
-            .map_err(|e| napi::Error::from_reason(format!("bind {port}: {e}")))?;
+        let std_listener = std::net::TcpListener::bind((host.as_str(), port))
+            .map_err(|e| napi::Error::from_reason(format!("bind {host}:{port}: {e}")))?;
         std_listener
             .set_nonblocking(true)
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -63,10 +88,15 @@ impl Server {
             .build()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
+        let shared = Arc::new(Shared {
+            tsfn,
+            routes,
+            has_not_found,
+        });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();
         runtime.spawn(async move {
-            server::serve(std_listener, tsfn, sd).await;
+            serve(std_listener, shared, sd).await;
         });
 
         *self.state.lock().unwrap() = Some(Running { runtime, shutdown });

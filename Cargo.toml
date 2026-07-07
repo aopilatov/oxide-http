@@ -19,6 +19,10 @@ hyper-util     = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes          = "1"
 
+# роутинг + парсинг query
+matchit         = "0.8"
+form_urlencoded = "1"
+
 [build-dependencies]
 napi-build = "2"
 
