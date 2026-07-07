@@ -236,7 +236,7 @@ function buildContext(
   const text = async () => Buffer.from(await arrayBuffer()).toString('utf8');
   const parseBody = async () => Object.fromEntries(new URLSearchParams(await text()));
 
-  const res = { status: undefined, headers: new ResHeaders() };
+  const res = { status: undefined, headers: new ResHeaders(), sent: false };
   // request-id пробрасываем в ответ по умолчанию (§6d B2).
   res.headers.set(requestIdHeader, nreq.id);
 
@@ -257,6 +257,7 @@ function buildContext(
       ips: nreq.ips,
       country: nreq.country ?? undefined,
       id: nreq.id,
+      signal: undefined, // AbortSignal (таймаут/дисконнект) — ставит диспетчер
       cookie: (name) => (cookies ??= parseCookies(reqHeaders.get('cookie')))[name],
       // тело
       get stream() {
@@ -274,10 +275,13 @@ function buildContext(
       },
     },
     res,
+    aborted: false, // true при дисконнекте/таймауте
+    error: undefined, // последняя ошибка (для onError и «после»-хуков)
     _bodyIo: bodyIo,
     _body: undefined,
     _stream: undefined,
     _finalized: false,
+    _settled: false, // ответ уже зафиксирован → мутаторы игнорируются
     log: makeLogger(nreq.id),
 
     // store между middleware/хендлером
@@ -290,59 +294,76 @@ function buildContext(
       return this._store.get(k);
     },
 
-    // мутаторы ответа
+    // мутаторы ответа (после фиксации ответа — no-op: защита от гонки таймаута)
     status(n) {
-      res.status = n;
+      if (!this._settled) res.status = n;
       return this;
     },
     header(k, v) {
-      res.headers.set(k, v);
+      if (!this._settled) res.headers.set(k, v);
       return this;
     },
     cookie(name, value, opts) {
-      res.headers.append('set-cookie', serializeCookie(name, value, opts));
+      if (!this._settled) res.headers.append('set-cookie', serializeCookie(name, value, opts));
       return this;
     },
 
     // финализирующие хелперы
     json(v, status) {
+      if (this._settled) return this;
       res.headers.set('content-type', CT_JSON);
       this._body = JSON.stringify(v);
+      this._stream = undefined;
       if (status != null) res.status = status;
       this._finalized = true;
       return this;
     },
     text(v, status) {
+      if (this._settled) return this;
       res.headers.set('content-type', CT_TEXT);
       this._body = String(v);
+      this._stream = undefined;
       if (status != null) res.status = status;
       this._finalized = true;
       return this;
     },
     body(data, status) {
+      if (this._settled) return this;
       if (status != null) res.status = status;
       if (isStreamSource(data)) {
         this._stream = data; // Buffer/ReadableStream/AsyncIterable → стрим ответа
+        this._body = undefined;
       } else {
         this._body = data == null ? undefined : String(data);
+        this._stream = undefined;
       }
       this._finalized = true;
       return this;
+    },
+    redirect(location, status = 302) {
+      return this.status(status).header('location', location).body('');
+    },
+    notFound() {
+      return this.text('Not Found', 404);
     },
   };
 
   return c;
 }
 
-/** Свести контекст + возврат хендлера к нативному JsResponse. */
-function finalizeResponse(c, returnValue) {
-  // Возврат-значение как сахар (если хелпер не вызван и вернули не сам c).
+/** Применить возврат-значение хендлера как сахар (string→text, stream→body, else json). */
+function applyReturnValue(c, returnValue) {
   if (!c._finalized && returnValue != null && returnValue !== c) {
     if (typeof returnValue === 'string') c.text(returnValue);
     else if (isStreamSource(returnValue)) c.body(returnValue);
     else c.json(returnValue);
   }
+}
 
+/** Свести контекст к нативному JsResponse (запускает pump для стрим-тела). */
+function buildNativeResponse(c) {
+  c._settled = true;
+  c.res.sent = true;
   const status = c.res.status ?? 200;
   if (c._stream != null) {
     startResponsePump(c._bodyIo, c._stream);
@@ -353,7 +374,8 @@ function finalizeResponse(c, returnValue) {
 
 module.exports = {
   buildContext,
-  finalizeResponse,
+  applyReturnValue,
+  buildNativeResponse,
   HttpError,
   ResHeaders,
   serializeCookie,
