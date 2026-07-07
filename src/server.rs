@@ -1,7 +1,8 @@
 //! tokio + hyper: accept-цикл и обслуживание запроса (HTTP/1.1).
 //!
-//! На M4: тело запроса читается в канал (backpressure JS→Rust), тело ответа
-//! может стримиться через канальный `Body` (backpressure Rust→JS). См. stream.rs.
+//! Края в Rust (§6a): CORS preflight и body-limit обрываются до пробуждения JS.
+//! Тело запроса читается в канал (backpressure JS→Rust), тело ответа может
+//! стримиться через канальный `Body` (backpressure Rust→JS). См. stream.rs / cors.rs.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -20,6 +21,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Notify;
 
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
+use crate::cors::Cors;
 use crate::router::Routes;
 use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
 
@@ -36,6 +38,8 @@ pub struct Shared {
     pub request_id_header: String,
     /// Жёсткий лимит тела запроса в байтах (авторитетный, в Rust). None = без лимита.
     pub body_limit: Option<u64>,
+    /// Нативный CORS (края луковицы). None = выключен.
+    pub cors: Option<Cors>,
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
@@ -83,23 +87,43 @@ struct ReqData {
     headers: Vec<KvPair>,
 }
 
-/// Один запрос: роутинг в Rust → (JS-диспетчер | статический ответ Rust).
+/// Один запрос. Края в Rust (CORS preflight, body-limit) → роутинг/диспетч →
+/// навешивание CORS-заголовков на итоговый ответ.
 async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) -> Response<ResBody> {
     let (parts, incoming) = req.into_parts();
     let method = parts.method.as_str().to_uppercase();
-    let path = parts.uri.path().to_string();
-    let query_string = parts.uri.query().map(|s| s.to_string());
+    let origin = header_str(&parts.headers, "origin");
+
+    // CORS preflight на краю: OPTIONS + Access-Control-Request-Method →
+    // отвечаем в Rust, НЕ будя JS (§6a). Запрещённый origin → 403.
+    if let Some(cors) = &shared.cors {
+        let is_preflight =
+            method == "OPTIONS" && parts.headers.contains_key("access-control-request-method");
+        if is_preflight {
+            let req_headers = header_str(&parts.headers, "access-control-request-headers");
+            return match cors.preflight(origin.as_deref(), req_headers.as_deref()) {
+                Some(headers) => pairs_response(204, headers),
+                None => status_text(403, "Forbidden"),
+            };
+        }
+    }
 
     // Ранний отказ: заявленный Content-Length уже больше лимита → 413 сразу,
     // не читая тело (защита от DoS до пробуждения JS). Авторитетная проверка —
     // по фактическим байтам в read_body_task (Content-Length может лгать/отсутствовать).
     if let (Some(limit), Some(cl)) = (shared.body_limit, content_length(&parts.headers)) {
         if cl > limit {
-            return status_text(413, "Payload Too Large");
+            return apply_cors(
+                &shared,
+                origin.as_deref(),
+                status_text(413, "Payload Too Large"),
+            );
         }
     }
 
     let has_body = request_has_body(&parts.headers);
+    let path = parts.uri.path().to_string();
+    let query_string = parts.uri.query().map(|s| s.to_string());
     let data = ReqData {
         query: parse_query(query_string.as_deref()),
         headers: collect_headers(&parts.headers),
@@ -108,10 +132,22 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
         query_string,
     };
 
+    let response = route_and_dispatch(&shared, &peer_ip, data, incoming, has_body).await;
+    apply_cors(&shared, origin.as_deref(), response)
+}
+
+/// Роутинг + диспетч в JS (без CORS — им оборачивает `handle`).
+async fn route_and_dispatch(
+    shared: &Arc<Shared>,
+    peer_ip: &str,
+    data: ReqData,
+    incoming: Incoming,
+    has_body: bool,
+) -> Response<ResBody> {
     // 1. Прямой матч (метод-специфичное дерево или ALL).
     if let Some(m) = shared.routes.match_route(&data.method, &data.path) {
         return dispatch(
-            &shared, &peer_ip, m.leaf_id, data, m.params, false, incoming, has_body,
+            shared, peer_ip, m.leaf_id, data, m.params, false, incoming, has_body,
         )
         .await;
     }
@@ -120,7 +156,7 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
     if data.method == "HEAD" {
         if let Some(m) = shared.routes.match_route("GET", &data.path) {
             return dispatch(
-                &shared, &peer_ip, m.leaf_id, data, m.params, true, incoming, has_body,
+                shared, peer_ip, m.leaf_id, data, m.params, true, incoming, has_body,
             )
             .await;
         }
@@ -132,8 +168,8 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
     if allowed.is_empty() {
         if shared.has_not_found {
             return dispatch(
-                &shared,
-                &peer_ip,
+                shared,
+                peer_ip,
                 -1,
                 data,
                 HashMap::new(),
@@ -159,6 +195,43 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
         Response::builder().status(405).header("allow", allow),
         full("Method Not Allowed"),
     )
+}
+
+/// Навесить CORS-заголовки обычного ответа (если origin разрешён).
+fn apply_cors(
+    shared: &Shared,
+    origin: Option<&str>,
+    mut response: Response<ResBody>,
+) -> Response<ResBody> {
+    if let Some(cors) = &shared.cors {
+        let headers = response.headers_mut();
+        for (k, v) in cors.actual(origin) {
+            if let (Ok(name), Ok(value)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(&v),
+            ) {
+                headers.append(name, value);
+            }
+        }
+    }
+    response
+}
+
+/// Значение заголовка как строка (первый, если несколько).
+fn header_str(headers: &hyper::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Ответ из статуса + пар заголовков (для CORS preflight).
+fn pairs_response(status: u16, headers: Vec<(String, String)>) -> Response<ResBody> {
+    let mut builder = Response::builder().status(status);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    builder_or_500(builder, empty())
 }
 
 /// Позвать JS-диспетчер, дождаться `Promise`, собрать HTTP-ответ.

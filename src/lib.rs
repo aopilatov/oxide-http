@@ -4,6 +4,7 @@
 //! `js/index.js`; здесь — низкоуровневый `RustServer`. См. DESIGN.md / IMPLEMENTATION.md.
 
 mod bridge;
+mod cors;
 mod router;
 mod server;
 mod stream;
@@ -17,9 +18,21 @@ use tokio::runtime::Runtime;
 use tokio::sync::Notify;
 
 use crate::bridge::{Handler, JsResponse, MatchedRequest};
+use crate::cors::{Cors, CorsOptions as RCorsOptions};
 use crate::router::{RouteDef as RRouteDef, Routes};
 use crate::server::{serve, Shared};
 use crate::stream::BodyIo;
+
+/// Опции CORS с JS-стороны (нормализованы обёрткой). Отсутствие = CORS выключен.
+#[napi(object)]
+pub struct CorsOptions {
+    pub origins: Vec<String>,
+    pub methods: Vec<String>,
+    pub allowed_headers: Option<Vec<String>>,
+    pub exposed_headers: Option<Vec<String>>,
+    pub credentials: bool,
+    pub max_age: Option<i64>,
+}
 
 /// Определение маршрута из JS-обёртки (path уже склеен с baseUrl/групповым префиксом).
 #[napi(object)]
@@ -37,6 +50,8 @@ pub struct ListenOptions {
     pub request_id_header: Option<String>,
     /// Жёсткий лимит тела запроса в байтах (авторитетно в Rust). null/отсутствие = без лимита.
     pub body_limit: Option<i64>,
+    /// Нативный CORS. null/отсутствие = выключен.
+    pub cors: Option<CorsOptions>,
 }
 
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
@@ -111,6 +126,16 @@ impl RustServer {
                 .request_id_header
                 .unwrap_or_else(|| "x-request-id".to_string()),
             body_limit: options.body_limit.filter(|&n| n >= 0).map(|n| n as u64),
+            cors: options.cors.map(|o| {
+                Cors::new(RCorsOptions {
+                    origins: o.origins,
+                    methods: o.methods,
+                    allowed_headers: o.allowed_headers,
+                    exposed_headers: o.exposed_headers,
+                    credentials: o.credentials,
+                    max_age: o.max_age,
+                })
+            }),
         });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();
