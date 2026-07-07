@@ -11,6 +11,8 @@ use napi::threadsafe_function::ThreadsafeFunction;
 use napi::Status;
 use napi_derive::napi;
 
+use crate::stream::BodyIo;
+
 /// Пара ключ-значение (для query, где ключи могут повторяться).
 #[napi(object)]
 pub struct KvPair {
@@ -41,22 +43,24 @@ pub struct MatchedRequest {
 /// Ответ, который JS-хендлер возвращает (в составе `Promise`).
 ///
 /// `headers` — упорядоченные пары с допуском повторов (несколько `set-cookie`).
-/// Тело на M3 — строка; `Buffer`/стримы придут на M4.
+/// `streamed = true` → тело идёт через `BodyIo::write` (канальный `Body`),
+/// поле `body` игнорируется. Иначе тело — строка `body`.
 #[napi(object)]
 pub struct JsResponse {
     pub status: Option<u16>,
     pub headers: Option<Vec<KvPair>>,
     pub body: Option<String>,
+    pub streamed: Option<bool>,
 }
 
-/// TSFN-обёртка над JS-диспетчером: `(req) => Promise<res>`.
+/// TSFN-обёртка над JS-диспетчером: `(req, bodyIo) => Promise<res>`.
 ///
 /// Вызывается из любого tokio-потока; `call_async` возвращает `Promise`,
 /// который мы `await`-им как Rust-`Future` (без блокировки потока).
 pub type Handler = ThreadsafeFunction<
-    MatchedRequest,      // T: данные в call_async
-    Promise<JsResponse>, // Return: что возвращает JS (Promise)
-    MatchedRequest,      // CallJsBackArgs: аргумент JS-функции
-    Status,              // ErrorStatus
-    false,               // CalleeHandled: ошибки обрабатываем сами (call_async(value: T))
+    (MatchedRequest, BodyIo), // T: данные в call_async
+    Promise<JsResponse>,      // Return: что возвращает JS (Promise)
+    (MatchedRequest, BodyIo), // CallJsBackArgs: аргументы JS-функции
+    Status,                   // ErrorStatus
+    false,                    // CalleeHandled: ошибки обрабатываем сами
 >;

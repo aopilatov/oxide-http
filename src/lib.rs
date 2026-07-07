@@ -6,6 +6,7 @@
 mod bridge;
 mod router;
 mod server;
+mod stream;
 
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +19,7 @@ use tokio::sync::Notify;
 use crate::bridge::{Handler, JsResponse, MatchedRequest};
 use crate::router::{RouteDef as RRouteDef, Routes};
 use crate::server::{serve, Shared};
+use crate::stream::BodyIo;
 
 /// Определение маршрута из JS-обёртки (path уже склеен с baseUrl/групповым префиксом).
 #[napi(object)]
@@ -69,7 +71,7 @@ impl RustServer {
         routes: Vec<RouteDef>,
         has_not_found: bool,
         options: ListenOptions,
-        dispatch: Function<MatchedRequest, Promise<JsResponse>>,
+        dispatch: Function<(MatchedRequest, BodyIo), Promise<JsResponse>>,
     ) -> Result<()> {
         // Компилируем деревья ДО bind: конфликты/невалидные паттерны → ранняя ошибка.
         let route_defs = routes

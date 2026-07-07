@@ -2,6 +2,91 @@
 
 // Контекст `c` (§7) и финализация ответа. Заголовки — lowercase; `Set-Cookie`
 // отдаётся отдельными строками; возврат значения из хендлера — сахар над c.json.
+// Тело запроса/ответа — стриминг через BodyIo с backpressure (§9).
+
+const zlib = require('node:zlib');
+
+/** Ошибка с HTTP-статусом (перехватывается диспетчером → отдаётся клиенту). */
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+    this.name = 'HttpError';
+  }
+}
+
+const toBuffer = (chunk) =>
+  Buffer.isBuffer(chunk) ? chunk : typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
+
+/** Прочитать всё тело запроса из BodyIo (backpressure per-chunk) с лимитом. */
+async function collectRaw(bodyIo, limit) {
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const chunk = await bodyIo.read();
+    if (chunk == null) break;
+    total += chunk.length;
+    if (limit != null && total > limit) throw new HttpError(413, 'Payload Too Large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Распаковать тело по Content-Encoding (§B5), лимит — на распакованный размер. */
+function decompress(buf, encoding, limit) {
+  const enc = (encoding || '').trim().toLowerCase();
+  if (!enc || enc === 'identity') return buf;
+  const opts = limit != null ? { maxOutputLength: limit } : {};
+  try {
+    if (enc === 'gzip') return zlib.gunzipSync(buf, opts);
+    if (enc === 'deflate') return zlib.inflateSync(buf, opts);
+    if (enc === 'br') return zlib.brotliDecompressSync(buf, opts);
+    return buf; // неизвестная кодировка — не трогаем
+  } catch (e) {
+    if (e && (e.code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength|too large/i.test(String(e.message)))) {
+      throw new HttpError(413, 'Payload Too Large');
+    }
+    throw new HttpError(400, 'Invalid compressed body');
+  }
+}
+
+/** Web ReadableStream над телом запроса (pull → bodyIo.read). */
+function makeReqStream(bodyIo) {
+  return new ReadableStream({
+    async pull(controller) {
+      const chunk = await bodyIo.read();
+      if (chunk == null) controller.close();
+      else controller.enqueue(new Uint8Array(chunk));
+    },
+  });
+}
+
+/** Прокачать источник (Buffer|ReadableStream|AsyncIterable) в BodyIo с backpressure. */
+function startResponsePump(bodyIo, source) {
+  (async () => {
+    try {
+      if (Buffer.isBuffer(source) || source instanceof Uint8Array) {
+        await bodyIo.write(toBuffer(source));
+      } else if (typeof source?.getReader === 'function') {
+        const reader = source.getReader();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value != null) await bodyIo.write(toBuffer(value));
+        }
+      } else if (source?.[Symbol.asyncIterator]) {
+        for await (const chunk of source) if (chunk != null) await bodyIo.write(toBuffer(chunk));
+      }
+    } catch {
+      // producer/соединение оборвались — просто закрываем тело.
+    } finally {
+      bodyIo.endWrite();
+    }
+  })();
+}
+
+const isStreamSource = (v) =>
+  Buffer.isBuffer(v) || v instanceof Uint8Array || typeof v?.getReader === 'function' || v?.[Symbol.asyncIterator] != null;
 
 /** Заголовки ответа: lowercase, set/append, несколько значений (set-cookie). */
 class ResHeaders {
@@ -94,7 +179,11 @@ const CT_JSON = 'application/json; charset=utf-8';
 const CT_TEXT = 'text/plain; charset=utf-8';
 
 /** Построить контекст `c` из нативного запроса. */
-function buildContext(nreq, { baseUrl = '', requestIdHeader = 'x-request-id' } = {}) {
+function buildContext(
+  nreq,
+  bodyIo,
+  { baseUrl = '', requestIdHeader = 'x-request-id', bodyLimit } = {},
+) {
   const reqHeaders = buildReqHeaders(nreq.headers);
 
   const rawPath = nreq.path;
@@ -109,6 +198,24 @@ function buildContext(nreq, { baseUrl = '', requestIdHeader = 'x-request-id' } =
   }
 
   let cookies;
+
+  // --- тело запроса (стриминг + буферизация с лимитом/декомпрессией) ---
+  let bodyUsed = false;
+  const useBody = () => {
+    if (bodyUsed) throw new Error('тело запроса уже прочитано');
+    bodyUsed = true;
+  };
+  const readBuffered = async () => {
+    const raw = await collectRaw(bodyIo, bodyLimit);
+    return decompress(raw, reqHeaders.get('content-encoding'), bodyLimit);
+  };
+  const arrayBuffer = async () => {
+    useBody();
+    const buf = await readBuffered();
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  };
+  const text = async () => Buffer.from(await arrayBuffer()).toString('utf8');
+  const parseBody = async () => Object.fromEntries(new URLSearchParams(await text()));
 
   const res = { status: undefined, headers: new ResHeaders() };
   // request-id пробрасываем в ответ по умолчанию (§6d B2).
@@ -132,9 +239,25 @@ function buildContext(nreq, { baseUrl = '', requestIdHeader = 'x-request-id' } =
       country: nreq.country ?? undefined,
       id: nreq.id,
       cookie: (name) => (cookies ??= parseCookies(reqHeaders.get('cookie')))[name],
+      // тело
+      get stream() {
+        useBody();
+        return makeReqStream(bodyIo);
+      },
+      arrayBuffer,
+      text,
+      json: async () => JSON.parse(await text()),
+      parseBody,
+      formData: async () => {
+        const fd = new FormData();
+        for (const [k, v] of new URLSearchParams(await text())) fd.append(k, v);
+        return fd;
+      },
     },
     res,
+    _bodyIo: bodyIo,
     _body: undefined,
+    _stream: undefined,
     _finalized: false,
     log: makeLogger(nreq.id),
 
@@ -178,8 +301,12 @@ function buildContext(nreq, { baseUrl = '', requestIdHeader = 'x-request-id' } =
       return this;
     },
     body(data, status) {
-      this._body = data == null ? undefined : String(data);
       if (status != null) res.status = status;
+      if (isStreamSource(data)) {
+        this._stream = data; // Buffer/ReadableStream/AsyncIterable → стрим ответа
+      } else {
+        this._body = data == null ? undefined : String(data);
+      }
       this._finalized = true;
       return this;
     },
@@ -193,11 +320,23 @@ function finalizeResponse(c, returnValue) {
   // Возврат-значение как сахар (если хелпер не вызван и вернули не сам c).
   if (!c._finalized && returnValue != null && returnValue !== c) {
     if (typeof returnValue === 'string') c.text(returnValue);
+    else if (isStreamSource(returnValue)) c.body(returnValue);
     else c.json(returnValue);
   }
 
   const status = c.res.status ?? 200;
+  if (c._stream != null) {
+    startResponsePump(c._bodyIo, c._stream);
+    return { status, headers: c.res.headers.toPairs(), streamed: true };
+  }
   return { status, headers: c.res.headers.toPairs(), body: c._body };
 }
 
-module.exports = { buildContext, finalizeResponse, ResHeaders, serializeCookie, parseCookies };
+module.exports = {
+  buildContext,
+  finalizeResponse,
+  HttpError,
+  ResHeaders,
+  serializeCookie,
+  parseCookies,
+};

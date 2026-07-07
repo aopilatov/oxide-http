@@ -9,7 +9,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # napi-мост (N-API 8 baseline: один бинарник на Node 18+)
-napi        = { version = "3", default-features = false, features = ["napi8"] }
+# tokio_rt — рантайм napi для async-методов класса BodyIo (стрим-мост, M4).
+napi        = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3"
 
 # async-рантайм и HTTP-стек
