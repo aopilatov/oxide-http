@@ -21,20 +21,31 @@ pub struct KvPair {
 /// Сматченный запрос, передаваемый в JS-диспетчер (один переход границы/запрос).
 ///
 /// `leaf_id` — индекс листа маршрута в JS-реестре хендлеров; `-1` = notFound.
+/// `path` — полный путь (с baseUrl); обёртка снимает префикс для `c.req.path`.
+/// `ip`/`ips`/`country`/`id` вычислены в Rust (§7, §6d B2).
 #[napi(object)]
 pub struct MatchedRequest {
     pub leaf_id: i32,
     pub method: String,
     pub path: String,
+    pub query_string: Option<String>,
     pub params: HashMap<String, String>,
     pub query: Vec<KvPair>,
+    pub headers: Vec<KvPair>,
+    pub ip: String,
+    pub ips: Vec<String>,
+    pub country: Option<String>,
+    pub id: String,
 }
 
 /// Ответ, который JS-хендлер возвращает (в составе `Promise`).
+///
+/// `headers` — упорядоченные пары с допуском повторов (несколько `set-cookie`).
+/// Тело на M3 — строка; `Buffer`/стримы придут на M4.
 #[napi(object)]
 pub struct JsResponse {
     pub status: Option<u16>,
-    pub headers: Option<HashMap<String, String>>,
+    pub headers: Option<Vec<KvPair>>,
     pub body: Option<String>,
 }
 

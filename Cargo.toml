@@ -23,6 +23,9 @@ bytes          = "1"
 matchit         = "0.8"
 form_urlencoded = "1"
 
+# request-id (UUIDv7)
+uuid = { version = "1", features = ["v7"] }
+
 [build-dependencies]
 napi-build = "2"
 

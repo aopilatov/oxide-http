@@ -27,6 +27,14 @@ pub struct RouteDef {
     pub leaf_id: i32,
 }
 
+/// Опции сервера, влияющие на вычисление контекста в Rust (§4, §7, §6d).
+#[napi(object)]
+pub struct ListenOptions {
+    pub custom_ip_headers: Option<Vec<String>>,
+    pub custom_country_headers: Option<Vec<String>>,
+    pub request_id_header: Option<String>,
+}
+
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
 struct Running {
     runtime: Runtime,
@@ -60,6 +68,7 @@ impl RustServer {
         host: String,
         routes: Vec<RouteDef>,
         has_not_found: bool,
+        options: ListenOptions,
         dispatch: Function<MatchedRequest, Promise<JsResponse>>,
     ) -> Result<()> {
         // Компилируем деревья ДО bind: конфликты/невалидные паттерны → ранняя ошибка.
@@ -92,6 +101,11 @@ impl RustServer {
             tsfn,
             routes,
             has_not_found,
+            custom_ip_headers: options.custom_ip_headers.unwrap_or_default(),
+            custom_country_headers: options.custom_country_headers.unwrap_or_default(),
+            request_id_header: options
+                .request_id_header
+                .unwrap_or_else(|| "x-request-id".to_string()),
         });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();

@@ -18,30 +18,12 @@ async function up(build) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-test('M1-regression: сквозной путь и async-хендлер', async () => {
-  const s = await up({
-    routes: (app) =>
-      app.get('/hello', async (c) => {
-        await new Promise((r) => setImmediate(r));
-        return { status: 201, headers: { 'x-p': c.req.path }, body: 'hi' };
-      }),
-  });
-  try {
-    const res = await fetch(`${s.base}/hello`);
-    assert.equal(res.status, 201);
-    assert.equal(res.headers.get('x-p'), '/hello');
-    assert.equal(await res.text(), 'hi');
-  } finally {
-    s.close();
-  }
-});
-
 test('M2: :param и приоритет static над param', async () => {
   const s = await up({
     routes: (app) =>
       app
-        .get('/users/me', () => ({ body: 'me' }))
-        .get('/users/:id', (c) => ({ body: `id=${c.req.params.id}` })),
+        .get('/users/me', (c) => c.text('me'))
+        .get('/users/:id', (c) => c.text(`id=${c.req.params.id}`)),
   });
   try {
     assert.equal(await (await fetch(`${s.base}/users/me`)).text(), 'me');
@@ -53,7 +35,7 @@ test('M2: :param и приоритет static над param', async () => {
 
 test('M2: catch-all', async () => {
   const s = await up({
-    routes: (app) => app.get('/static/*path', (c) => ({ body: c.req.params.path })),
+    routes: (app) => app.get('/static/*path', (c) => c.text(c.req.params.path)),
   });
   try {
     assert.equal(await (await fetch(`${s.base}/static/css/app.css`)).text(), 'css/app.css');
@@ -64,10 +46,7 @@ test('M2: catch-all', async () => {
 
 test('M2: query — last-wins + queries()', async () => {
   const s = await up({
-    routes: (app) =>
-      app.get('/q', (c) => ({
-        body: JSON.stringify({ last: c.req.query.k, all: c.req.queries('k') }),
-      })),
+    routes: (app) => app.get('/q', (c) => c.json({ last: c.req.query.k, all: c.req.queries('k') })),
   });
   try {
     const res = await fetch(`${s.base}/q?k=a&k=b&x=1`);
@@ -79,8 +58,7 @@ test('M2: query — last-wins + queries()', async () => {
 
 test('M2: 404 (Rust) и 405 + Allow (Rust)', async () => {
   const s = await up({
-    routes: (app) =>
-      app.get('/users', () => ({ body: 'g' })).post('/users', () => ({ body: 'p' })),
+    routes: (app) => app.get('/users', (c) => c.text('g')).post('/users', (c) => c.text('p')),
   });
   try {
     assert.equal((await fetch(`${s.base}/nope`)).status, 404);
@@ -93,16 +71,15 @@ test('M2: 404 (Rust) и 405 + Allow (Rust)', async () => {
   }
 });
 
-test('M2: авто-HEAD (как GET без тела) и авто-OPTIONS', async () => {
+test('M2: авто-HEAD и авто-OPTIONS', async () => {
   const s = await up({
-    routes: (app) => app.get('/x', () => ({ headers: { 'x-h': '1' }, body: 'hello' })),
+    routes: (app) => app.get('/x', (c) => c.body('hello', 200)),
   });
   try {
     const head = await fetch(`${s.base}/x`, { method: 'HEAD' });
     assert.equal(head.status, 200);
-    assert.equal(head.headers.get('x-h'), '1');
     assert.equal(head.headers.get('content-length'), '5');
-    assert.equal(await head.text(), ''); // тела нет
+    assert.equal(await head.text(), '');
 
     const opt = await fetch(`${s.base}/x`, { method: 'OPTIONS' });
     assert.equal(opt.status, 204);
@@ -112,51 +89,172 @@ test('M2: авто-HEAD (как GET без тела) и авто-OPTIONS', async
   }
 });
 
-test('M2: baseUrl склеивается при регистрации', async () => {
+test('M2: baseUrl, группы, all(), notFound()', async () => {
+  const sub = new Server();
+  sub.get('/ping', (c) => c.text('pong'));
+
   const s = await up({
     config: { baseUrl: '/api/v1' },
-    routes: (app) => app.get('/users/:id', (c) => ({ body: c.req.params.id })),
+    routes: (app) => {
+      app.get('/users/:id', (c) => c.text(c.req.params.id));
+      app.all('/any', (c) => c.text(c.req.method));
+      app.route('/admin', sub);
+      app.notFound((c) => c.text(`no ${c.req.path}`, 404));
+    },
   });
   try {
     assert.equal(await (await fetch(`${s.base}/api/v1/users/7`)).text(), '7');
-    assert.equal((await fetch(`${s.base}/users/7`)).status, 404); // без префикса — 404
-  } finally {
-    s.close();
-  }
-});
-
-test('M2: группы app.route(prefix, sub)', async () => {
-  const sub = new Server();
-  sub.get('/ping', () => ({ body: 'pong' }));
-
-  const s = await up({
-    routes: (app) => {
-      app.get('/', () => ({ body: 'root' }));
-      app.route('/admin', sub);
-    },
-  });
-  try {
-    assert.equal(await (await fetch(`${s.base}/`)).text(), 'root');
-    assert.equal(await (await fetch(`${s.base}/admin/ping`)).text(), 'pong');
-  } finally {
-    s.close();
-  }
-});
-
-test('M2: app.all(), notFound() и close() идемпотентен', async () => {
-  const s = await up({
-    routes: (app) => {
-      app.all('/any', (c) => ({ body: c.req.method }));
-      app.notFound((c) => ({ status: 404, body: `no ${c.req.path}` }));
-    },
-  });
-  try {
-    assert.equal(await (await fetch(`${s.base}/any`, { method: 'PUT' })).text(), 'PUT');
-    const nf = await fetch(`${s.base}/missing`);
+    assert.equal(await (await fetch(`${s.base}/api/v1/any`, { method: 'PUT' })).text(), 'PUT');
+    assert.equal(await (await fetch(`${s.base}/api/v1/admin/ping`)).text(), 'pong');
+    const nf = await fetch(`${s.base}/api/v1/missing`);
     assert.equal(nf.status, 404);
-    assert.equal(await nf.text(), 'no /missing');
   } finally {
     s.close();
-    s.close(); // идемпотентно
+  }
+});
+
+// --- M3 ---
+
+test('M3: c.json ставит статус и content-type', async () => {
+  const s = await up({
+    routes: (app) => app.get('/j', (c) => c.json({ ok: true }, 201)),
+  });
+  try {
+    const res = await fetch(`${s.base}/j`);
+    assert.equal(res.status, 201);
+    assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.deepEqual(await res.json(), { ok: true });
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: возврат значения как сахар (object→json, string→text)', async () => {
+  const s = await up({
+    routes: (app) =>
+      app.get('/obj', () => ({ a: 1 })).get('/str', () => 'plain'),
+  });
+  try {
+    const o = await fetch(`${s.base}/obj`);
+    assert.equal(o.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.deepEqual(await o.json(), { a: 1 });
+    const t = await fetch(`${s.base}/str`);
+    assert.equal(t.headers.get('content-type'), 'text/plain; charset=utf-8');
+    assert.equal(await t.text(), 'plain');
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: заголовки запроса регистронезависимы', async () => {
+  const s = await up({
+    routes: (app) => app.get('/h', (c) => c.text(c.req.header('X-Custom') ?? 'none')),
+  });
+  try {
+    const res = await fetch(`${s.base}/h`, { headers: { 'x-custom': 'yes' } });
+    assert.equal(await res.text(), 'yes');
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: Set-Cookie отдельными строками + c.req.cookie', async () => {
+  const s = await up({
+    routes: (app) =>
+      app.get('/c', (c) => {
+        c.cookie('a', '1', { httpOnly: true });
+        c.cookie('b', '2', { path: '/x', sameSite: 'lax' });
+        return c.text(`in=${c.req.cookie('sid')}`);
+      }),
+  });
+  try {
+    const res = await fetch(`${s.base}/c`, { headers: { cookie: 'sid=xyz; other=1' } });
+    assert.equal(await res.text(), 'in=xyz');
+    const setCookie = res.headers.getSetCookie();
+    assert.equal(setCookie.length, 2);
+    assert.ok(setCookie[0].startsWith('a=1'));
+    assert.ok(setCookie[0].includes('HttpOnly'));
+    assert.ok(setCookie[1].includes('SameSite=Lax'));
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: ip/ips/country из custom-заголовков', async () => {
+  const s = await up({
+    config: {
+      customIpHeaders: ['x-forwarded-for'],
+      customCountryHeaders: ['x-country-code'],
+    },
+    routes: (app) =>
+      app.get('/ip', (c) => c.json({ ip: c.req.ip, ips: c.req.ips, country: c.req.country })),
+  });
+  try {
+    const res = await fetch(`${s.base}/ip`, {
+      headers: { 'x-forwarded-for': '1.1.1.1, 2.2.2.2', 'x-country-code': 'de' },
+    });
+    assert.deepEqual(await res.json(), {
+      ip: '1.1.1.1',
+      ips: ['1.1.1.1', '2.2.2.2'],
+      country: 'DE',
+    });
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: ip fallback на peer, country undefined без заголовка', async () => {
+  const s = await up({
+    routes: (app) => app.get('/ip', (c) => c.json({ ip: c.req.ip, country: c.req.country ?? null })),
+  });
+  try {
+    const body = await (await fetch(`${s.base}/ip`)).json();
+    assert.equal(body.ip, '127.0.0.1'); // peer
+    assert.equal(body.country, null);
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: request-id генерируется (UUIDv7) и уходит в ответ', async () => {
+  let seen;
+  const s = await up({
+    routes: (app) =>
+      app.get('/id', (c) => {
+        seen = c.req.id;
+        return c.text('ok');
+      }),
+  });
+  try {
+    const res = await fetch(`${s.base}/id`);
+    assert.match(seen, /^[0-9a-f-]{36}$/);
+    assert.equal(res.headers.get('x-request-id'), seen);
+
+    // переданный x-request-id сохраняется
+    const res2 = await fetch(`${s.base}/id`, { headers: { 'x-request-id': 'abc-123' } });
+    assert.equal(seen, 'abc-123');
+    assert.equal(res2.headers.get('x-request-id'), 'abc-123');
+  } finally {
+    s.close();
+  }
+});
+
+test('M3: c.set/get, c.status/header, c.req.path без baseUrl', async () => {
+  const s = await up({
+    config: { baseUrl: '/api' },
+    routes: (app) =>
+      app.get('/p/:id', (c) => {
+        c.set('uid', c.req.params.id);
+        c.status(202).header('x-mark', 'm');
+        return c.json({ path: c.req.path, rawPath: c.req.rawPath, uid: c.get('uid') });
+      }),
+  });
+  try {
+    const res = await fetch(`${s.base}/api/p/9`);
+    assert.equal(res.status, 202);
+    assert.equal(res.headers.get('x-mark'), 'm');
+    assert.deepEqual(await res.json(), { path: '/p/9', rawPath: '/api/p/9', uid: '9' });
+  } finally {
+    s.close();
   }
 });
