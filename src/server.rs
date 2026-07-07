@@ -21,7 +21,7 @@ use tokio::sync::Notify;
 
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
 use crate::router::Routes;
-use crate::stream::{BodyIo, ChannelBody, BODY_CHANNEL_CAP};
+use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
 
 /// Единый тип тела ответа: буфер (`Full`) либо стрим (`ChannelBody`).
 type ResBody = BoxBody<Bytes, Infallible>;
@@ -34,6 +34,8 @@ pub struct Shared {
     pub custom_ip_headers: Vec<String>,
     pub custom_country_headers: Vec<String>,
     pub request_id_header: String,
+    /// Жёсткий лимит тела запроса в байтах (авторитетный, в Rust). None = без лимита.
+    pub body_limit: Option<u64>,
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
@@ -87,6 +89,16 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
     let method = parts.method.as_str().to_uppercase();
     let path = parts.uri.path().to_string();
     let query_string = parts.uri.query().map(|s| s.to_string());
+
+    // Ранний отказ: заявленный Content-Length уже больше лимита → 413 сразу,
+    // не читая тело (защита от DoS до пробуждения JS). Авторитетная проверка —
+    // по фактическим байтам в read_body_task (Content-Length может лгать/отсутствовать).
+    if let (Some(limit), Some(cl)) = (shared.body_limit, content_length(&parts.headers)) {
+        if cl > limit {
+            return status_text(413, "Payload Too Large");
+        }
+    }
+
     let has_body = request_has_body(&parts.headers);
     let data = ReqData {
         query: parse_query(query_string.as_deref()),
@@ -171,8 +183,8 @@ async fn dispatch(
 
     // Канал тела запроса (только если тело есть) + фоновая задача чтения.
     let req_rx = if has_body {
-        let (tx, rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_CAP);
-        tokio::spawn(read_body_task(incoming, tx));
+        let (tx, rx) = mpsc::channel::<BodyMsg>(BODY_CHANNEL_CAP);
+        tokio::spawn(read_body_task(incoming, tx, shared.body_limit));
         Some(rx)
     } else {
         None
@@ -206,14 +218,33 @@ async fn dispatch(
 }
 
 /// Фоновая задача: читает тело запроса по фреймам → канал (backpressure через cap).
-async fn read_body_task(mut body: Incoming, tx: Sender<Bytes>) {
+///
+/// Авторитетный body-limit: считаем **фактические** байты (не доверяя Content-Length).
+/// При превышении шлём `Overflow` и прекращаем читать сокет — обойти из JS нельзя.
+async fn read_body_task(mut body: Incoming, tx: Sender<BodyMsg>, limit: Option<u64>) {
+    let mut total: u64 = 0;
     while let Some(Ok(frame)) = body.frame().await {
         if let Ok(data) = frame.into_data() {
-            if tx.send(data).await.is_err() {
+            total = total.saturating_add(data.len() as u64);
+            if limit.is_some_and(|lim| total > lim) {
+                let _ = tx.send(BodyMsg::Overflow).await;
+                return; // прекращаем читать тело (защита от DoS)
+            }
+            if tx.send(BodyMsg::Data(data)).await.is_err() {
                 break; // получатель ушёл (JS перестал читать)
             }
         }
     }
+}
+
+/// Значение Content-Length, если валидно.
+fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }
 
 /// Есть ли у запроса тело (content-length>0 или transfer-encoding).
@@ -221,14 +252,7 @@ fn request_has_body(headers: &hyper::HeaderMap) -> bool {
     if headers.contains_key(hyper::header::TRANSFER_ENCODING) {
         return true;
     }
-    match headers.get(hyper::header::CONTENT_LENGTH) {
-        Some(v) => v
-            .to_str()
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .is_some_and(|n| n > 0),
-        None => false,
-    }
+    content_length(headers).is_some_and(|n| n > 0)
 }
 
 fn collect_headers(headers: &hyper::HeaderMap) -> Vec<KvPair> {

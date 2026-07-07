@@ -35,6 +35,8 @@ pub struct ListenOptions {
     pub custom_ip_headers: Option<Vec<String>>,
     pub custom_country_headers: Option<Vec<String>>,
     pub request_id_header: Option<String>,
+    /// Жёсткий лимит тела запроса в байтах (авторитетно в Rust). null/отсутствие = без лимита.
+    pub body_limit: Option<i64>,
 }
 
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
@@ -108,6 +110,7 @@ impl RustServer {
             request_id_header: options
                 .request_id_header
                 .unwrap_or_else(|| "x-request-id".to_string()),
+            body_limit: options.body_limit.filter(|&n| n >= 0).map(|n| n as u64),
         });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();

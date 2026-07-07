@@ -20,17 +20,27 @@ use tokio::sync::Mutex as TokioMutex;
 /// Ёмкость каналов тела: 1 чанк «в полёте» → плотный backpressure.
 pub const BODY_CHANNEL_CAP: usize = 1;
 
+/// Маркер превышения body-limit, передаётся в JS через `read()` (→ 413).
+pub const BODY_LIMIT_EXCEEDED: &str = "BODY_LIMIT_EXCEEDED";
+
+/// Сообщение канала тела запроса: данные либо превышение лимита.
+pub enum BodyMsg {
+    Data(Bytes),
+    /// Тело превысило body-limit — читать сокет прекратили (защита от DoS).
+    Overflow,
+}
+
 /// Мост тел одного запроса. Создаётся в Rust, отдаётся в JS как аргумент.
 #[napi]
 pub struct BodyIo {
     /// Приёмник чанков тела запроса (None → тела нет).
-    req_rx: TokioMutex<Option<Receiver<Bytes>>>,
+    req_rx: TokioMutex<Option<Receiver<BodyMsg>>>,
     /// Отправитель чанков тела ответа (None после endWrite / если не стримится).
     resp_tx: StdMutex<Option<Sender<Bytes>>>,
 }
 
 impl BodyIo {
-    pub fn new(req_rx: Option<Receiver<Bytes>>, resp_tx: Option<Sender<Bytes>>) -> Self {
+    pub fn new(req_rx: Option<Receiver<BodyMsg>>, resp_tx: Option<Sender<Bytes>>) -> Self {
         BodyIo {
             req_rx: TokioMutex::new(req_rx),
             resp_tx: StdMutex::new(resp_tx),
@@ -46,7 +56,12 @@ impl BodyIo {
     pub async fn read(&self) -> Result<Option<Buffer>> {
         let mut guard = self.req_rx.lock().await;
         match guard.as_mut() {
-            Some(rx) => Ok(rx.recv().await.map(|b| b.to_vec().into())),
+            Some(rx) => match rx.recv().await {
+                Some(BodyMsg::Data(b)) => Ok(Some(b.to_vec().into())),
+                // Превышение лимита → ошибка в JS (маппится в 413). Читать больше нельзя.
+                Some(BodyMsg::Overflow) => Err(napi::Error::from_reason(BODY_LIMIT_EXCEEDED)),
+                None => Ok(None),
+            },
             None => Ok(None),
         }
     }

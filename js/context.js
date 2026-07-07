@@ -18,12 +18,26 @@ class HttpError extends Error {
 const toBuffer = (chunk) =>
   Buffer.isBuffer(chunk) ? chunk : typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
 
-/** Прочитать всё тело запроса из BodyIo (backpressure per-chunk) с лимитом. */
+/** Ошибка превышения лимита тела, пришедшая из нативного read() (см. src/stream.rs). */
+const isLimitError = (e) => e != null && /BODY_LIMIT_EXCEEDED/.test(String(e.message));
+
+/** Прочитать чанк, маппя нативный маркер лимита в HttpError(413). */
+async function readChunk(bodyIo) {
+  try {
+    return await bodyIo.read();
+  } catch (e) {
+    if (isLimitError(e)) throw new HttpError(413, 'Payload Too Large');
+    throw e;
+  }
+}
+
+/** Прочитать всё тело запроса из BodyIo (backpressure per-chunk). Лимит — в Rust;
+ *  здесь дублирующая проверка на случай, если нативный лимит выключен. */
 async function collectRaw(bodyIo, limit) {
   const chunks = [];
   let total = 0;
   for (;;) {
-    const chunk = await bodyIo.read();
+    const chunk = await readChunk(bodyIo);
     if (chunk == null) break;
     total += chunk.length;
     if (limit != null && total > limit) throw new HttpError(413, 'Payload Too Large');
@@ -50,13 +64,18 @@ function decompress(buf, encoding, limit) {
   }
 }
 
-/** Web ReadableStream над телом запроса (pull → bodyIo.read). */
+/** Web ReadableStream над телом запроса (pull → bodyIo.read). Превышение лимита
+ *  (в Rust) → ошибка стрима с HttpError(413), которую поймает for-await хендлера. */
 function makeReqStream(bodyIo) {
   return new ReadableStream({
     async pull(controller) {
-      const chunk = await bodyIo.read();
-      if (chunk == null) controller.close();
-      else controller.enqueue(new Uint8Array(chunk));
+      try {
+        const chunk = await readChunk(bodyIo);
+        if (chunk == null) controller.close();
+        else controller.enqueue(new Uint8Array(chunk));
+      } catch (e) {
+        controller.error(e);
+      }
     },
   });
 }
