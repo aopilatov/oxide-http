@@ -1,0 +1,38 @@
+# CI-заготовка (M0). Полная матрица сборки/доставки — на M13.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm ci
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build .node
+        run: npm run build
+
+      - name: JS tests
+        run: npm test

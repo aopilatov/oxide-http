@@ -1,1 +1,14 @@
 .idea
+
+# Rust
+/target
+Cargo.lock
+
+# napi-rs build output
+*.node
+index.js
+index.d.ts
+
+# Node
+node_modules
+npm-debug.log*

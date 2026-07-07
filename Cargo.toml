@@ -1,0 +1,25 @@
+[package]
+name    = "oxide-http"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# napi-мост (N-API 8 baseline: один бинарник на Node 18+)
+napi        = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+# async-рантайм и HTTP-стек (пока только объявлены — задействуются в M1)
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto       = true
+strip     = "symbols"
+opt-level = 3
