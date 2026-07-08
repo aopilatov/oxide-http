@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -40,6 +40,8 @@ pub struct Shared {
     pub body_limit: Option<u64>,
     /// Нативный CORS (края луковицы). None = выключен.
     pub cors: Option<Cors>,
+    /// Скомпилированные схемы по leaf_id (валидация вне event loop). Пустой = без схем.
+    pub schemas: Vec<crate::schema::LeafSchema>,
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
@@ -254,10 +256,56 @@ async fn dispatch(
     );
     let id = request_id(&data.headers, &shared.request_id_header);
 
-    // Канал тела запроса (только если тело есть) + фоновая задача чтения.
-    let req_rx = if has_body {
+    // Схема этого листа (notFound / без схемы → None).
+    let schema = if leaf_id >= 0 {
+        shared
+            .schemas
+            .get(leaf_id as usize)
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    // Тело буферизуем в Rust только для нативной валидации несжатого тела.
+    // Сжатое тело со схемой валидируется в JS (декомпрессия — там, M4).
+    let compressed = is_compressed(&data.headers);
+    let buffer_for_schema = schema.is_some_and(|s| s.has_body()) && has_body && !compressed;
+
+    let mut incoming = Some(incoming);
+    let mut buffered: Option<Bytes> = None;
+    if buffer_for_schema {
+        match buffer_body(incoming.take().unwrap(), shared.body_limit).await {
+            Ok(b) => buffered = Some(b),
+            Err(()) => return status_text(413, "Payload Too Large"),
+        }
+    }
+
+    // Структурная валидация в Rust → 400 без пробуждения JS (§6b).
+    let mut validated = crate::schema::Validated::default();
+    if let Some(schema) = schema {
+        let body_bytes = if buffer_for_schema {
+            buffered.as_deref()
+        } else {
+            None
+        };
+        match schema.validate(&data.query, &params, body_bytes) {
+            Ok(v) => validated = v,
+            Err(issues) => return validation_response(&issues),
+        }
+    }
+
+    // Канал тела запроса. Буферизованное отдаём одним чанком (c.req.json/stream в JS работают).
+    let req_rx = if let Some(b) = buffered {
+        let (tx, rx) = mpsc::channel::<BodyMsg>(1);
+        let _ = tx.try_send(BodyMsg::Data(b)); // помещается (cap 1), затем закрываем
+        Some(rx)
+    } else if has_body {
         let (tx, rx) = mpsc::channel::<BodyMsg>(BODY_CHANNEL_CAP);
-        tokio::spawn(read_body_task(incoming, tx, shared.body_limit));
+        tokio::spawn(read_body_task(
+            incoming.take().unwrap(),
+            tx,
+            shared.body_limit,
+        ));
         Some(rx)
     } else {
         None
@@ -279,6 +327,9 @@ async fn dispatch(
         ips,
         country,
         id,
+        valid_body: validated.body,
+        valid_query: validated.query,
+        valid_params: validated.params,
     };
 
     match shared.tsfn.call_async((req, body_io)).await {
@@ -318,6 +369,43 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .ok()?
         .parse::<u64>()
         .ok()
+}
+
+/// Буферизовать тело целиком (для нативной валидации), соблюдая лимит.
+/// `Err(())` — превышение лимита.
+async fn buffer_body(mut body: Incoming, limit: Option<u64>) -> Result<Bytes, ()> {
+    let mut buf = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else { break };
+        if let Ok(data) = frame.into_data() {
+            if limit.is_some_and(|l| buf.len() as u64 + data.len() as u64 > l) {
+                return Err(());
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(buf.freeze())
+}
+
+/// Сжато ли тело (Content-Encoding не identity).
+fn is_compressed(headers: &[KvPair]) -> bool {
+    headers.iter().any(|kv| {
+        kv.key == "content-encoding" && {
+            let v = kv.value.trim().to_lowercase();
+            !v.is_empty() && v != "identity"
+        }
+    })
+}
+
+/// Ответ `400` со списком ошибок валидации (машиночитаемый, без пробуждения JS).
+fn validation_response(issues: &[crate::schema::Issue]) -> Response<ResBody> {
+    let body = crate::schema::errors_body(issues);
+    builder_or_500(
+        Response::builder()
+            .status(400)
+            .header("content-type", "application/json; charset=utf-8"),
+        Full::new(Bytes::from(body)).boxed(),
+    )
 }
 
 /// Есть ли у запроса тело (content-length>0 или transfer-encoding).

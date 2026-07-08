@@ -30,7 +30,9 @@
     "test": "node --test \"__test__/**/*.test.mjs\""
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.7.2"
+    "@napi-rs/cli": "^3.7.2",
+    "@valibot/to-json-schema": "^1.7.1",
+    "valibot": "^1.4.2"
   },
   "files": [
     "index.js",

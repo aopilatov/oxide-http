@@ -6,6 +6,7 @@
 mod bridge;
 mod cors;
 mod router;
+mod schema;
 mod server;
 mod stream;
 
@@ -35,11 +36,15 @@ pub struct CorsOptions {
 }
 
 /// Определение маршрута из JS-обёртки (path уже склеен с baseUrl/групповым префиксом).
+/// Схемы — JSON Schema как строки (обёртка конвертирует valibot заранее).
 #[napi(object)]
 pub struct RouteDef {
     pub method: String,
     pub path: String,
     pub leaf_id: i32,
+    pub body_schema: Option<String>,
+    pub query_schema: Option<String>,
+    pub params_schema: Option<String>,
 }
 
 /// Опции сервера, влияющие на вычисление контекста в Rust (§4, §7, §6d).
@@ -90,14 +95,31 @@ impl RustServer {
         options: ListenOptions,
         dispatch: Function<(MatchedRequest, BodyIo), Promise<JsResponse>>,
     ) -> Result<()> {
-        // Компилируем деревья ДО bind: конфликты/невалидные паттерны → ранняя ошибка.
-        let route_defs = routes
-            .into_iter()
-            .map(|r| RRouteDef {
+        // Компилируем деревья + схемы ДО bind: конфликты/невалидные паттерны/схемы → ранняя ошибка.
+        let n = routes.len();
+        let mut route_defs = Vec::with_capacity(n);
+        let mut schema_slots: Vec<Option<crate::schema::LeafSchema>> =
+            (0..n).map(|_| None).collect();
+        for r in routes {
+            let leaf = crate::schema::LeafSchema::build(crate::schema::SchemaDef {
+                body: r.body_schema,
+                query: r.query_schema,
+                params: r.params_schema,
+            })
+            .map_err(napi::Error::from_reason)?;
+            let idx = r.leaf_id as usize;
+            if idx < n {
+                schema_slots[idx] = Some(leaf);
+            }
+            route_defs.push(RRouteDef {
                 method: r.method,
                 path: r.path,
                 leaf_id: r.leaf_id,
-            })
+            });
+        }
+        let schemas: Vec<crate::schema::LeafSchema> = schema_slots
+            .into_iter()
+            .map(Option::unwrap_or_default)
             .collect();
         let routes = Routes::build(route_defs).map_err(napi::Error::from_reason)?;
 
@@ -136,6 +158,7 @@ impl RustServer {
                     max_age: o.max_age,
                 })
             }),
+            schemas,
         });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();

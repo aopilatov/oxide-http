@@ -201,9 +201,16 @@ const CT_TEXT = 'text/plain; charset=utf-8';
 function buildContext(
   nreq,
   bodyIo,
-  { baseUrl = '', requestIdHeader = 'x-request-id', bodyLimit } = {},
+  { baseUrl = '', requestIdHeader = 'x-request-id', bodyLimit, responseStrip = null } = {},
 ) {
   const reqHeaders = buildReqHeaders(nreq.headers);
+
+  // Провалидированные в Rust значения (JSON-строки) → объекты для c.req.valid().
+  const rustValid = {
+    body: nreq.validBody != null ? JSON.parse(nreq.validBody) : undefined,
+    query: nreq.validQuery != null ? JSON.parse(nreq.validQuery) : undefined,
+    params: nreq.validParams != null ? JSON.parse(nreq.validParams) : undefined,
+  };
 
   const rawPath = nreq.path;
   const path = baseUrl && rawPath.startsWith(baseUrl) ? rawPath.slice(baseUrl.length) || '/' : rawPath;
@@ -273,8 +280,15 @@ function buildContext(
         for (const [k, v] of new URLSearchParams(await text())) fd.append(k, v);
         return fd;
       },
+      // валидация (§6b): valibot-transform (_valid) поверх Rust-коэрции (_rustValid)
+      _rustValid: rustValid,
+      _valid: Object.create(null),
+      valid(loc) {
+        return this._valid[loc] !== undefined ? this._valid[loc] : this._rustValid[loc];
+      },
     },
     res,
+    _responseStrip: responseStrip,
     aborted: false, // true при дисконнекте/таймауте
     error: undefined, // последняя ошибка (для onError и «после»-хуков)
     _bodyIo: bodyIo,
@@ -369,7 +383,28 @@ function buildNativeResponse(c) {
     startResponsePump(c._bodyIo, c._stream);
     return { status, headers: c.res.headers.toPairs(), streamed: true };
   }
-  return { status, headers: c.res.headers.toPairs(), body: c._body };
+  // Стрип ответа по response-схеме: не утечёт то, чего нет в схеме (§6b).
+  const body = stripResponse(c, status);
+  return { status, headers: c.res.headers.toPairs(), body };
+}
+
+/** Отсечь поля верхнего уровня, которых нет в response-схеме для статуса. */
+function stripResponse(c, status) {
+  const strip = c._responseStrip;
+  if (!strip || c._body == null) return c._body;
+  const props = strip[status] ?? strip[String(status)];
+  if (!props) return c._body;
+  const ct = c.res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) return c._body;
+  try {
+    const parsed = JSON.parse(c._body);
+    if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return c._body;
+    const out = {};
+    for (const k of Object.keys(parsed)) if (props.has(k)) out[k] = parsed[k];
+    return JSON.stringify(out);
+  } catch {
+    return c._body;
+  }
 }
 
 module.exports = {

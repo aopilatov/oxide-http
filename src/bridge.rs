@@ -38,6 +38,11 @@ pub struct MatchedRequest {
     pub ips: Vec<String>,
     pub country: Option<String>,
     pub id: String,
+    /// Провалидированные/коэрцированные значения (JSON-строки) — если у листа схема.
+    /// `c.req.valid('body'|'query'|'params')` в JS доигрывает valibot transform.
+    pub valid_body: Option<String>,
+    pub valid_query: Option<String>,
+    pub valid_params: Option<String>,
 }
 
 /// Ответ, который JS-хендлер возвращает (в составе `Promise`).
