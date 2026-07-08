@@ -42,6 +42,8 @@ pub struct Shared {
     pub cors: Option<Cors>,
     /// Скомпилированные схемы по leaf_id (валидация вне event loop). Пустой = без схем.
     pub schemas: Vec<crate::schema::LeafSchema>,
+    /// Multipart-конфиги по leaf_id. None = маршрут не multipart.
+    pub multipart: Vec<Option<crate::multipart::MultipartConfig>>,
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
@@ -265,13 +267,46 @@ async fn dispatch(
     } else {
         None
     };
-
-    // Тело буферизуем в Rust только для нативной валидации несжатого тела.
-    // Сжатое тело со схемой валидируется в JS (декомпрессия — там, M4).
-    let compressed = is_compressed(&data.headers);
-    let buffer_for_schema = schema.is_some_and(|s| s.has_body()) && has_body && !compressed;
+    // Multipart-конфиг этого листа.
+    let multipart_cfg = if leaf_id >= 0 {
+        shared
+            .multipart
+            .get(leaf_id as usize)
+            .and_then(|o| o.as_ref())
+    } else {
+        None
+    };
 
     let mut incoming = Some(incoming);
+    let mut mp_rx = None;
+
+    // Multipart-маршрут: проверяем Content-Type → 415, извлекаем boundary → парсим потоково.
+    if let Some(cfg) = multipart_cfg {
+        let ct = data
+            .headers
+            .iter()
+            .find(|kv| kv.key == "content-type")
+            .map(|kv| kv.value.as_str());
+        match ct.and_then(|c| multer::parse_boundary(c).ok()) {
+            Some(boundary) => {
+                let (tx, rx) = mpsc::channel::<crate::multipart::MpEvent>(BODY_CHANNEL_CAP);
+                tokio::spawn(crate::multipart::parse_task(
+                    incoming.take().unwrap(),
+                    boundary,
+                    cfg.clone(),
+                    tx,
+                ));
+                mp_rx = Some(rx);
+            }
+            None => return status_text(415, "Unsupported Media Type"),
+        }
+    }
+
+    // Тело буферизуем в Rust только для нативной валидации несжатого тела (не multipart).
+    let compressed = is_compressed(&data.headers);
+    let buffer_for_schema =
+        multipart_cfg.is_none() && schema.is_some_and(|s| s.has_body()) && has_body && !compressed;
+
     let mut buffered: Option<Bytes> = None;
     if buffer_for_schema {
         match buffer_body(incoming.take().unwrap(), shared.body_limit).await {
@@ -280,7 +315,7 @@ async fn dispatch(
         }
     }
 
-    // Структурная валидация в Rust → 400 без пробуждения JS (§6b).
+    // Структурная валидация в Rust → 400 без пробуждения JS (§6b). Body — только не-multipart.
     let mut validated = crate::schema::Validated::default();
     if let Some(schema) = schema {
         let body_bytes = if buffer_for_schema {
@@ -294,8 +329,10 @@ async fn dispatch(
         }
     }
 
-    // Канал тела запроса. Буферизованное отдаём одним чанком (c.req.json/stream в JS работают).
-    let req_rx = if let Some(b) = buffered {
+    // Канал тела запроса. Буферизованное отдаём одним чанком; multipart → обычного тела нет.
+    let req_rx = if multipart_cfg.is_some() {
+        None
+    } else if let Some(b) = buffered {
         let (tx, rx) = mpsc::channel::<BodyMsg>(1);
         let _ = tx.try_send(BodyMsg::Data(b)); // помещается (cap 1), затем закрываем
         Some(rx)
@@ -313,7 +350,7 @@ async fn dispatch(
 
     // Канал тела ответа (используется, если хендлер стримит).
     let (resp_tx, resp_rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_CAP);
-    let body_io = BodyIo::new(req_rx, Some(resp_tx));
+    let body_io = BodyIo::new(req_rx, Some(resp_tx), mp_rx);
 
     let req = MatchedRequest {
         leaf_id,

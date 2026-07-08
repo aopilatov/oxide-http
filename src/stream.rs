@@ -17,6 +17,8 @@ use napi_derive::napi;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex as TokioMutex;
 
+use crate::multipart::MpEvent;
+
 /// Ёмкость каналов тела: 1 чанк «в полёте» → плотный backpressure.
 pub const BODY_CHANNEL_CAP: usize = 1;
 
@@ -30,20 +32,41 @@ pub enum BodyMsg {
     Overflow,
 }
 
+/// Метаданные части multipart для JS.
+#[napi(object)]
+pub struct PartMeta {
+    pub name: Option<String>,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+}
+
+/// Состояние чтения multipart-потока.
+struct MpState {
+    rx: Receiver<MpEvent>,
+    ended: bool, // текущая часть закончилась (read_part → null)
+}
+
 /// Мост тел одного запроса. Создаётся в Rust, отдаётся в JS как аргумент.
 #[napi]
 pub struct BodyIo {
-    /// Приёмник чанков тела запроса (None → тела нет).
+    /// Приёмник чанков тела запроса (None → тела нет / multipart).
     req_rx: TokioMutex<Option<Receiver<BodyMsg>>>,
     /// Отправитель чанков тела ответа (None после endWrite / если не стримится).
     resp_tx: StdMutex<Option<Sender<Bytes>>>,
+    /// Поток событий multipart (None → маршрут не multipart).
+    mp: TokioMutex<Option<MpState>>,
 }
 
 impl BodyIo {
-    pub fn new(req_rx: Option<Receiver<BodyMsg>>, resp_tx: Option<Sender<Bytes>>) -> Self {
+    pub fn new(
+        req_rx: Option<Receiver<BodyMsg>>,
+        resp_tx: Option<Sender<Bytes>>,
+        mp_rx: Option<Receiver<MpEvent>>,
+    ) -> Self {
         BodyIo {
             req_rx: TokioMutex::new(req_rx),
             resp_tx: StdMutex::new(resp_tx),
+            mp: TokioMutex::new(mp_rx.map(|rx| MpState { rx, ended: false })),
         }
     }
 }
@@ -84,6 +107,67 @@ impl BodyIo {
     pub fn end_write(&self) {
         self.resp_tx.lock().unwrap().take();
     }
+
+    /// Следующая часть multipart (пропуская хвост недочитанной). `null` = конец формы.
+    #[napi]
+    pub async fn next_part(&self) -> Result<Option<PartMeta>> {
+        let mut guard = self.mp.lock().await;
+        let Some(state) = guard.as_mut() else {
+            return Ok(None);
+        };
+        loop {
+            match state.rx.recv().await {
+                Some(MpEvent::Part {
+                    name,
+                    filename,
+                    content_type,
+                }) => {
+                    state.ended = false;
+                    return Ok(Some(PartMeta {
+                        name,
+                        filename,
+                        content_type,
+                    }));
+                }
+                // Хвост брошенной части — пропускаем до следующего Part.
+                Some(MpEvent::Chunk(_)) | Some(MpEvent::PartEnd) => continue,
+                Some(MpEvent::Reject { status, message }) => {
+                    return Err(mp_reject(status, &message))
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Следующий чанк текущей части. `null` = конец части.
+    #[napi]
+    pub async fn read_part(&self) -> Result<Option<Buffer>> {
+        let mut guard = self.mp.lock().await;
+        let Some(state) = guard.as_mut() else {
+            return Ok(None);
+        };
+        if state.ended {
+            return Ok(None);
+        }
+        match state.rx.recv().await {
+            Some(MpEvent::Chunk(b)) => Ok(Some(b.to_vec().into())),
+            Some(MpEvent::PartEnd) => {
+                state.ended = true;
+                Ok(None)
+            }
+            Some(MpEvent::Reject { status, message }) => Err(mp_reject(status, &message)),
+            // Защита: Part без предшествующего next_part / конец потока.
+            Some(MpEvent::Part { .. }) | None => {
+                state.ended = true;
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Ошибка отклонения multipart, кодирующая HTTP-статус (JS маппит в HttpError).
+fn mp_reject(status: u16, message: &str) -> napi::Error {
+    napi::Error::from_reason(format!("MULTIPART_REJECT:{status}:{message}"))
 }
 
 /// hyper-`Body`, тянущий чанки из канала (наполняется из `BodyIo::write`).

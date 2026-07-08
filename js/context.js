@@ -107,6 +107,75 @@ function startResponsePump(bodyIo, source) {
 const isStreamSource = (v) =>
   Buffer.isBuffer(v) || v instanceof Uint8Array || typeof v?.getReader === 'function' || v?.[Symbol.asyncIterator] != null;
 
+// --- multipart (§9a): парсинг в Rust, здесь — итератор частей ---
+
+/** Отклонение из Rust ("MULTIPART_REJECT:<status>:<msg>") → HttpError. */
+function mpMapError(e) {
+  const m = /^MULTIPART_REJECT:(\d+):(.*)$/s.exec(e && e.message);
+  return m ? new HttpError(Number(m[1]), m[2]) : e;
+}
+
+async function mpNextPart(bodyIo) {
+  try {
+    return await bodyIo.nextPart();
+  } catch (e) {
+    throw mpMapError(e);
+  }
+}
+async function mpReadPart(bodyIo) {
+  try {
+    return await bodyIo.readPart();
+  } catch (e) {
+    throw mpMapError(e);
+  }
+}
+
+/** Собрать объект-часть с потоком/буферизацией. */
+function makePart(bodyIo, meta) {
+  const collect = async () => {
+    const chunks = [];
+    for (;;) {
+      const chunk = await mpReadPart(bodyIo);
+      if (chunk == null) break;
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  };
+  return {
+    name: meta.name ?? undefined,
+    filename: meta.filename ?? undefined,
+    contentType: meta.contentType ?? undefined,
+    get stream() {
+      return new ReadableStream({
+        async pull(controller) {
+          try {
+            const chunk = await mpReadPart(bodyIo);
+            if (chunk == null) controller.close();
+            else controller.enqueue(new Uint8Array(chunk));
+          } catch (e) {
+            controller.error(e);
+          }
+        },
+      });
+    },
+    async arrayBuffer() {
+      const b = await collect();
+      return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+    },
+    async text() {
+      return (await collect()).toString('utf8');
+    },
+  };
+}
+
+/** Async-итератор частей multipart (потоково, §9a). */
+async function* partsIterator(bodyIo) {
+  let meta;
+  while ((meta = await mpNextPart(bodyIo)) != null) {
+    yield makePart(bodyIo, meta);
+  }
+}
+
 /** Заголовки ответа: lowercase, set/append, несколько значений (set-cookie). */
 class ResHeaders {
   #map = new Map(); // lk -> string[]
@@ -275,9 +344,28 @@ function buildContext(
       text,
       json: async () => JSON.parse(await text()),
       parseBody,
+      // multipart: потоковый итератор частей (§9a)
+      parts() {
+        useBody();
+        return partsIterator(bodyIo);
+      },
       formData: async () => {
+        const ct = reqHeaders.get('content-type') || '';
         const fd = new FormData();
-        for (const [k, v] of new URLSearchParams(await text())) fd.append(k, v);
+        if (ct.startsWith('multipart/form-data')) {
+          useBody();
+          for await (const part of partsIterator(bodyIo)) {
+            if (part.filename != null) {
+              const buf = Buffer.from(await part.arrayBuffer());
+              const opts = part.contentType ? { type: part.contentType } : {};
+              fd.append(part.name, new Blob([buf], opts), part.filename);
+            } else {
+              fd.append(part.name, await part.text());
+            }
+          }
+        } else {
+          for (const [k, v] of new URLSearchParams(await text())) fd.append(k, v);
+        }
         return fd;
       },
       // валидация (§6b): valibot-transform (_valid) поверх Rust-коэрции (_rustValid)

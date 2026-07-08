@@ -5,6 +5,7 @@
 
 mod bridge;
 mod cors;
+mod multipart;
 mod router;
 mod schema;
 mod server;
@@ -45,6 +46,18 @@ pub struct RouteDef {
     pub body_schema: Option<String>,
     pub query_schema: Option<String>,
     pub params_schema: Option<String>,
+    pub multipart: Option<MultipartOptions>,
+}
+
+/// Per-route опции multipart (нормализованы обёрткой; лимиты в байтах/штуках).
+#[napi(object)]
+pub struct MultipartOptions {
+    pub max_file_size: Option<i64>,
+    pub max_field_size: Option<i64>,
+    pub max_files: Option<i64>,
+    pub max_fields: Option<i64>,
+    pub allowed_mime_types: Option<Vec<String>>,
+    pub allowed_extensions: Option<Vec<String>>,
 }
 
 /// Опции сервера, влияющие на вычисление контекста в Rust (§4, §7, §6d).
@@ -100,6 +113,8 @@ impl RustServer {
         let mut route_defs = Vec::with_capacity(n);
         let mut schema_slots: Vec<Option<crate::schema::LeafSchema>> =
             (0..n).map(|_| None).collect();
+        let mut mp_slots: Vec<Option<crate::multipart::MultipartConfig>> =
+            (0..n).map(|_| None).collect();
         for r in routes {
             let leaf = crate::schema::LeafSchema::build(crate::schema::SchemaDef {
                 body: r.body_schema,
@@ -110,6 +125,7 @@ impl RustServer {
             let idx = r.leaf_id as usize;
             if idx < n {
                 schema_slots[idx] = Some(leaf);
+                mp_slots[idx] = r.multipart.map(multipart_config);
             }
             route_defs.push(RRouteDef {
                 method: r.method,
@@ -159,6 +175,7 @@ impl RustServer {
                 })
             }),
             schemas,
+            multipart: mp_slots,
         });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();
@@ -179,5 +196,23 @@ impl RustServer {
             running.runtime.shutdown_background();
         }
         Ok(())
+    }
+}
+
+/// napi MultipartOptions → внутренний MultipartConfig (лимиты i64 → u64/u32).
+fn multipart_config(o: MultipartOptions) -> crate::multipart::MultipartConfig {
+    let u64_of = |v: Option<i64>| v.filter(|&n| n >= 0).map(|n| n as u64);
+    let u32_of = |v: Option<i64>| v.filter(|&n| n >= 0).map(|n| n as u32);
+    crate::multipart::MultipartConfig {
+        max_file_size: u64_of(o.max_file_size),
+        max_field_size: u64_of(o.max_field_size),
+        max_files: u32_of(o.max_files),
+        max_fields: u32_of(o.max_fields),
+        allowed_mime: o
+            .allowed_mime_types
+            .map(|v| v.iter().map(|s| s.to_lowercase()).collect()),
+        allowed_ext: o
+            .allowed_extensions
+            .map(|v| v.iter().map(|s| s.to_lowercase()).collect()),
     }
 }
