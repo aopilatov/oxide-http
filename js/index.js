@@ -100,6 +100,7 @@ class Server {
   #handleSignals;
   #ready = true;
   #readinessTimer = null;
+  #closed = false;
 
   constructor(config = {}) {
     this.#baseUrl = normalizeBase(config.baseUrl);
@@ -366,6 +367,7 @@ class Server {
       this.#stopReadinessCheck();
       await this.#native.close();
       this.#listening = false;
+      this.#closed = true;
       this.#removeSignalHandlers();
       this.#events.emit('close');
     })();
@@ -374,6 +376,60 @@ class Server {
 
   get listening() {
     return this.#listening;
+  }
+
+  /** Тест-харнесс без сокета (§17): запрос идёт по in-memory каналу через тот же
+   *  конвейер — роутинг, схемы, CORS, метрики, JS-луковица.
+   *
+   *  `inject({ method, path, headers, body, query })` → `{ status, headers, body,
+   *  text(), json() }`. Если сервер ещё не поднят, поднимаем его на эфемерном порту
+   *  (маршруты и схемы компилируются именно в `listen()`); сам запрос через сокет
+   *  не идёт. Порт освобождается обычным `close()`. */
+  async inject(req = {}) {
+    const { method = 'GET', path = '/', headers = {}, body, query } = req;
+    if (this.#closed) throw new Error('inject: сервер закрыт (close() уже вызван)');
+    if (!this.#listening) await this.listen({ port: 0, host: '127.0.0.1' });
+
+    let url = path;
+    if (query && Object.keys(query).length > 0) {
+      const qs = new URLSearchParams(query).toString();
+      url += (url.includes('?') ? '&' : '?') + qs;
+    }
+
+    const pairs = [];
+    for (const [k, v] of Object.entries(headers)) {
+      for (const one of Array.isArray(v) ? v : [v]) pairs.push({ key: k, value: String(one) });
+    }
+
+    let payload;
+    if (body != null) {
+      if (Buffer.isBuffer(body)) payload = body;
+      else if (typeof body === 'string') payload = Buffer.from(body);
+      else {
+        payload = Buffer.from(JSON.stringify(body));
+        if (!pairs.some((p) => p.key.toLowerCase() === 'content-type')) {
+          pairs.push({ key: 'content-type', value: 'application/json' });
+        }
+      }
+    }
+
+    const res = await this.#native.inject(method.toUpperCase(), url, pairs, payload);
+
+    // Заголовки отдаём и объектом (удобно ассертить), и списком пар (set-cookie
+    // может повторяться, а объект схлопнул бы дубликаты).
+    const headerObj = {};
+    for (const { key, value } of res.headers) {
+      headerObj[key] = key in headerObj ? `${headerObj[key]}, ${value}` : value;
+    }
+
+    return {
+      status: res.status,
+      headers: headerObj,
+      rawHeaders: res.headers,
+      body: res.body,
+      text: () => res.body.toString('utf8'),
+      json: () => JSON.parse(res.body.toString('utf8')),
+    };
   }
 
   /** Ручной readiness (§11): `false` → `/readyz` отдаёт 503, liveness не трогаем. */

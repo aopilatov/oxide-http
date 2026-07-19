@@ -27,6 +27,8 @@ use napi_derive::napi;
 use tokio::runtime::Runtime;
 use tokio::sync::{watch, Notify};
 
+use bytes::Bytes;
+
 use crate::bridge::{Handler, JsResponse, MatchedRequest};
 use crate::cors::{Cors, CorsOptions as RCorsOptions};
 use crate::listener::Bound;
@@ -155,6 +157,14 @@ pub struct ListenOptions {
     /// (§6c C5). Отсутствие/0 = readiness не трогать.
     pub overload_shed_after: Option<i64>,
     pub http2: Option<Http2Options>,
+}
+
+/// Ответ `app.inject` (§17): без сокета, но структура та же, что у обычного ответа.
+#[napi(object)]
+pub struct InjectResponse {
+    pub status: u16,
+    pub headers: Vec<bridge::KvPair>,
+    pub body: napi::bindgen_prelude::Buffer,
 }
 
 /// Забинденный сокет до передачи в рантайм (регистрация в реакторе — уже там).
@@ -429,6 +439,61 @@ impl RustServer {
             pre_shutdown_delay,
         });
         Ok(())
+    }
+
+    /// Прогнать запрос через конвейер без сокета (§17, `app.inject`).
+    ///
+    /// Выполняется на серверном рантайме (там живут TSFN и состояние), результат
+    /// приезжает обратно через oneshot. Требует поднятого сервера: маршруты и схемы
+    /// компилируются в `listen()` — обёртка при необходимости поднимает его на
+    /// эфемерном порту, но сам запрос через сокет не идёт.
+    #[napi]
+    pub async fn inject(
+        &self,
+        method: String,
+        path: String,
+        headers: Vec<bridge::KvPair>,
+        body: Option<napi::bindgen_prelude::Buffer>,
+    ) -> Result<InjectResponse> {
+        let (shared, handle) = {
+            let guard = self.state.lock().unwrap();
+            let running = guard
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("inject: сервер не запущен"))?;
+            (running.shared.clone(), running.runtime.handle().clone())
+        };
+
+        let body_bytes = body.map(|b| Bytes::from(b.to_vec())).unwrap_or_default();
+        let mut builder = hyper::Request::builder().method(method.as_str()).uri(&path);
+        let mut has_host = false;
+        for kv in &headers {
+            if kv.key.eq_ignore_ascii_case("host") {
+                has_host = true;
+            }
+            builder = builder.header(&kv.key, &kv.value);
+        }
+        if !has_host {
+            // HTTP/1.1 требует Host; в inject реального хоста нет — ставим заглушку.
+            builder = builder.header("host", "inject.local");
+        }
+        let req = builder
+            .body(http_body_util::Full::new(body_bytes))
+            .map_err(|e| napi::Error::from_reason(format!("inject: некорректный запрос: {e}")))?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.spawn(async move {
+            let _ = tx.send(crate::server::inject(shared, req).await);
+        });
+
+        match rx.await {
+            Ok(Ok((status, headers, body))) => Ok(InjectResponse {
+                status,
+                headers,
+                body: body.to_vec().into(),
+            }),
+            Ok(Err(e)) => Err(napi::Error::from_reason(e)),
+            Err(_) => Err(napi::Error::from_reason("inject: задача прервана")),
+        }
     }
 
     /// Выставить readiness из JS (§11): `app.setReady(false)` снимает под с эндпоинтов,

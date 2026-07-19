@@ -465,6 +465,54 @@ pub async fn serve_admin(
     }
 }
 
+/// Прогнать запрос через весь конвейер **без сокета** (§17, `app.inject`).
+///
+/// Соединение — `tokio::io::duplex`, память вместо сети. Это не мок: работают тот же
+/// `handle`, роутинг, схемы, CORS, метрики и JS-луковица, просто байты не выходят за
+/// пределы процесса. Возвращает статус, заголовки и тело ответа.
+pub async fn inject(
+    shared: Arc<Shared>,
+    req: Request<Full<Bytes>>,
+) -> Result<(u16, Vec<KvPair>, Bytes), String> {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    // Серверная сторона канала: тот же путь, что и у реального соединения.
+    let srv = shared.clone();
+    tokio::spawn(async move {
+        let shed = Arc::new(Notify::new());
+        let service = service_fn(move |r: Request<Incoming>| {
+            let srv = srv.clone();
+            let shed = shed.clone();
+            async move { Ok::<_, Infallible>(handle(r, srv, "127.0.0.1".to_string(), shed).await) }
+        });
+        let _ = http1::Builder::new()
+            .serve_connection(TokioIo::new(server_io), service)
+            .await;
+    });
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+        .await
+        .map_err(|e| format!("inject handshake: {e}"))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let res = sender
+        .send_request(req)
+        .await
+        .map_err(|e| format!("inject request: {e}"))?;
+    let status = res.status().as_u16();
+    let headers = collect_headers(res.headers());
+    let body = res
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("inject body: {e}"))?
+        .to_bytes();
+
+    Ok((status, headers, body))
+}
+
 /// Общие для запроса данные (вычислены один раз, затем перемещаются в диспетч).
 struct ReqData {
     method: String,
