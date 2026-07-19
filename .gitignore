@@ -17,3 +17,6 @@ npm-debug.log*
 # TypeScript build output
 /dist
 
+
+# Каталоги platform-пакетов (генерируются napi create-npm-dirs)
+/npm

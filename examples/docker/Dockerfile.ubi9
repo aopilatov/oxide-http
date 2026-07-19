@@ -1,0 +1,18 @@
+# Red Hat UBI 9 (glibc 2.34). Проверяет baseline glibc 2.17 в prebuild-бинарнике.
+FROM redhat/ubi9:latest
+
+# В полном образе UBI пакетный менеджер — dnf (microdnf только в ubi-minimal).
+# Модуль по умолчанию даёт Node 16 — ниже нашего engines>=18, поэтому явно
+# включаем поддерживаемый поток: смысл проверки в том, что мы декларируем.
+RUN dnf -y module enable nodejs:20 \
+ && dnf -y install nodejs \
+ && dnf clean all \
+ && node -v
+
+WORKDIR /app
+COPY package.json index.js index.d.ts ./
+COPY dist ./dist
+COPY *.node ./
+COPY scripts ./scripts
+
+RUN node scripts/smoke.cjs

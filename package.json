@@ -70,5 +70,13 @@
     "hyper",
     "tokio",
     "fastify-alternative"
-  ]
+  ],
+  "optionalDependencies": {
+    "@oxide/http-darwin-arm64": "0.0.0",
+    "@oxide/http-darwin-x64": "0.0.0",
+    "@oxide/http-linux-x64-gnu": "0.0.0",
+    "@oxide/http-linux-arm64-gnu": "0.0.0",
+    "@oxide/http-linux-x64-musl": "0.0.0",
+    "@oxide/http-linux-arm64-musl": "0.0.0"
+  }
 }

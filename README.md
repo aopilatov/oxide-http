@@ -270,3 +270,28 @@ node bench/run.mjs   # бенчмарки
 ## Лицензия
 
 MIT
+
+---
+
+## Сборка из исходников
+
+Готовые бинарники покрывают linux x64/arm64 (glibc и musl) и macOS arm64/x64.
+Если вашей платформы нет в списке, соберите сами — нужен Rust:
+
+```bash
+git clone https://github.com/saxik/oxide-http && cd oxide-http
+npm ci
+npm run build:release   # .node под текущую платформу
+npm run build:ts        # dist/ (CJS + типы)
+node scripts/smoke.cjs  # проверка, что аддон грузится
+```
+
+Проверить загрузку в чистом образе можно готовыми Dockerfile'ами:
+
+```bash
+docker build -f examples/docker/Dockerfile.ubi9 .     # glibc-бинарник
+docker build -f examples/docker/Dockerfile.alpine .   # musl-бинарник
+```
+
+Важно: libc аддона обязана совпадать с libc Node. Для Alpine нужен именно
+musl-бинарник — glibc-сборка там не загрузится.

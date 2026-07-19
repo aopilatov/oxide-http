@@ -1,38 +1,214 @@
-# CI-заготовка (M0). Полная матрица сборки/доставки — на M13.
+# Сборка, проверки и публикация prebuild-артефактов (M13).
+#
+# build  — .node под каждую платформу, кладётся артефактом;
+# test   — JS-тесты на всех LTS Node поверх собранного бинарника;
+# images — установка в чистые образы (Ubuntu/UBI/Alpine) без Rust-тулчейна;
+# publish — platform-пакеты и npm-релиз по git-тегу.
 name: CI
 
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
 jobs:
-  lint-and-test:
+  lint:
+    name: Проверки (clippy, fmt, типы)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install deps
-        run: npm ci
-
+      - run: npm ci
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-
       - name: cargo clippy
         run: cargo clippy -- -D warnings
+      - name: cargo test
+        run: cargo test
+      - name: Типы (библиотека и тесты)
+        run: npm run typecheck
 
-      - name: Build .node
-        run: npm run build
+  build:
+    name: Сборка ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc-сборки идут в docker-образе napi-rs с baseline glibc 2.17
+          # (manylinux2014): бинарник заводится и на старых дистрибутивах.
+          - target: x86_64-unknown-linux-gnu
+            host: ubuntu-latest
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+          - target: aarch64-unknown-linux-gnu
+            host: ubuntu-24.04-arm
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+          # musl — отдельные бинарники: libc аддона обязана совпадать с libc Node.
+          - target: x86_64-unknown-linux-musl
+            host: ubuntu-latest
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+            artifact: oxide-http.linux-x64-musl.node
+          - target: aarch64-unknown-linux-musl
+            host: ubuntu-24.04-arm
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+            artifact: oxide-http.linux-arm64-musl.node
+          - target: aarch64-apple-darwin
+            host: macos-latest
+          - target: x86_64-apple-darwin
+            host: macos-13
 
-      - name: JS tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.docker }}
+        with: { targets: '${{ matrix.target }}' }
+      - uses: Swatinem/rust-cache@v2
+        with: { key: '${{ matrix.target }}' }
+
+      - run: npm ci
+
+      - name: Сборка (docker, glibc)
+        if: ${{ matrix.docker && !contains(matrix.target, 'musl') }}
+        run: |
+          docker run --rm -v "$PWD":/build -w /build ${{ matrix.docker }} \
+            bash -lc "npm ci --no-audit --no-fund && npx napi build --platform --release --target ${{ matrix.target }}"
+
+      # musl-образ napi-rs несёт Node 18, а napi CLI 3.x требует Node 20+
+      # (@inquirer/core тянет styleText из node:util). Обходим CLI и зовём cargo
+      # напрямую: в этом образе musl и так нативная цель, остаётся переименовать
+      # артефакт по конвенции napi. index.js/index.d.ts уже сгенерированы.
+      - name: Сборка (docker, musl)
+        if: ${{ matrix.docker && contains(matrix.target, 'musl') }}
+        run: |
+          docker run --rm -v "$PWD":/build -w /build ${{ matrix.docker }} \
+            sh -lc "cargo build --release && cp target/release/liboxide_http.so ${{ matrix.artifact }}"
+
+      - name: Сборка (нативно)
+        if: ${{ !matrix.docker }}
+        run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: '*.node'
+          if-no-files-found: error
+
+  test:
+    name: Тесты Node ${{ matrix.node }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: npm }
+      - uses: actions/download-artifact@v4
+        with: { name: bindings-x86_64-unknown-linux-gnu, path: . }
+      - run: npm ci
+
+      # Полный набор гоняется там, где Node исполняет .ts напрямую (22+).
+      - name: Полный набор тестов
+        if: ${{ matrix.node >= 22 }}
         run: npm test
+
+      # На 18/20 проверяем главное — что опубликованный артефакт (CJS + .node)
+      # работает на этой версии ABI. Набор на .ts там не запустится.
+      - name: Smoke собранного пакета
+        run: |
+          npm run build:ts
+          node scripts/smoke.cjs
+
+  images:
+    name: Установка в ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: 'ubuntu:22.04', libc: gnu, dockerfile: examples/docker/Dockerfile.ubuntu }
+          - { image: 'redhat/ubi9:latest', libc: gnu, dockerfile: examples/docker/Dockerfile.ubi9 }
+          - { image: 'redhat/ubi10:latest', libc: gnu, dockerfile: examples/docker/Dockerfile.ubi10 }
+          - { image: 'alpine:3.20', libc: musl, dockerfile: examples/docker/Dockerfile.alpine }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: actions/download-artifact@v4
+        with: { name: bindings-x86_64-unknown-linux-${{ matrix.libc }}, path: . }
+      - run: npm ci && npm run build:ts
+
+      - name: Загрузка аддона без Rust-тулчейна
+        run: docker build -f ${{ matrix.dockerfile }} -t oxide-smoke:${{ matrix.libc }} .
+
+  publish:
+    name: Публикация
+    needs: [lint, build, test, images]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm, registry-url: 'https://registry.npmjs.org' }
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+
+      - name: Разложить бинарники по platform-пакетам
+        run: |
+          find artifacts -name '*.node' -exec mv {} . \;
+          ls -la *.node
+          npx napi create-npm-dirs
+          npx napi artifacts
+
+      - name: Собрать TypeScript
+        run: npm run build:ts
+
+      # Проверки — строго ДО первой публикации: npm-релиз необратим,
+      # неверную версию уже не отозвать (можно только deprecate).
+      - name: Тег должен совпадать с версией в package.json
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          test "$TAG" = "$PKG" || { echo "тег $TAG ≠ версия $PKG"; exit 1; }
+
+      - name: Smoke перед публикацией
+        run: node scripts/smoke.cjs
+
+      - name: Публикация platform-пакетов
+        run: |
+          # Каждый platform-пакет публикуется отдельно; корневой тянет их через
+          # optionalDependencies, поэтому они обязаны быть в реестре раньше него.
+          for dir in npm/*/; do
+            npm publish "$dir" --access public --provenance
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Публикация корневого пакета
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
