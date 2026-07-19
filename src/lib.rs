@@ -10,6 +10,7 @@ mod router;
 mod schema;
 mod server;
 mod stream;
+mod tls;
 
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +23,7 @@ use tokio::sync::Notify;
 use crate::bridge::{Handler, JsResponse, MatchedRequest};
 use crate::cors::{Cors, CorsOptions as RCorsOptions};
 use crate::router::{RouteDef as RRouteDef, Routes};
-use crate::server::{serve, Shared};
+use crate::server::{serve, Shared, Tuning};
 use crate::stream::BodyIo;
 
 /// Опции CORS с JS-стороны (нормализованы обёрткой). Отсутствие = CORS выключен.
@@ -60,6 +61,21 @@ pub struct MultipartOptions {
     pub allowed_extensions: Option<Vec<String>>,
 }
 
+/// TLS-сертификаты (PEM-строки; путь/Buffer резолвит обёртка).
+#[napi(object)]
+pub struct TlsOptions {
+    pub cert: String,
+    pub key: String,
+}
+
+/// Опции HTTP/2 (§6c A1).
+#[napi(object)]
+pub struct Http2Options {
+    pub max_concurrent_streams: Option<i64>,
+    pub initial_window_size: Option<i64>,
+    pub max_reset_streams_per_sec: Option<i64>,
+}
+
 /// Опции сервера, влияющие на вычисление контекста в Rust (§4, §7, §6d).
 #[napi(object)]
 pub struct ListenOptions {
@@ -70,6 +86,17 @@ pub struct ListenOptions {
     pub body_limit: Option<i64>,
     /// Нативный CORS. null/отсутствие = выключен.
     pub cors: Option<CorsOptions>,
+    /// TLS (§12). null/отсутствие = plaintext.
+    pub tls: Option<TlsOptions>,
+    /// h2c prior-knowledge на plaintext-порту (§19).
+    pub h2c: Option<bool>,
+    /// Таймаут чтения заголовков в мс (Slowloris, §6c A2).
+    pub header_read_timeout: Option<i64>,
+    /// Таймаут TLS-хендшейка в мс.
+    pub handshake_timeout: Option<i64>,
+    /// Лимит числа заголовков.
+    pub max_headers: Option<i64>,
+    pub http2: Option<Http2Options>,
 }
 
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
@@ -142,6 +169,37 @@ impl RustServer {
         // TSFN строим синхронно, пока JS-функция жива; дальше она 'static + Send.
         let tsfn: Handler = dispatch.build_threadsafe_function().build()?;
 
+        // TLS-акцептор (парсинг PEM может упасть → ранняя ошибка до bind).
+        let tls = match options.tls {
+            Some(t) => Some(tls::build_acceptor(&t.cert, &t.key).map_err(napi::Error::from_reason)?),
+            None => None,
+        };
+        let http2 = options.http2;
+        let ms = |v: Option<i64>| v.filter(|&n| n >= 0).map(|n| std::time::Duration::from_millis(n as u64));
+        let tuning = Tuning {
+            tls,
+            h2c: options.h2c.unwrap_or(false),
+            header_read_timeout: ms(options.header_read_timeout),
+            handshake_timeout: ms(options.handshake_timeout)
+                .unwrap_or_else(|| std::time::Duration::from_secs(10)),
+            max_headers: options.max_headers.filter(|&n| n > 0).map(|n| n as usize),
+            max_concurrent_streams: http2
+                .as_ref()
+                .and_then(|h| h.max_concurrent_streams)
+                .filter(|&n| n >= 0)
+                .map(|n| n as u32),
+            initial_window_size: http2
+                .as_ref()
+                .and_then(|h| h.initial_window_size)
+                .filter(|&n| n >= 0)
+                .map(|n| n as u32),
+            max_reset_streams: http2
+                .as_ref()
+                .and_then(|h| h.max_reset_streams_per_sec)
+                .filter(|&n| n >= 0)
+                .map(|n| n as usize),
+        };
+
         // Слушаем сокет синхронно → ошибки bind (EADDRINUSE и т.п.) отдаём сразу.
         let std_listener = std::net::TcpListener::bind((host.as_str(), port))
             .map_err(|e| napi::Error::from_reason(format!("bind {host}:{port}: {e}")))?;
@@ -176,6 +234,7 @@ impl RustServer {
             }),
             schemas,
             multipart: mp_slots,
+            tuning,
         });
         let shutdown = Arc::new(Notify::new());
         let sd = shutdown.clone();

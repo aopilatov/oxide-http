@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::combinators::BoxBody;
@@ -15,15 +16,29 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::Notify;
+use tokio_rustls::TlsAcceptor;
 
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
 use crate::cors::Cors;
 use crate::router::Routes;
 use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
+
+/// Параметры протокола/безопасности (TLS, h2, read-таймауты) — §12, §6c A1/A2.
+pub struct Tuning {
+    pub tls: Option<TlsAcceptor>,
+    pub h2c: bool,
+    pub header_read_timeout: Option<Duration>,
+    pub handshake_timeout: Duration,
+    pub max_headers: Option<usize>,
+    pub max_concurrent_streams: Option<u32>,
+    pub initial_window_size: Option<u32>,
+    pub max_reset_streams: Option<usize>,
+}
 
 /// Единый тип тела ответа: буфер (`Full`) либо стрим (`ChannelBody`).
 type ResBody = BoxBody<Bytes, Infallible>;
@@ -44,18 +59,62 @@ pub struct Shared {
     pub schemas: Vec<crate::schema::LeafSchema>,
     /// Multipart-конфиги по leaf_id. None = маршрут не multipart.
     pub multipart: Vec<Option<crate::multipart::MultipartConfig>>,
+    /// Протокол/TLS/таймауты.
+    pub tuning: Tuning,
+}
+
+/// Auto-билдер (h1 + h2 через ALPN/preface) с настройками таймаутов и h2.
+fn build_auto(t: &Tuning) -> auto::Builder<TokioExecutor> {
+    let mut b = auto::Builder::new(TokioExecutor::new());
+    {
+        let mut h1 = b.http1();
+        h1.timer(TokioTimer::new());
+        if let Some(to) = t.header_read_timeout {
+            h1.header_read_timeout(to);
+        }
+        if let Some(m) = t.max_headers {
+            h1.max_headers(m);
+        }
+    }
+    {
+        let mut h2 = b.http2();
+        h2.timer(TokioTimer::new());
+        if let Some(m) = t.max_concurrent_streams {
+            h2.max_concurrent_streams(m);
+        }
+        if let Some(w) = t.initial_window_size {
+            h2.initial_stream_window_size(w);
+        }
+        if let Some(r) = t.max_reset_streams {
+            h2.max_pending_accept_reset_streams(r); // A1: Rapid Reset (CVE-2023-44487)
+        }
+    }
+    b
+}
+
+/// http1-билдер для plaintext без h2c (h1 only) с read-таймаутом.
+fn build_h1(t: &Tuning) -> http1::Builder {
+    let mut b = http1::Builder::new();
+    b.timer(TokioTimer::new());
+    if let Some(to) = t.header_read_timeout {
+        b.header_read_timeout(to);
+    }
+    if let Some(m) = t.max_headers {
+        b.max_headers(m);
+    }
+    b
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
-pub async fn serve(
-    std_listener: std::net::TcpListener,
-    shared: Arc<Shared>,
-    shutdown: Arc<Notify>,
-) {
+pub async fn serve(std_listener: std::net::TcpListener, shared: Arc<Shared>, shutdown: Arc<Notify>) {
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
         Err(_) => return,
     };
+
+    // Билдеры собираем один раз, шарим в задачи через Arc (serve_connection(&self)).
+    let auto_builder = Arc::new(build_auto(&shared.tuning));
+    let h1_builder = Arc::new(build_h1(&shared.tuning));
 
     loop {
         tokio::select! {
@@ -66,16 +125,36 @@ pub async fn serve(
                     Err(_) => continue, // временная ошибка accept — пропускаем
                 };
                 let peer_ip = peer.ip().to_string();
-                let io = TokioIo::new(stream);
                 let shared = shared.clone();
+                let auto_builder = auto_builder.clone();
+                let h1_builder = h1_builder.clone();
+                let tls = shared.tuning.tls.clone();
+                let handshake_to = shared.tuning.handshake_timeout;
+                let h2c = shared.tuning.h2c;
                 tokio::spawn(async move {
                     let service = service_fn(move |req: Request<Incoming>| {
                         let shared = shared.clone();
                         let peer_ip = peer_ip.clone();
                         async move { Ok::<_, Infallible>(handle(req, shared, peer_ip).await) }
                     });
-                    // Ошибку соединения глотаем: процесс не должен падать.
-                    let _ = http1::Builder::new().serve_connection(io, service).await;
+                    // Ошибки соединения глотаем: процесс не должен падать.
+                    if let Some(acceptor) = tls {
+                        // TLS: хендшейк с таймаутом → ALPN решает h2/h1.1.
+                        if let Ok(Ok(tls_stream)) =
+                            tokio::time::timeout(handshake_to, acceptor.accept(stream)).await
+                        {
+                            let io = TokioIo::new(tls_stream);
+                            let _ = auto_builder.serve_connection(io, service).await;
+                        }
+                    } else if h2c {
+                        // plaintext + h2c prior-knowledge → auto (h1 + h2).
+                        let io = TokioIo::new(stream);
+                        let _ = auto_builder.serve_connection(io, service).await;
+                    } else {
+                        // plaintext, только HTTP/1.1.
+                        let io = TokioIo::new(stream);
+                        let _ = h1_builder.serve_connection(io, service).await;
+                    }
                 });
             }
         }

@@ -16,7 +16,7 @@ napi-derive = "3"
 # async-рантайм и HTTP-стек
 tokio          = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
 hyper          = { version = "1", features = ["server", "http1", "http2"] }
-hyper-util     = { version = "0.1", features = ["tokio"] }
+hyper-util     = { version = "0.1", features = ["http1", "http2", "server-auto", "tokio"] }
 http-body-util = "0.1"
 bytes          = "1"
 
@@ -30,6 +30,9 @@ jsonschema = { version = "0.46", default-features = false }
 serde_json = "1.0.150"
 multer = "3.1.0"
 futures-util = { version = "0.3.32", default-features = false }
+# TLS: провайдер ring (портируемее aws-lc-rs для musl/кросс-сборок M13)
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls-pemfile = "2"
 
 [build-dependencies]
 napi-build = "2"
