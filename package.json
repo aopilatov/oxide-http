@@ -1,7 +1,7 @@
 {
   "name": "@oxide-ts/http",
-  "version": "0.1.0",
-  "description": "Быстрый HTTP/1.1 + HTTP/2 сервер для Node.js на Rust (napi-rs)",
+  "version": "0.1.1",
+  "description": "Fast HTTP/1.1 + HTTP/2 server for Node.js built on Rust (napi-rs)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "license": "MIT",
@@ -72,12 +72,12 @@
     "fastify-alternative"
   ],
   "optionalDependencies": {
-    "@oxide-ts/http-darwin-arm64": "0.1.0",
-    "@oxide-ts/http-darwin-x64": "0.1.0",
-    "@oxide-ts/http-linux-x64-gnu": "0.1.0",
-    "@oxide-ts/http-linux-arm64-gnu": "0.1.0",
-    "@oxide-ts/http-linux-x64-musl": "0.1.0",
-    "@oxide-ts/http-linux-arm64-musl": "0.1.0"
+    "@oxide-ts/http-darwin-arm64": "0.1.1",
+    "@oxide-ts/http-darwin-x64": "0.1.1",
+    "@oxide-ts/http-linux-x64-gnu": "0.1.1",
+    "@oxide-ts/http-linux-arm64-gnu": "0.1.1",
+    "@oxide-ts/http-linux-x64-musl": "0.1.1",
+    "@oxide-ts/http-linux-arm64-musl": "0.1.1"
   },
   "bugs": {
     "url": "https://github.com/aopilatov/oxide-http/issues"

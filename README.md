@@ -1,7 +1,7 @@
 # `@oxide-ts/http`
 
-HTTP/1.1 и HTTP/2 сервер для Node.js: сетевой слой, роутинг, валидация и лимиты —
-в Rust (hyper + tokio), прикладные хендлеры — на JS/TypeScript.
+An HTTP/1.1 and HTTP/2 server for Node.js: the network layer, routing, validation and
+limits live in Rust (hyper + tokio), while application handlers stay in JS/TypeScript.
 
 ```ts
 import { Server } from '@oxide-ts/http';
@@ -16,124 +16,124 @@ await app.listen({ port: 3000 });
 
 ---
 
-## Честно о производительности
+## An honest word about performance
 
-Начнём с того, о чём обычно умалчивают.
+Let's start with what usually goes unmentioned.
 
-**На маршрутах, которые уходят в JS-хендлер, эта библиотека медленнее встроенного
-`node:http`** — примерно 40k против 69k RPS в наших замерах. Причина архитектурная:
-каждый такой запрос пересекает границу napi (вызов ThreadsafeFunction + `Promise`
-через границу), и один этот переход стоит ~17 мкс времени главного потока, тогда как
-`node:http` обрабатывает весь запрос за ~14.5 мкс. Оптимизация JS-обёртки этот разрыв
-не закроет — предел известен и измерен.
+**On routes that end up in a JS handler this library is slower than the built-in
+`node:http`** — roughly 40k versus 69k RPS in our measurements. The reason is
+architectural: every such request crosses the napi boundary (a ThreadsafeFunction call
+plus a `Promise` across the boundary), and that crossing alone costs ~17 µs of main-thread
+time, while `node:http` handles an entire request in ~14.5 µs. Optimizing the JS wrapper
+will not close that gap — the floor is known and measured.
 
-**Выигрыш — там, где JS не будится вообще.** Всё перечисленное отвечает из Rust, не
-отнимая ни микросекунды у event loop (ELU = 0.000 против 1.0 на JS-маршрутах):
+**The win is where JS never wakes at all.** Everything below is answered from Rust without
+taking a single microsecond from the event loop (ELU = 0.000 versus 1.0 on JS routes):
 
-| Что | Эффект |
+| What | Effect |
 |---|---|
-| Роутинг, `404`, `405` + `Allow`, авто-`HEAD`/`OPTIONS` | не доходит до JS |
-| CORS preflight | отвечает Rust |
-| Валидация схемы с отказом → `400` | JS не просыпается |
-| `413` (лимит тела), `415` (тип), `431` (заголовки), `408` (таймаут чтения) | обрываются на краю |
-| `503` при перегрузке + `Retry-After` | до захвата слота |
-| `/healthz`, `/readyz`, `/metrics` | отвечают под нагрузкой и при drain'е |
+| Routing, `404`, `405` + `Allow`, auto-`HEAD`/`OPTIONS` | never reaches JS |
+| CORS preflight | answered by Rust |
+| Schema validation rejection → `400` | JS stays asleep |
+| `413` (body limit), `415` (type), `431` (headers), `408` (read timeout) | cut off at the edge |
+| `503` on overload + `Retry-After` | before a slot is taken |
+| `/healthz`, `/readyz`, `/metrics` | answer under load and during drain |
 
-То есть смысл не в «быстрее Node», а в том, что **мусорный и служебный трафик
-не доходит до вашего event loop**, а прод-обвязка (graceful shutdown, backpressure,
-метрики, лимиты) есть из коробки и работает вне JS.
+So the point is not "faster than Node" but that **junk and housekeeping traffic never
+reaches your event loop**, while production plumbing (graceful shutdown, backpressure,
+metrics, limits) comes built in and runs outside JS.
 
-Подробные числа и методика — [BENCHMARKS.md](BENCHMARKS.md).
+Detailed numbers and methodology live in [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
-## Установка
+## Installation
 
 ```bash
 npm i @oxide-ts/http
-# схемы — опционально:
+# schemas are optional:
 npm i valibot @valibot/to-json-schema
 ```
 
-Node 18+. Готовые бинарники: linux x64/arm64 (glibc и musl), macOS arm64/x64.
-Rust-тулчейн для установки не нужен.
+Node 18+. Prebuilt binaries: linux x64/arm64 (glibc and musl), macOS arm64/x64.
+No Rust toolchain is needed to install.
 
 ---
 
-## Контекст `c`
+## The context `c`
 
-Единственный аргумент хендлера.
+The single argument of a handler.
 
 ```ts
 app.post('/orders/:id', async (c) => {
   c.req.method;                  // 'POST'
-  c.req.path;                    // '/orders/42' (без baseUrl)
+  c.req.path;                    // '/orders/42' (without baseUrl)
   c.req.params.id;               // '42'
   c.req.query.sort;              // last-wins
-  c.req.queries('tag');          // все значения
-  c.req.header('content-type');  // регистронезависимо
-  c.req.ip;                      // с учётом customIpHeaders и PROXY protocol
-  c.req.id;                      // UUIDv7, если не пришёл x-request-id
+  c.req.queries('tag');          // every value
+  c.req.header('content-type');  // case-insensitive
+  c.req.ip;                      // honours customIpHeaders and PROXY protocol
+  c.req.id;                      // UUIDv7 when no x-request-id arrived
   c.req.cookie('sid');
-  c.req.signal;                  // AbortSignal: таймаут/дисконнект
+  c.req.signal;                  // AbortSignal: timeout/disconnect
 
-  await c.req.json();            // тело (лимит соблюдается в Rust)
+  await c.req.json();            // body (the limit is enforced in Rust)
   await c.req.text();
   await c.req.arrayBuffer();
   await c.req.formData();
-  c.req.stream;                  // ReadableStream с backpressure
-  c.req.parts();                 // multipart, потоково
+  c.req.stream;                  // ReadableStream with backpressure
+  c.req.parts();                 // multipart, streaming
 
-  c.set('user', user);           // обмен между middleware
+  c.set('user', user);           // sharing between middleware
   c.get('user');
-  c.log.info('сообщение', { extra: 1 });  // JSON-лог с requestId
+  c.log.info('message', { extra: 1 });  // JSON log carrying requestId
 
   c.status(201).header('x-a', 'b');
   c.cookie('sid', 'v', { httpOnly: true, sameSite: 'lax' });
-  return c.json({ ok: true });   // либо c.text / c.body / c.redirect / c.notFound
+  return c.json({ ok: true });   // or c.text / c.body / c.redirect / c.notFound
 });
 ```
 
-Возврат значения работает как сахар: объект → `c.json`, строка → `c.text`,
-Buffer/поток → `c.body`.
+A returned value works as sugar: an object → `c.json`, a string → `c.text`,
+a Buffer/stream → `c.body`.
 
-## Маршруты и группы
+## Routes and groups
 
 ```ts
 app.get(path, handler);
-app.get(path, options, handler);          // схемы, multipart, маршрутные хуки
-app.get(path, mw1, mw2, handler);         // маршрутные middleware
-// post / put / patch / delete / head / options / all — так же
+app.get(path, options, handler);          // schemas, multipart, route hooks
+app.get(path, mw1, mw2, handler);         // route middleware
+// post / put / patch / delete / head / options / all — same shape
 
 const api = new Server();
 api.get('/ping', (c) => c.text('pong'));
-app.route('/api/v1', api);                // монтирование под префиксом
+app.route('/api/v1', api);                // mounting under a prefix
 ```
 
-⚠️ Один параметр на сегмент: `/:id` работает, `/{id}.{ext}` — нет (ограничение
-роутера). Обходится матчингом сегмента целиком и разбором в хендлере.
+⚠️ One parameter per segment: `/:id` works, `/{id}.{ext}` does not (a router limitation).
+Work around it by matching the whole segment and splitting inside the handler.
 
-## Middleware и хуки
+## Middleware and hooks
 
 ```ts
-app.use(async (c, next) => { await next(); });      // глобальный
-app.use('/admin', authMiddleware);                  // по префиксу
+app.use(async (c, next) => { await next(); });      // global
+app.use('/admin', authMiddleware);                  // scoped by prefix
 
-app.onRequest(fn);        // до разбора тела
+app.onRequest(fn);        // before the body is parsed
 app.preValidation(fn);
 app.preHandler(fn);
-app.preSerialization(fn); // «после»-хуки идут всегда
-app.onSend(fn);           // последняя точка правки заголовков
-app.onResponse(fn);       // наблюдение
+app.preSerialization(fn); // the "after" hooks always run
+app.onSend(fn);           // the last place to adjust headers
+app.onResponse(fn);       // observation
 app.onTimeout(fn);
 app.onError((err, c) => c.json({ error: String(err) }, 500));
 ```
 
-Порядок: `onRequest → preParsing → preValidation → preHandler → [middleware →
-хендлер] → preSerialization → onSend → onResponse`. Любой «до»-хук, сформировавший
-ответ, обрывает цепочку; «после»-хуки выполняются всегда.
+Order: `onRequest → preParsing → preValidation → preHandler → [middleware → handler] →
+preSerialization → onSend → onResponse`. Any "before" hook that produces a response stops
+the chain; the "after" hooks always run.
 
-## Схемы
+## Schemas
 
 ```ts
 import * as v from 'valibot';
@@ -142,73 +142,73 @@ app.post('/users', {
   schema: {
     body: v.object({ name: v.string(), age: v.number() }),
     query: v.object({ dryRun: v.boolean() }),
-    response: { 200: v.object({ id: v.string() }) },   // лишние поля отсекаются
+    response: { 200: v.object({ id: v.string() }) },   // extra fields are stripped
   },
-}, (c) => c.json({ id: 'u1', secret: 'не утечёт' }));
+}, (c) => c.json({ id: 'u1', secret: 'will-not-leak' }));
 ```
 
-Структурная часть проверяется в Rust — невалидный запрос получает `400`, не разбудив
-JS. `transform`/`check` доигрывает valibot уже в JS. Query и params коэрцируются по
-типам из схемы (`?age=42` придёт числом). Принимается и сырой JSON Schema.
+The structural part is checked in Rust — an invalid request receives a `400` without waking
+JS. valibot then applies `transform`/`check` in JS. Query and params are coerced by the
+schema types (`?age=42` arrives as a number). Raw JSON Schema is accepted too.
 
-Формат ошибки: `{ error: 'validation', issues: [{ in, path, message, code }] }`.
+Error shape: `{ error: 'validation', issues: [{ in, path, message, code }] }`.
 
-## Тестирование без сокета
+## Testing without a socket
 
 ```ts
-const res = await app.inject({ method: 'POST', path: '/users', body: { name: 'Аня' } });
+const res = await app.inject({ method: 'POST', path: '/users', body: { name: 'Anna' } });
 res.status;      // 400
 res.json();
 res.headers['content-type'];
-res.rawHeaders;  // с повторами (несколько set-cookie)
+res.rawHeaders;  // with duplicates (multiple set-cookie)
 ```
 
-Запрос идёт по in-memory каналу через **тот же** конвейер — роутинг, схемы, CORS,
-метрики, луковица. Это не мок.
+The request travels through an in-memory pipe and **the same** pipeline — routing, schemas,
+CORS, metrics, the onion. This is not a mock.
 
 ---
 
-## Конфигурация
+## Configuration
 
 ```ts
 new Server({ /* ... */ });
 ```
 
-**Базовое:** `baseUrl`, `bodyLimit` (`'10mb'`), `requestTimeout` (`'30s'`),
+**Basics:** `baseUrl`, `bodyLimit` (`'10mb'`), `requestTimeout` (`'30s'`),
 `requestId.header`, `customIpHeaders`, `customCountryHeaders`.
 
-**Протокол:** `tls: { cert, key }` (PEM-строка, путь или Buffer; ALPN сам согласует
-h2/http1.1), `h2c: true` (HTTP/2 prior-knowledge на plaintext-порту),
+**Protocol:** `tls: { cert, key }` (a PEM string, a path or a Buffer; ALPN negotiates
+h2/http1.1 automatically), `h2c: true` (HTTP/2 prior-knowledge on the plaintext port),
 `http2: { maxConcurrentStreams, initialWindowSize, maxResetStreamsPerSec }`.
 
-**Таймауты и лимиты:** `headerReadTimeout`, `bodyReadTimeout` (→`408`),
+**Timeouts and limits:** `headerReadTimeout`, `bodyReadTimeout` (→`408`),
 `idleTimeout`, `handshakeTimeout`, `maxHeaders`, `maxHeaderSize` (→`431`).
 
-**Жизненный цикл:** `shutdownTimeout` (дефолт `'10s'`), `preShutdownDelay`,
-`handleSignals` (SIGTERM/SIGINT по умолчанию включены).
+**Lifecycle:** `shutdownTimeout` (default `'10s'`), `preShutdownDelay`,
+`handleSignals` (SIGTERM/SIGINT are handled by default).
 
-**Сеть:** `backlog`, `reusePort`, `noDelay`, `maxConnections`, `proxyProtocol`,
-`workerThreads: число | 'auto'` (авто читает cgroup-квоту пода, а не ядра ноды).
+**Network:** `backlog`, `reusePort`, `noDelay`, `maxConnections`, `proxyProtocol`,
+`workerThreads: number | 'auto'` (auto reads the pod's cgroup quota, not the node's cores).
 
-**Наблюдаемость:** `health: { path, readyPath, metricsPath, port }`, `accessLog`.
+**Observability:** `health: { path, readyPath, metricsPath, port }`, `accessLog`.
 
-**Перегрузка:** `maxConcurrentRequests`, `maxQueue`, `queueTimeout`, `retryAfter`,
+**Overload:** `maxConcurrentRequests`, `maxQueue`, `queueTimeout`, `retryAfter`,
 `overloadShedAfter`.
 
 **CORS:** `cors: { origin, methods, allowedHeaders, exposedHeaders, credentials, maxAge }`.
-Preflight отвечает Rust. Динамическая логика origin — обычным JS-middleware.
+Preflight is answered by Rust. Dynamic origin logic goes into a regular JS middleware.
 
-Единицы принимают и строку (`'10mb'`, `'30s'`), и число (байты, миллисекунды).
+Units accept both a string (`'10mb'`, `'30s'`) and a number (bytes, milliseconds).
 
 ---
 
-## Прод: k8s
+## Production: k8s
 
 ```ts
 const app = new Server({
-  preShutdownDelay: '10s',   // снять readiness и ещё принимать, пока LB уводит трафик
-  shutdownTimeout: '15s',    // дедлайн drain'а
-  health: { port: 9090 },    // пробы и метрики на отдельном порту
+  preShutdownDelay: '10s',   // drop readiness and keep accepting while the LB drains
+  shutdownTimeout: '15s',    // drain deadline
+  health: { port: 9090 },    // probes and metrics on a separate port
   maxConcurrentRequests: 500,
   overloadShedAfter: '5s',
   workerThreads: 'auto',
@@ -217,81 +217,81 @@ const app = new Server({
 app.setReadinessCheck(async () => db.isConnected(), { interval: 2000 });
 ```
 
-Манифест — [examples/k8s.yaml](examples/k8s.yaml). Ключевое:
-`terminationGracePeriodSeconds` должен быть **больше** `preShutdownDelay + shutdownTimeout`,
-иначе k8s убьёт под посреди drain'а.
+A manifest lives in [examples/k8s.yaml](examples/k8s.yaml). The key part:
+`terminationGracePeriodSeconds` must be **greater** than `preShutdownDelay + shutdownTimeout`,
+otherwise k8s kills the pod mid-drain.
 
-Последовательность остановки: SIGTERM → `/readyz` отдаёт `503` (под снимается с
-эндпоинтов), listener **ещё принимает** `preShutdownDelay` → затем приём прекращается,
-h2 получает `GOAWAY`, in-flight дожимается до `shutdownTimeout` → `exit 0`.
+Shutdown sequence: SIGTERM → `/readyz` returns `503` (the pod leaves the endpoints), the
+listener **keeps accepting** for `preShutdownDelay` → then accepting stops, h2 receives
+`GOAWAY`, in-flight requests finish until `shutdownTimeout` → `exit 0`.
 
-## Метрики
+## Metrics
 
-`/metrics` в формате Prometheus: `http_requests_total{method,status}` (status —
-класс: `2xx`/`4xx`/...), гистограмма `http_request_duration_seconds`,
-`http_requests_in_flight`, `http_connections_active`, счётчики байт тел.
+`/metrics` in Prometheus format: `http_requests_total{method,status}` (status is a class:
+`2xx`/`4xx`/...), the `http_request_duration_seconds` histogram,
+`http_requests_in_flight`, `http_connections_active`, and body byte counters.
 
 ---
 
-## Примеры
+## Examples
 
-| Файл | Про что |
+| File | Topic |
 |---|---|
-| [01-basic.ts](examples/01-basic.ts) | маршруты, параметры, query, cookies |
-| [02-schemas.ts](examples/02-schemas.ts) | валидация, коэрция, отсечение полей ответа |
-| [03-streaming.ts](examples/03-streaming.ts) | SSE, большие ответы, чтение тела потоком |
-| [04-multipart.ts](examples/04-multipart.ts) | загрузка файлов с лимитами |
-| [05-middleware.ts](examples/05-middleware.ts) | луковица, хуки, ошибки, группы |
+| [01-basic.ts](examples/01-basic.ts) | routes, params, query, cookies |
+| [02-schemas.ts](examples/02-schemas.ts) | validation, coercion, response stripping |
+| [03-streaming.ts](examples/03-streaming.ts) | SSE, large responses, streaming the request body |
+| [04-multipart.ts](examples/04-multipart.ts) | file uploads with limits |
+| [05-middleware.ts](examples/05-middleware.ts) | the onion, hooks, errors, groups |
 | [06-tls-h2.ts](examples/06-tls-h2.ts) | TLS, ALPN, h2c |
-| [k8s.yaml](examples/k8s.yaml) | манифест с пробами и graceful shutdown |
+| [k8s.yaml](examples/k8s.yaml) | a manifest with probes and graceful shutdown |
 
-## Чего нет
+## What is not here
 
-- **WebSocket** — не поддерживается и не планируется (библиотека про API).
-- **Несколько параметров в одном сегменте пути** — ограничение роутера.
-- **Динамическая origin-функция в нативном CORS** — пишется JS-middleware.
-- **Hot-reload TLS-сертификатов** — фаза 2.
-- **Точный код статуса в метриках** — только класс (кардинальность).
+- **WebSocket** — not supported and not planned (this library is about APIs).
+- **Several parameters in one path segment** — a router limitation.
+- **A dynamic origin function in the native CORS** — write a JS middleware.
+- **TLS certificate hot-reload** — phase two.
+- **The exact status code in metrics** — only the class (cardinality).
 
-## Разработка
+## Development
 
 ```bash
-npm run build        # сборка нативного аддона (нужен Rust)
-npm test             # 127 тестов, .ts исполняются Node напрямую
-npm run typecheck    # tsc для библиотеки и тестов
+npm run build        # build the native addon (requires Rust)
+npm test             # 128 tests, .ts executed by Node directly
+npm run typecheck    # tsc for the library and the tests
 npm run lint         # clippy + typecheck
-node bench/run.mjs   # бенчмарки
+node bench/run.mjs   # benchmarks
 ```
 
-Исходники JS-слоя — TypeScript в `js/*.ts` (директория `src/` занята Rust-кодом),
-сборка в `dist/` (CJS). Подробности решений — [IMPLEMENTATION.md](IMPLEMENTATION.md),
-архитектура — [DESIGN.md](DESIGN.md).
+The JS layer's sources are TypeScript in `js/*.ts` (the `src/` directory holds the Rust
+code), built into `dist/` (CJS). Architecture and the decisions behind it live in
+[DESIGN.md](DESIGN.md).
 
-## Лицензия
+## License
 
 MIT
 
 ---
 
-## Сборка из исходников
+## Building from source
 
-Готовые бинарники покрывают linux x64/arm64 (glibc и musl) и macOS arm64/x64.
-Если вашей платформы нет в списке, соберите сами — нужен Rust:
+The prebuilt binaries cover linux x64/arm64 (glibc and musl) and macOS arm64/x64.
+If your platform is not on that list, build it yourself — Rust is required:
 
 ```bash
 git clone https://github.com/aopilatov/oxide-http && cd oxide-http
 npm ci
-npm run build:release   # .node под текущую платформу
-npm run build:ts        # dist/ (CJS + типы)
-node scripts/smoke.cjs  # проверка, что аддон грузится
+npm run build:release   # .node for the current platform
+npm run build:ts        # dist/ (CJS + types)
+node scripts/smoke.cjs  # verify the addon loads
 ```
 
-Проверить загрузку в чистом образе можно готовыми Dockerfile'ами:
+The bundled Dockerfiles verify loading inside a clean image:
 
 ```bash
-docker build -f examples/docker/Dockerfile.ubi9 .     # glibc-бинарник
-docker build -f examples/docker/Dockerfile.alpine .   # musl-бинарник
+docker build -f examples/docker/Dockerfile.ubi9 .     # glibc binary
+docker build -f examples/docker/Dockerfile.alpine .   # musl binary
 ```
 
-Важно: libc аддона обязана совпадать с libc Node. Для Alpine нужен именно
-musl-бинарник — glibc-сборка там не загрузится.
+Important: the addon's libc must match Node's libc. Alpine needs the musl binary
+specifically — a glibc build will not load there.

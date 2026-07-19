@@ -1,8 +1,8 @@
-//! Потоковый парсинг `multipart/form-data` в Rust (§9a) на `multer`.
+//! Streaming `multipart/form-data` parsing in Rust (§9a) on top of `multer`.
 //!
-//! Парсим вне event loop, применяем per-route лимиты и проверки типов **до**
-//! передачи файла в JS. Отдаём в JS поток событий (часть → чанки → конец),
-//! backpressure — через bounded-канал. Диск не трогаем (только потоки).
+//! Parsing happens off the event loop, and per-route limits and type checks are applied
+//! **before** the file reaches JS. JS receives an event stream (part → chunks → end)
+//! with backpressure via a bounded channel. Nothing touches disk — streams only.
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -10,18 +10,18 @@ use http_body_util::BodyStream;
 use hyper::body::Incoming;
 use tokio::sync::mpsc::Sender;
 
-/// Per-route конфиг multipart (лимиты + ограничения типов).
+/// Per-route multipart config (limits plus type restrictions).
 #[derive(Clone, Default)]
 pub struct MultipartConfig {
     pub max_file_size: Option<u64>,
     pub max_field_size: Option<u64>,
     pub max_files: Option<u32>,
     pub max_fields: Option<u32>,
-    pub allowed_mime: Option<Vec<String>>, // паттерны (lowercase), поддержка `image/*`
-    pub allowed_ext: Option<Vec<String>>,  // расширения (lowercase, с точкой)
+    pub allowed_mime: Option<Vec<String>>, // patterns (lowercase), supports `image/*`
+    pub allowed_ext: Option<Vec<String>>,  // extensions (lowercase, with the dot)
 }
 
-/// Событие парсинга, уходящее в JS через канал.
+/// A parsing event sent to JS through the channel.
 pub enum MpEvent {
     Part {
         name: Option<String>,
@@ -30,21 +30,21 @@ pub enum MpEvent {
     },
     Chunk(Bytes),
     PartEnd,
-    /// Нарушение лимита/типа/формата → HTTP-статус (413/415/400) для клиента.
+    /// Limit/type/format violation → an HTTP status (413/415/400) for the client.
     Reject {
         status: u16,
         message: String,
     },
 }
 
-/// Фоновая задача: парсит тело, шлёт события. Прерывается на первом нарушении.
+/// Background task: parses the body and emits events. Stops at the first violation.
 pub async fn parse_task(
     incoming: Incoming,
     boundary: String,
     cfg: MultipartConfig,
     tx: Sender<MpEvent>,
 ) {
-    // Incoming → Stream<Result<Bytes, _>> для multer.
+    // Incoming → Stream<Result<Bytes, _>> for multer.
     let stream =
         BodyStream::new(incoming).map(|r| r.map(|frame| frame.into_data().unwrap_or_default()));
     let mut mp = multer::Multipart::new(stream, boundary);
@@ -55,7 +55,7 @@ pub async fn parse_task(
     loop {
         let mut field = match mp.next_field().await {
             Ok(Some(f)) => f,
-            Ok(None) => break, // конец формы
+            Ok(None) => break, // end of form
             Err(_) => {
                 let _ = tx.send(reject(400, "malformed multipart")).await;
                 return;
@@ -67,7 +67,7 @@ pub async fn parse_task(
         let content_type = field.content_type().map(|m| m.to_string());
         let is_file = filename.is_some();
 
-        // Лимиты по количеству + проверки типов (только для файловых частей).
+        // Count limits plus type checks (file parts only).
         if is_file {
             files += 1;
             if cfg.max_files.is_some_and(|m| files > m) {
@@ -99,10 +99,10 @@ pub async fn parse_task(
             .await
             .is_err()
         {
-            return; // JS отвалился
+            return; // JS went away
         }
 
-        // Стримим чанки части с per-part лимитом размера.
+        // Stream the part's chunks with the per-part size limit.
         let limit = if is_file {
             cfg.max_file_size
         } else {
@@ -122,7 +122,7 @@ pub async fn parse_task(
                         return;
                     }
                 }
-                Ok(None) => break, // конец части
+                Ok(None) => break, // end of part
                 Err(_) => {
                     let _ = tx.send(reject(400, "malformed multipart")).await;
                     return;
@@ -134,7 +134,7 @@ pub async fn parse_task(
             return;
         }
     }
-    // drop tx → канал закрыт → JS видит конец формы
+    // drop tx → channel closed → JS sees the end of the form
 }
 
 fn reject(status: u16, message: &str) -> MpEvent {
@@ -144,7 +144,7 @@ fn reject(status: u16, message: &str) -> MpEvent {
     }
 }
 
-/// Тип части (Content-Type) разрешён? `image/*` — wildcard по префиксу.
+/// Is the part's Content-Type allowed? `image/*` is a prefix wildcard.
 fn mime_allowed(ct: Option<&str>, patterns: &Option<Vec<String>>) -> bool {
     let Some(patterns) = patterns else {
         return true;
@@ -160,7 +160,7 @@ fn mime_allowed(ct: Option<&str>, patterns: &Option<Vec<String>>) -> bool {
     })
 }
 
-/// Расширение файла разрешено?
+/// Is the file extension allowed?
 fn ext_allowed(filename: Option<&str>, exts: &Option<Vec<String>>) -> bool {
     let Some(exts) = exts else {
         return true;
@@ -183,14 +183,14 @@ mod tests {
         assert!(mime_allowed(Some("image/jpeg; charset=x"), &pats));
         assert!(mime_allowed(Some("application/pdf"), &pats));
         assert!(!mime_allowed(Some("text/html"), &pats));
-        assert!(mime_allowed(Some("text/html"), &None)); // нет ограничений
+        assert!(mime_allowed(Some("text/html"), &None)); // no restrictions
     }
 
     #[test]
     fn extension_check() {
         let exts = Some(vec![".png".to_string(), ".jpg".to_string()]);
-        assert!(ext_allowed(Some("photo.PNG"), &exts)); // регистронезависимо
+        assert!(ext_allowed(Some("photo.PNG"), &exts)); // case-insensitive
         assert!(!ext_allowed(Some("evil.exe"), &exts));
-        assert!(ext_allowed(None, &exts)); // не файловая часть
+        assert!(ext_allowed(None, &exts)); // not a file part
     }
 }

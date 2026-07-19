@@ -1,20 +1,20 @@
 {
-  // Проверка типов для тестов: они не входят в сборку пакета (rootDir сборочного
-  // конфига — js/), но проверять их надо.
+  // Type checking for the tests: they are not part of the package build (the build
+  // config's rootDir is js/), but they still need checking.
   //
-  // Библиотека собирается на максимальной строгости (0 ошибок). Здесь три флага
-  // ослаблены намеренно — они требуют аннотаций во внутренних помощниках тестов
-  // (`function up(build)`), не давая ничего взамен. Главное сохраняется:
-  // контекстная типизация от перегрузок маршрутов работает независимо от
-  // noImplicitAny, поэтому опечатка в публичном API (`c.jsonn`, неизвестный ключ
-  // конфига, неверная сигнатура хука) в тестах по-прежнему ошибка компиляции.
+  // The library compiles under maximum strictness (0 errors). A few flags are relaxed
+  // here on purpose — they demand annotations in the tests' internal helpers
+  // (`function up(build)`) without giving anything back. The important part remains:
+  // contextual typing from the route overloads works regardless of noImplicitAny, so a
+  // typo in the public API (`c.jsonn`, an unknown config key, a wrong hook signature)
+  // is still a compile error in tests.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
     "rootDir": ".",
-    // Тесты и фикстуры Node всегда исполняет как ESM (он определяет это по
-    // синтаксису). Сборочный конфиг целится в CJS, поэтому здесь объявляем
-    // модульную систему явно — иначе TS запрещает import.meta и top-level await.
+    // Node always executes tests and fixtures as ESM (it detects this from the syntax).
+    // The build config targets CJS, so we declare the module system explicitly here —
+    // otherwise TS forbids import.meta and top-level await.
     "module": "esnext",
     "moduleResolution": "bundler",
     "noImplicitAny": false,

@@ -1,5 +1,5 @@
-// Фикстура для проверки access-log: лог пишется из Rust в stdout, поэтому нужен
-// отдельный процесс — родительский тест читает его stdout построчно (§11).
+// Fixture for the access-log check: the log is written from Rust to stdout, so a separate
+// process is required — the parent test reads its stdout line by line (§11).
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 

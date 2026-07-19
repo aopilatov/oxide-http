@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 
 import { Server } from '../js/index.ts';
 
-// Фиксированные порты (автовыбор listen({port:0}) — на M10).
+// Fixed ports (auto-selection via listen({port:0}) came in M10).
 let PORT = 20100;
 const nextPort = () => PORT++;
 
-/** Поднять сервер на свободном порту, вернуть { base, close }. */
+/** Start a server on a free port and return { base, close }. */
 async function up(build) {
   const server = new Server(build.config);
   build.routes(server);
@@ -16,7 +16,7 @@ async function up(build) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-test('M2: :param и приоритет static над param', async () => {
+test('M2: :param and static taking priority over param', async () => {
   const s = await up({
     routes: (app) =>
       app
@@ -54,7 +54,7 @@ test('M2: query — last-wins + queries()', async () => {
   }
 });
 
-test('M2: 404 (Rust) и 405 + Allow (Rust)', async () => {
+test('M2: 404 (Rust) and 405 + Allow (Rust)', async () => {
   const s = await up({
     routes: (app) => app.get('/users', (c) => c.text('g')).post('/users', (c) => c.text('p')),
   });
@@ -69,7 +69,7 @@ test('M2: 404 (Rust) и 405 + Allow (Rust)', async () => {
   }
 });
 
-test('M2: авто-HEAD и авто-OPTIONS', async () => {
+test('M2: auto-HEAD and auto-OPTIONS', async () => {
   const s = await up({
     routes: (app) => app.get('/x', (c) => c.body('hello', 200)),
   });
@@ -87,7 +87,7 @@ test('M2: авто-HEAD и авто-OPTIONS', async () => {
   }
 });
 
-test('M2: baseUrl, группы, all(), notFound()', async () => {
+test('M2: baseUrl, groups, all(), notFound()', async () => {
   const sub = new Server();
   sub.get('/ping', (c) => c.text('pong'));
 
@@ -113,7 +113,7 @@ test('M2: baseUrl, группы, all(), notFound()', async () => {
 
 // --- M3 ---
 
-test('M3: c.json ставит статус и content-type', async () => {
+test('M3: c.json sets status and content-type', async () => {
   const s = await up({
     routes: (app) => app.get('/j', (c) => c.json({ ok: true }, 201)),
   });
@@ -127,7 +127,7 @@ test('M3: c.json ставит статус и content-type', async () => {
   }
 });
 
-test('M3: возврат значения как сахар (object→json, string→text)', async () => {
+test('M3: returned value as sugar (object→json, string→text)', async () => {
   const s = await up({
     routes: (app) =>
       app.get('/obj', () => ({ a: 1 })).get('/str', () => 'plain'),
@@ -144,7 +144,7 @@ test('M3: возврат значения как сахар (object→json, stri
   }
 });
 
-test('M3: заголовки запроса регистронезависимы', async () => {
+test('M3: request headers are case-insensitive', async () => {
   const s = await up({
     routes: (app) => app.get('/h', (c) => c.text(c.req.header('X-Custom') ?? 'none')),
   });
@@ -156,7 +156,7 @@ test('M3: заголовки запроса регистронезависимы
   }
 });
 
-test('M3: Set-Cookie отдельными строками + c.req.cookie', async () => {
+test('M3: Set-Cookie as separate lines + c.req.cookie', async () => {
   const s = await up({
     routes: (app) =>
       app.get('/c', (c) => {
@@ -178,7 +178,7 @@ test('M3: Set-Cookie отдельными строками + c.req.cookie', asyn
   }
 });
 
-test('M3: ip/ips/country из custom-заголовков', async () => {
+test('M3: ip/ips/country from custom headers', async () => {
   const s = await up({
     config: {
       customIpHeaders: ['x-forwarded-for'],
@@ -201,7 +201,7 @@ test('M3: ip/ips/country из custom-заголовков', async () => {
   }
 });
 
-test('M3: ip fallback на peer, country undefined без заголовка', async () => {
+test('M3: ip falls back to peer, country undefined without a header', async () => {
   const s = await up({
     routes: (app) => app.get('/ip', (c) => c.json({ ip: c.req.ip, country: c.req.country ?? null })),
   });
@@ -214,7 +214,7 @@ test('M3: ip fallback на peer, country undefined без заголовка', a
   }
 });
 
-test('M3: request-id генерируется (UUIDv7) и уходит в ответ', async () => {
+test('M3: request-id is generated (UUIDv7) and echoed in the response', async () => {
   let seen;
   const s = await up({
     routes: (app) =>
@@ -228,7 +228,7 @@ test('M3: request-id генерируется (UUIDv7) и уходит в отв
     assert.match(seen, /^[0-9a-f-]{36}$/);
     assert.equal(res.headers.get('x-request-id')!, seen);
 
-    // переданный x-request-id сохраняется
+    // a supplied x-request-id is preserved
     const res2 = await fetch(`${s.base}/id`, { headers: { 'x-request-id': 'abc-123' } });
     assert.equal(seen, 'abc-123');
     assert.equal(res2.headers.get('x-request-id'), 'abc-123');
@@ -237,7 +237,7 @@ test('M3: request-id генерируется (UUIDv7) и уходит в отв
   }
 });
 
-test('M3: c.set/get, c.status/header, c.req.path без baseUrl', async () => {
+test('M3: c.set/get, c.status/header, c.req.path without baseUrl', async () => {
   const s = await up({
     config: { baseUrl: '/api' },
     routes: (app) =>

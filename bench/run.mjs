@@ -1,16 +1,16 @@
-// Бенчмарк-харнесс (§17). Запуск: `node bench/run.mjs [--duration=10] [--connections=64]`
+// Benchmark harness (§17). Run: `node bench/run.mjs [--duration=10] [--connections=64]`
 //
-// Методика:
-// · каждый сервер поднимается в ОТДЕЛЬНОМ процессе (bench/servers.mjs) — иначе
-//   генератор нагрузки конкурирует с сервером за event loop, и нативный сервер
-//   с переходом в JS оказывается в заведомо худших условиях;
-// · клиент — `node:http` с keep-alive агентом, без внешних зависимостей;
-// · прогрев 2с, затем замер; считаем RPS и латентности.
+// Methodology:
+// · every server runs in a SEPARATE process (bench/servers.mjs) — otherwise the load
+//   generator competes with the server for the event loop, putting a native server that
+//   crosses into JS at a clear disadvantage;
+// · the client is `node:http` with a keep-alive agent, no external dependencies;
+// · 2s warm-up, then measurement; we report RPS and latencies.
 //
-// ОГРАНИЧЕНИЕ: генератор — тоже Node, и на быстрых серверах он сам становится
-// узким местом. Цифры читать как **относительные**, на одном клиенте и железе.
-// Авторитетные замеры — внешним генератором (oha/bombardier/h2load), желательно
-// с отдельной машины; сценарий описан в BENCHMARKS.md.
+// LIMITATION: the generator is Node too, and against fast servers it becomes the
+// bottleneck itself. Read the numbers as **relative**, on one client and one machine.
+// Authoritative measurements need an external generator (oha/bombardier/h2load),
+// preferably from a separate machine; the scenario is described in BENCHMARKS.md.
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -28,7 +28,7 @@ const WARMUP_MS = 2000;
 
 const TARGETS = [
   { id: 'oxide', name: '@oxide-ts/http' },
-  { id: 'oxide-native', name: '@oxide-ts/http (нативная ручка)' },
+  { id: 'oxide-native', name: '@oxide-ts/http (native endpoint)' },
   { id: 'node-http', name: 'node:http' },
   { id: 'fastify', name: 'fastify' },
   { id: 'hono', name: 'hono (node-server)' },
@@ -37,7 +37,7 @@ const TARGETS = [
 function once(agent, opts) {
   return new Promise((resolve, reject) => {
     const req = http.request({ ...opts, agent }, (res) => {
-      res.resume(); // тело вычитываем, иначе соединение не переиспользуется
+      res.resume(); // drain the body, otherwise the connection is not reused
       res.on('end', () => resolve(res.statusCode));
       res.on('error', reject);
     });
@@ -82,7 +82,7 @@ async function load(opts, ms) {
   };
 }
 
-/** Поднять сервер в отдельном процессе; `null`, если участник не установлен. */
+/** Start a server in a separate process; `null` if the participant is not installed. */
 async function startServer(id, port) {
   const child = spawn(process.execPath, [join(here, 'servers.mjs'), id, String(port)], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -114,7 +114,7 @@ for (const target of TARGETS) {
   const { child, err } = await startServer(target.id, port);
   if (!child) {
     const missing = /Cannot find (package|module)/.test(err);
-    console.log(`· ${target.name}: ${missing ? 'не установлен, пропускаю' : 'не поднялся'}`);
+    console.log(`· ${target.name}: ${missing ? 'not installed, skipping' : 'failed to start'}`);
     port++;
     continue;
   }
@@ -125,16 +125,16 @@ for (const target of TARGETS) {
     const r = await load(opts, DURATION_MS);
     results.push({ name: target.name, ...r });
     console.log(
-      `${target.name.padEnd(30)} rps=${String(r.rps).padStart(7)}  p50=${r.p50}ms  p99=${r.p99}ms  ошибок=${r.errors}`,
+      `${target.name.padEnd(30)} rps=${String(r.rps).padStart(7)}  p50=${r.p50}ms  p99=${r.p99}ms  errors=${r.errors}`,
     );
   } finally {
     child.kill('SIGKILL');
     port++;
-    await new Promise((r) => setTimeout(r, 300)); // дать порту освободиться
+    await new Promise((r) => setTimeout(r, 300)); // let the port free up
   }
 }
 
-console.log('\n--- сводка (JSON) ---');
+console.log('\n--- summary (JSON) ---');
 console.log(
   JSON.stringify(
     {

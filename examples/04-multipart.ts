@@ -1,5 +1,5 @@
-// Загрузка файлов (§9a): парсинг в Rust потоково, лимиты и типы проверяются
-// ДО передачи файла в JS — мусорный запрос обрывается на краю.
+// File uploads (§9a): streaming parsing in Rust, with limits and types checked BEFORE
+// the file reaches JS — a junk request is cut off at the edge.
 import { Server } from '../js/index.ts';
 
 const app = new Server();
@@ -20,7 +20,7 @@ app.post(
 
     for await (const part of c.req.parts()) {
       if (part.filename != null) {
-        // Потоково: файл не оседает в памяти целиком.
+        // Streaming: the file never lands in memory as a whole.
         let bytes = 0;
         for await (const chunk of part.stream) bytes += chunk.length;
         files.push({ name: part.name, filename: part.filename, bytes });
@@ -32,7 +32,7 @@ app.post(
   },
 );
 
-// Сахар: если файлы небольшие, можно взять готовую FormData.
+// Sugar: for small files you can grab a ready-made FormData.
 app.post('/form', { multipart: true }, async (c) => {
   const fd = await c.req.formData();
   return c.json({ keys: [...fd.keys()] });

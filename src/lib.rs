@@ -1,7 +1,8 @@
 #![deny(clippy::all)]
 
-//! `@oxide-ts/http` — нативный аддон (napi-rs). Публичный JS-API живёт в обёртке
-//! `js/index.js`; здесь — низкоуровневый `RustServer`. См. DESIGN.md / IMPLEMENTATION.md.
+//! `@oxide-ts/http` — the native addon (napi-rs). The public JS API lives in the
+//! `js/index.ts` wrapper; this file holds the low-level `RustServer`.
+//! See DESIGN.md.
 
 mod bridge;
 mod cors;
@@ -36,7 +37,7 @@ use crate::router::{RouteDef as RRouteDef, Routes};
 use crate::server::{serve, Shared, Tuning};
 use crate::stream::BodyIo;
 
-/// Опции CORS с JS-стороны (нормализованы обёрткой). Отсутствие = CORS выключен.
+/// CORS options from the JS side (normalized by the wrapper). Absent = CORS off.
 #[napi(object)]
 pub struct CorsOptions {
     pub origins: Vec<String>,
@@ -47,8 +48,8 @@ pub struct CorsOptions {
     pub max_age: Option<i64>,
 }
 
-/// Определение маршрута из JS-обёртки (path уже склеен с baseUrl/групповым префиксом).
-/// Схемы — JSON Schema как строки (обёртка конвертирует valibot заранее).
+/// Route definition from the JS wrapper (path already joined with baseUrl/group prefix).
+/// Schemas are JSON Schema strings (the wrapper converts valibot beforehand).
 #[napi(object)]
 pub struct RouteDef {
     pub method: String,
@@ -60,7 +61,7 @@ pub struct RouteDef {
     pub multipart: Option<MultipartOptions>,
 }
 
-/// Per-route опции multipart (нормализованы обёрткой; лимиты в байтах/штуках).
+/// Per-route multipart options (normalized by the wrapper; limits in bytes/counts).
 #[napi(object)]
 pub struct MultipartOptions {
     pub max_file_size: Option<i64>,
@@ -71,14 +72,14 @@ pub struct MultipartOptions {
     pub allowed_extensions: Option<Vec<String>>,
 }
 
-/// TLS-сертификаты (PEM-строки; путь/Buffer резолвит обёртка).
+/// TLS certificates (PEM strings; the wrapper resolves path/Buffer).
 #[napi(object)]
 pub struct TlsOptions {
     pub cert: String,
     pub key: String,
 }
 
-/// Опции HTTP/2 (§6c A1).
+/// HTTP/2 options (§6c A1).
 #[napi(object)]
 pub struct Http2Options {
     pub max_concurrent_streams: Option<i64>,
@@ -86,80 +87,80 @@ pub struct Http2Options {
     pub max_reset_streams_per_sec: Option<i64>,
 }
 
-/// Опции сервера, влияющие на вычисление контекста в Rust (§4, §7, §6d).
+/// Server options that affect how the context is computed in Rust (§4, §7, §6d).
 #[napi(object)]
 pub struct ListenOptions {
     pub custom_ip_headers: Option<Vec<String>>,
     pub custom_country_headers: Option<Vec<String>>,
     pub request_id_header: Option<String>,
-    /// Жёсткий лимит тела запроса в байтах (авторитетно в Rust). null/отсутствие = без лимита.
+    /// Hard request body limit in bytes (authoritative in Rust). null/absent = no limit.
     pub body_limit: Option<i64>,
-    /// Нативный CORS. null/отсутствие = выключен.
+    /// Native CORS. null/absent = disabled.
     pub cors: Option<CorsOptions>,
-    /// TLS (§12). null/отсутствие = plaintext.
+    /// TLS (§12). null/absent = plaintext.
     pub tls: Option<TlsOptions>,
-    /// h2c prior-knowledge на plaintext-порту (§19).
+    /// h2c prior-knowledge on the plaintext port (§19).
     ///
-    /// `js_name` обязателен: автоконвертация napi даёт `h2C` (буква после цифры
-    /// поднимается в верхний регистр), обёртка шлёт `h2c` — поле молча терялось.
+    /// `js_name` is required: napi's auto-conversion yields `h2C` (the letter after a
+    /// digit is upper-cased) while the wrapper sends `h2c` — the field was silently lost.
     #[napi(js_name = "h2c")]
     pub h2c: Option<bool>,
-    /// Таймаут чтения заголовков в мс (Slowloris, §6c A2).
+    /// Header read timeout in ms (Slowloris, §6c A2).
     pub header_read_timeout: Option<i64>,
-    /// Таймаут ожидания чанка тела запроса в мс (§6c A2) → 408.
+    /// Timeout waiting for a request body chunk, ms (§6c A2) → 408.
     pub body_read_timeout: Option<i64>,
-    /// Простой соединения без чтения/записи в мс (§6c A2) → закрытие.
+    /// Connection idle without reads/writes, ms (§6c A2) → close.
     pub idle_timeout: Option<i64>,
-    /// Таймаут TLS-хендшейка в мс.
+    /// TLS handshake timeout in ms.
     pub handshake_timeout: Option<i64>,
-    /// Лимит числа заголовков.
+    /// Limit on the number of headers.
     pub max_headers: Option<i64>,
-    /// Предел размера блока заголовков в байтах (§6c B10) → 431.
+    /// Header block size limit in bytes (§6c B10) → 431.
     pub max_header_size: Option<i64>,
-    /// Дедлайн graceful shutdown в мс (§10). По умолчанию 10с.
+    /// Graceful shutdown deadline in ms (§10). Defaults to 10s.
     pub shutdown_timeout: Option<i64>,
-    /// Пауза между снятием readiness и закрытием listener'а в мс (§10 + §11).
-    /// Даёт балансировщику убрать под из эндпоинтов до отказа в соединениях.
+    /// Pause between dropping readiness and closing the listener, ms (§10 + §11).
+    /// Gives the balancer time to remove the pod from endpoints before refusals start.
     pub pre_shutdown_delay: Option<i64>,
-    /// Путь Unix-сокета (§6c B9). Задан → слушаем его, `port`/`host` игнорируются.
+    /// Unix socket path (§6c B9). Set → we listen on it and ignore `port`/`host`.
     pub unix_path: Option<String>,
-    /// Глубина accept-очереди (§6c B9). По умолчанию 1024.
+    /// Accept queue depth (§6c B9). Defaults to 1024.
     pub backlog: Option<i64>,
-    /// `SO_REUSEPORT` — несколько процессов на одном порту (§6c B9).
+    /// `SO_REUSEPORT` — several processes on one port (§6c B9).
     pub reuse_port: Option<bool>,
-    /// `TCP_NODELAY` (§6c B9). По умолчанию включён.
+    /// `TCP_NODELAY` (§6c B9). Enabled by default.
     pub no_delay: Option<bool>,
-    /// Потолок одновременных соединений (§6c B9).
+    /// Cap on concurrent connections (§6c B9).
     pub max_connections: Option<i64>,
-    /// Ждать PROXY protocol v1/v2 на каждом соединении (§6c A4).
+    /// Expect PROXY protocol v1/v2 on every connection (§6c A4).
     pub proxy_protocol: Option<bool>,
-    /// Число tokio-воркеров; `0`/отсутствие = авто по cgroup-квоте (§6c A3).
+    /// Number of tokio workers; `0`/absent = auto from the cgroup quota (§6c A3).
     pub worker_threads: Option<i64>,
-    /// Путь liveness-пробы (§11). Пустая строка = выключить.
+    /// Liveness probe path (§11). Empty string disables it.
     pub health_path: Option<String>,
-    /// Путь readiness-пробы (§11). Пустая строка = выключить.
+    /// Readiness probe path (§11). Empty string disables it.
     pub ready_path: Option<String>,
-    /// Путь метрик Prometheus (§11). Пустая строка = выключить.
+    /// Prometheus metrics path (§11). Empty string disables it.
     pub metrics_path: Option<String>,
-    /// Отдельный порт для проб/метрик (§11); задан → на основном порту их нет.
+    /// Separate port for probes/metrics (§11); set → they are absent from the main port.
     pub admin_port: Option<u16>,
-    /// JSON access-log в stdout (§11).
+    /// JSON access log to stdout (§11).
     pub access_log: Option<bool>,
-    /// Потолок одновременно обрабатываемых запросов (§6c C5). Сверх — 503.
+    /// Cap on concurrently handled requests (§6c C5). Above it — 503.
     pub max_concurrent_requests: Option<i64>,
-    /// Сколько запросов ждут слот сверх лимита (§6c C5). 0 = очереди нет.
+    /// How many requests may wait for a slot beyond the limit (§6c C5). 0 = no queue.
     pub max_queue: Option<i64>,
-    /// Сколько ждать в очереди, мс (§6c C5). По умолчанию 1с.
+    /// How long to wait in the queue, ms (§6c C5). Defaults to 1s.
     pub queue_timeout: Option<i64>,
-    /// Значение заголовка `Retry-After` в секундах при 503 (§6c C5).
+    /// `Retry-After` header value in seconds for 503 (§6c C5).
     pub retry_after: Option<i64>,
-    /// Длительность непрерывной перегрузки, после которой снимается readiness, мс
-    /// (§6c C5). Отсутствие/0 = readiness не трогать.
+    /// How long continuous overload must last before readiness drops, ms (§6c C5).
+    /// Absent/0 = leave readiness alone.
     pub overload_shed_after: Option<i64>,
     pub http2: Option<Http2Options>,
 }
 
-/// Ответ `app.inject` (§17): без сокета, но структура та же, что у обычного ответа.
+/// `app.inject` response (§17): no socket involved, same shape as a regular response.
 #[napi(object)]
 pub struct InjectResponse {
     pub status: u16,
@@ -167,29 +168,29 @@ pub struct InjectResponse {
     pub body: napi::bindgen_prelude::Buffer,
 }
 
-/// Забинденный сокет до передачи в рантайм (регистрация в реакторе — уже там).
+/// A bound socket before handing it to the runtime (reactor registration happens there).
 enum ListenTarget {
     Tcp(std::net::TcpListener),
     Unix(std::os::unix::net::UnixListener),
 }
 
-/// Состояние запущенного сервера (живёт, пока сервер слушает).
+/// State of a running server (lives while the server listens).
 struct Running {
     runtime: Runtime,
-    /// Broadcast сигнала остановки: его слушают и accept-цикл, и каждое соединение
-    /// (`watch`, а не `Notify`: нужно разбудить всех, включая ещё не подписавшихся).
+    /// Broadcast of the stop signal: both the accept loop and every connection listen
+    /// to it (`watch`, not `Notify`: we must wake everyone, including late subscribers).
     shutdown: watch::Sender<u8>,
-    /// Сигнал «drain завершён» от accept-цикла.
+    /// "Drain complete" signal from the accept loop.
     done: Arc<Notify>,
-    /// Общее состояние — нужно, чтобы JS мог менять readiness на лету (§11).
+    /// Shared state — needed so JS can change readiness on the fly (§11).
     shared: Arc<Shared>,
-    /// Дедлайн drain'а + запас: страховка, если сигнал `done` не придёт вовсе.
+    /// Drain deadline plus slack: a safety net if the `done` signal never arrives.
     close_deadline: std::time::Duration,
-    /// Пауза между снятием readiness и закрытием listener'а (§10 + §11).
+    /// Pause between dropping readiness and closing the listener (§10 + §11).
     pre_shutdown_delay: std::time::Duration,
 }
 
-/// Низкоуровневый сервер. Оборачивается JS-классом `Server`.
+/// The low-level server. Wrapped by the JS `Server` class.
 #[napi]
 pub struct RustServer {
     state: Mutex<Option<Running>>,
@@ -198,17 +199,17 @@ pub struct RustServer {
 #[napi]
 impl RustServer {
     #[napi(constructor)]
-    #[allow(clippy::new_without_default)] // конструктор экспортируется в JS
+    #[allow(clippy::new_without_default)] // the constructor is exported to JS
     pub fn new() -> Self {
         RustServer {
             state: Mutex::new(None),
         }
     }
 
-    /// Поднять HTTP/1.1 на `host:port` с таблицей маршрутов.
+    /// Start HTTP/1.1 on `host:port` with a route table.
     ///
-    /// Роутинг/`404`/`405`/авто-`OPTIONS` — в Rust; попадание в лист зовёт
-    /// `dispatch(req) => Promise<res>`. Неблокирующий (accept-цикл в фоне).
+    /// Routing/`404`/`405`/auto-`OPTIONS` happen in Rust; hitting a leaf calls
+    /// `dispatch(req) => Promise<res>`. Non-blocking (the accept loop runs in background).
     #[napi]
     pub fn listen(
         &self,
@@ -219,7 +220,7 @@ impl RustServer {
         options: ListenOptions,
         dispatch: Function<(MatchedRequest, BodyIo), Promise<JsResponse>>,
     ) -> Result<()> {
-        // Компилируем деревья + схемы ДО bind: конфликты/невалидные паттерны/схемы → ранняя ошибка.
+        // Compile trees and schemas BEFORE bind: conflicts/invalid patterns/schemas fail early.
         let n = routes.len();
         let mut route_defs = Vec::with_capacity(n);
         let mut schema_slots: Vec<Option<crate::schema::LeafSchema>> =
@@ -250,10 +251,11 @@ impl RustServer {
             .collect();
         let routes = Routes::build(route_defs).map_err(napi::Error::from_reason)?;
 
-        // TSFN строим синхронно, пока JS-функция жива; дальше она 'static + Send.
+        // Build the TSFN synchronously while the JS function is alive; afterwards it is
+        // 'static + Send.
         let tsfn: Handler = dispatch.build_threadsafe_function().build()?;
 
-        // TLS-акцептор (парсинг PEM может упасть → ранняя ошибка до bind).
+        // TLS acceptor (PEM parsing may fail → an early error before bind).
         let tls = match options.tls {
             Some(t) => {
                 Some(tls::build_acceptor(&t.cert, &t.key).map_err(napi::Error::from_reason)?)
@@ -324,8 +326,8 @@ impl RustServer {
             socket,
         };
 
-        // Биндим синхронно → ошибки (EADDRINUSE, нет прав на путь) отдаём сразу.
-        // Unix-сокет имеет приоритет над port/host, если путь задан.
+        // Bind synchronously → errors (EADDRINUSE, no permission for the path) surface
+        // immediately. A Unix socket takes priority over port/host when a path is set.
         let unix_path = options.unix_path.clone();
         let listen_target: ListenTarget = match &unix_path {
             Some(path) => ListenTarget::Unix(
@@ -338,8 +340,8 @@ impl RustServer {
             ),
         };
 
-        // Admin-порт (§11) биндим тоже синхронно: занятый порт метрик должен
-        // валить listen(), а не всплывать позже молчаливым отсутствием проб.
+        // The admin port (§11) is bound synchronously too: a busy metrics port must fail
+        // listen() instead of surfacing later as silently missing probes.
         let admin_target = match tuning.admin_port {
             Some(p) => Some(
                 listener::bind_tcp(&host, p, &tuning.socket)
@@ -348,8 +350,8 @@ impl RustServer {
             None => None,
         };
 
-        // Воркеры: явное число, иначе авто по cgroup-квоте (§6c A3) — в контейнере
-        // число ядер ноды сильно больше реального лимита пода.
+        // Workers: an explicit number, otherwise auto from the cgroup quota (§6c A3) —
+        // inside a container the node's core count far exceeds the pod's real limit.
         let workers = match options.worker_threads.filter(|&n| n > 0) {
             Some(n) => n as usize,
             None => crate::cpu::worker_threads_auto(),
@@ -405,7 +407,7 @@ impl RustServer {
         let done = Arc::new(Notify::new());
         let done_srv = done.clone();
 
-        // Readiness держим и на JS-стороне (setReady/setReadinessCheck).
+        // Readiness is also driven from JS (setReady/setReadinessCheck).
         let readiness_handle = shared.clone();
 
         if let Some(admin) = admin_target {
@@ -417,7 +419,7 @@ impl RustServer {
                 }
             });
         }
-        // Регистрация сокета в реакторе — уже внутри рантайма (from_std требует его).
+        // Registering the socket with the reactor happens inside the runtime (from_std needs it).
         runtime.spawn(async move {
             let bound = match listen_target {
                 ListenTarget::Tcp(l) => tokio::net::TcpListener::from_std(l).map(Bound::Tcp),
@@ -441,12 +443,12 @@ impl RustServer {
         Ok(())
     }
 
-    /// Прогнать запрос через конвейер без сокета (§17, `app.inject`).
+    /// Run a request through the pipeline without a socket (§17, `app.inject`).
     ///
-    /// Выполняется на серверном рантайме (там живут TSFN и состояние), результат
-    /// приезжает обратно через oneshot. Требует поднятого сервера: маршруты и схемы
-    /// компилируются в `listen()` — обёртка при необходимости поднимает его на
-    /// эфемерном порту, но сам запрос через сокет не идёт.
+    /// Executes on the server runtime (where the TSFN and state live); the result comes
+    /// back through a oneshot. Requires a started server: routes and schemas are compiled
+    /// in `listen()` — the wrapper starts one on an ephemeral port when needed, but the
+    /// request itself never travels over a socket.
     #[napi]
     pub async fn inject(
         &self,
@@ -459,7 +461,7 @@ impl RustServer {
             let guard = self.state.lock().unwrap();
             let running = guard
                 .as_ref()
-                .ok_or_else(|| napi::Error::from_reason("inject: сервер не запущен"))?;
+                .ok_or_else(|| napi::Error::from_reason("inject: server is not running"))?;
             (running.shared.clone(), running.runtime.handle().clone())
         };
 
@@ -473,12 +475,12 @@ impl RustServer {
             builder = builder.header(&kv.key, &kv.value);
         }
         if !has_host {
-            // HTTP/1.1 требует Host; в inject реального хоста нет — ставим заглушку.
+            // HTTP/1.1 requires Host; inject has no real host — use a placeholder.
             builder = builder.header("host", "inject.local");
         }
         let req = builder
             .body(http_body_util::Full::new(body_bytes))
-            .map_err(|e| napi::Error::from_reason(format!("inject: некорректный запрос: {e}")))?;
+            .map_err(|e| napi::Error::from_reason(format!("inject: malformed request: {e}")))?;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         handle.spawn(async move {
@@ -492,13 +494,13 @@ impl RustServer {
                 body: body.to_vec().into(),
             }),
             Ok(Err(e)) => Err(napi::Error::from_reason(e)),
-            Err(_) => Err(napi::Error::from_reason("inject: задача прервана")),
+            Err(_) => Err(napi::Error::from_reason("inject: task aborted")),
         }
     }
 
-    /// Выставить readiness из JS (§11): `app.setReady(false)` снимает под с эндпоинтов,
-    /// не трогая liveness. Периодический `readinessCheck` пушит сюда же свой результат.
-    /// До `listen()` — no-op (состояния ещё нет).
+    /// Set readiness from JS (§11): `app.setReady(false)` removes the pod from the
+    /// endpoints without touching liveness. The periodic `readinessCheck` pushes its
+    /// verdict here too. Before `listen()` this is a no-op (there is no state yet).
     #[napi]
     pub fn set_ready(&self, ready: bool) -> Result<()> {
         if let Some(running) = self.state.lock().unwrap().as_ref() {
@@ -507,37 +509,37 @@ impl RustServer {
         Ok(())
     }
 
-    /// Graceful shutdown (§10). Резолвится, когда in-flight запросы дожаты
-    /// (или истёк `shutdownTimeout`). Идемпотентно: повторный вызов — no-op.
+    /// Graceful shutdown (§10). Resolves once in-flight requests have finished (or
+    /// `shutdownTimeout` expired). Idempotent: a repeated call is a no-op.
     ///
-    /// Порядок: сигнал → accept-цикл закрывает listener (порт свободен сразу) →
-    /// соединения получают `graceful_shutdown` (h2 — `GOAWAY`) → drain → `done`.
+    /// Order: signal → the accept loop closes the listener (the port frees immediately)
+    /// → connections receive `graceful_shutdown` (h2 gets `GOAWAY`) → drain → `done`.
     ///
-    /// Рантайм гасим в отдельном системном потоке через `shutdown_timeout`, а не
-    /// `shutdown_background`: последний возвращается сразу и **может не уничтожить
-    /// рантайм вообще** (док tokio). Тогда не дропается `Arc<Shared>`, а вместе с ним
-    /// живут listener (порт занят) и `ThreadsafeFunction` (держит ref на event loop) —
-    /// процесс Node не завершается.
+    /// The runtime is shut down on a separate OS thread via `shutdown_timeout` rather
+    /// than `shutdown_background`: the latter returns immediately and **may never destroy
+    /// the runtime at all** (tokio docs). Then `Arc<Shared>` is never dropped, and with it
+    /// the listener (port stays busy) and the `ThreadsafeFunction` (holds a ref on the
+    /// event loop) stay alive — the Node process never exits.
     #[napi]
     pub async fn close(&self) -> Result<()> {
         let Some(running) = self.state.lock().unwrap().take() else {
             return Ok(());
         };
-        // Стадия 1: снимаем readiness, но продолжаем принимать. Балансировщику нужно
-        // время заметить `/readyz` 503 и увести трафик; закрой мы listener сразу —
-        // запросы, уже направленные на этот под, получили бы connection refused.
+        // Stage 1: drop readiness but keep accepting. The balancer needs time to notice
+        // the `/readyz` 503 and drain traffic away; closing the listener right away would
+        // give connection refused to requests already routed to this pod.
         running.shared.readiness.set_draining(true);
         if !running.pre_shutdown_delay.is_zero() {
             let _ = running.shutdown.send(crate::server::PRE_SHUTDOWN);
             tokio::time::sleep(running.pre_shutdown_delay).await;
         }
 
-        // Стадия 2: перестаём принимать и просим соединения закрыться.
-        // Ошибку send игнорируем: получателей может уже не быть (accept-цикл упал).
+        // Stage 2: stop accepting and ask connections to close.
+        // The send error is ignored: there may be no receivers left (accept loop died).
         let _ = running.shutdown.send(crate::server::CLOSING);
 
-        // Ждём drain. Свой дедлайн — на случай, если сигнал `done` не придёт вовсе
-        // (паника в accept-цикле): close() не должен зависнуть навсегда.
+        // Wait for the drain. Our own deadline covers the case where the `done` signal
+        // never arrives (a panic in the accept loop): close() must not hang forever.
         let _ = tokio::time::timeout(running.close_deadline, running.done.notified()).await;
 
         std::thread::spawn(move || {
@@ -549,7 +551,7 @@ impl RustServer {
     }
 }
 
-/// napi MultipartOptions → внутренний MultipartConfig (лимиты i64 → u64/u32).
+/// napi MultipartOptions → the internal MultipartConfig (limits i64 → u64/u32).
 fn multipart_config(o: MultipartOptions) -> crate::multipart::MultipartConfig {
     let u64_of = |v: Option<i64>| v.filter(|&n| n >= 0).map(|n| n as u64);
     let u32_of = |v: Option<i64>| v.filter(|&n| n >= 0).map(|n| n as u32);

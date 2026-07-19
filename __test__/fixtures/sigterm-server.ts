@@ -1,6 +1,6 @@
-// Фикстура для теста SIGTERM: поднимается, печатает 'ready', медленно отвечает.
-// Родительский тест шлёт SIGTERM во время запроса и проверяет, что ответ дожался,
-// а процесс вышел с кодом 0 (§10 graceful shutdown).
+// Fixture for the SIGTERM test: starts up, prints 'ready', answers slowly.
+// The parent test sends SIGTERM mid-request and checks that the response completed and
+// the process exited with code 0 (§10 graceful shutdown).
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 

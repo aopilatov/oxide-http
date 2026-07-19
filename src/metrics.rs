@@ -1,38 +1,38 @@
-//! Метрики в формате Prometheus (§11).
+//! Prometheus-format metrics (§11).
 //!
-//! Всё на атомиках без блокировок: счётчики живут в массивах фиксированного размера
-//! (метод × класс статуса), гистограмма — массив бакетов + сумма + количество.
-//! Ни аллокаций, ни `Mutex` на горячем пути запроса.
+//! Everything is lock-free atomics: counters live in fixed-size arrays
+//! (method × status class), the histogram is an array of buckets + sum + count.
+//! No allocations and no `Mutex` on the hot request path.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-/// Методы, для которых держим отдельные счётчики; всё остальное — `other`.
+/// Methods with their own counters; everything else falls into `other`.
 const METHODS: [&str; 8] = [
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "other",
 ];
 const OTHER_METHOD: usize = 7;
 
-/// Классы статуса: 1xx..5xx.
+/// Status classes: 1xx..5xx.
 const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
 
-/// Границы бакетов гистограммы латентности, секунды (аналог дефолта Prometheus).
+/// Latency histogram bucket bounds in seconds (mirrors the Prometheus default).
 const BUCKETS: [f64; 12] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
-/// Реестр метрик процесса. Один на сервер, шарится через `Arc<Shared>`.
+/// Process metrics registry. One per server, shared via `Arc<Shared>`.
 pub struct Metrics {
-    /// Запросы: [метод][класс статуса].
+    /// Requests: [method][status class].
     requests: [[AtomicU64; CLASSES.len()]; METHODS.len()],
-    /// Гистограмма латентности: кумулятивные счётчики по бакетам + сумма + всего.
+    /// Latency histogram: per-bucket counters + sum + total.
     duration_buckets: [AtomicU64; BUCKETS.len()],
     duration_sum_micros: AtomicU64,
     duration_count: AtomicU64,
-    /// Запросы в обработке прямо сейчас.
+    /// Requests being handled right now.
     in_flight: AtomicI64,
-    /// Открытые соединения.
+    /// Open connections.
     connections: AtomicI64,
-    /// Прочитанные/записанные байты тел.
+    /// Body bytes read/written.
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
 }
@@ -73,7 +73,7 @@ impl Metrics {
         self.response_bytes.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Запрос завершён: снять in-flight, разложить по счётчикам и гистограмме.
+    /// Request finished: drop in-flight, fold into counters and the histogram.
     pub fn request_finished(&self, method: &str, status: u16, elapsed: std::time::Duration) {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
 
@@ -84,7 +84,8 @@ impl Metrics {
         let secs = elapsed.as_secs_f64();
         for (i, edge) in BUCKETS.iter().enumerate() {
             if secs <= *edge {
-                // Кумулятивность («le») достраивается при выводе, здесь — первый подходящий.
+                // The cumulative "le" semantics are built at render time; here we
+                // only bump the first matching bucket.
                 self.duration_buckets[i].fetch_add(1, Ordering::Relaxed);
                 break;
             }
@@ -94,17 +95,17 @@ impl Metrics {
         self.duration_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Текстовый формат Prometheus (exposition format 0.0.4).
+    /// Prometheus text format (exposition format 0.0.4).
     pub fn encode(&self) -> String {
         let mut out = String::with_capacity(2048);
 
-        out.push_str("# HELP http_requests_total Обработано HTTP-запросов.\n");
+        out.push_str("# HELP http_requests_total Total HTTP requests handled.\n");
         out.push_str("# TYPE http_requests_total counter\n");
         for (mi, method) in METHODS.iter().enumerate() {
             for (ci, class) in CLASSES.iter().enumerate() {
                 let v = self.requests[mi][ci].load(Ordering::Relaxed);
                 if v == 0 {
-                    continue; // не засоряем вывод нулями
+                    continue; // do not clutter the output with zeros
                 }
                 out.push_str(&format!(
                     "http_requests_total{{method=\"{method}\",status=\"{class}\"}} {v}\n"
@@ -112,7 +113,7 @@ impl Metrics {
             }
         }
 
-        out.push_str("# HELP http_request_duration_seconds Латентность обработки запроса.\n");
+        out.push_str("# HELP http_request_duration_seconds Request handling latency.\n");
         out.push_str("# TYPE http_request_duration_seconds histogram\n");
         let mut cumulative = 0u64;
         for (i, edge) in BUCKETS.iter().enumerate() {
@@ -132,12 +133,12 @@ impl Metrics {
         let gauges = [
             (
                 "http_requests_in_flight",
-                "Запросы в обработке прямо сейчас.",
+                "Requests currently being handled.",
                 self.in_flight.load(Ordering::Relaxed),
             ),
             (
                 "http_connections_active",
-                "Открытые соединения.",
+                "Open connections.",
                 self.connections.load(Ordering::Relaxed),
             ),
         ];
@@ -149,12 +150,12 @@ impl Metrics {
         let counters = [
             (
                 "http_request_body_bytes_total",
-                "Прочитано байт тел запросов.",
+                "Request body bytes read.",
                 self.request_bytes.load(Ordering::Relaxed),
             ),
             (
                 "http_response_body_bytes_total",
-                "Записано байт тел ответов.",
+                "Response body bytes written.",
                 self.response_bytes.load(Ordering::Relaxed),
             ),
         ];
@@ -202,7 +203,7 @@ mod tests {
         let out = m.encode();
         assert!(out.contains("http_requests_total{method=\"GET\",status=\"2xx\"} 1"));
         assert!(out.contains("http_requests_total{method=\"POST\",status=\"4xx\"} 1"));
-        // Неизвестный метод схлопывается в other, чтобы не рос кардиналитет.
+        // An unknown method collapses into `other` to keep cardinality bounded.
         assert!(out.contains("http_requests_total{method=\"other\",status=\"5xx\"} 1"));
         assert!(out.contains("http_requests_in_flight 0"));
     }
@@ -215,12 +216,12 @@ mod tests {
             m.request_finished("GET", 200, Duration::from_millis(2));
         }
         let out = m.encode();
-        // 2мс попадает в бакет 0.005 и во все следующие.
+        // 2ms lands in the 0.005 bucket and every one above it.
         assert!(out.contains("http_request_duration_seconds_bucket{le=\"0.005\"} 3"));
         assert!(out.contains("http_request_duration_seconds_bucket{le=\"0.1\"} 3"));
         assert!(out.contains("http_request_duration_seconds_bucket{le=\"+Inf\"} 3"));
         assert!(out.contains("http_request_duration_seconds_count 3"));
-        // 0.001 меньше замера — туда не должно попасть.
+        // 0.001 is below the measurement — nothing should land there.
         assert!(out.contains("http_request_duration_seconds_bucket{le=\"0.001\"} 0"));
     }
 }

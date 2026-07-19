@@ -1,13 +1,13 @@
 # Red Hat UBI 10.
 FROM redhat/ubi10:latest
 
-# В UBI 10 модульность DNF объявлена устаревшей, потока nodejs:20 там нет
-# (в отличие от UBI 9) — nodejs ставится обычным пакетом и уже свежий.
-# Версию печатаем и проверяем, что она не ниже нашего engines >= 18.
+# In UBI 10 DNF modularity is deprecated and there is no nodejs:20 stream (unlike UBI 9)
+# — nodejs installs as a regular, already-recent package. We print the version and check
+# it is not below our engines >= 18.
 RUN dnf -y install nodejs \
  && dnf clean all \
  && node -v \
- && node -e 'if (+process.versions.node.split(".")[0] < 18) { console.error("Node ниже 18"); process.exit(1) }'
+ && node -e 'if (+process.versions.node.split(".")[0] < 18) { console.error("Node is older than 18"); process.exit(1) }'
 
 WORKDIR /app
 COPY package.json index.js index.d.ts ./

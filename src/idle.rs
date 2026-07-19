@@ -1,11 +1,12 @@
-//! Idle-таймаут соединения (§6c A2).
+//! Connection idle timeout (§6c A2).
 //!
-//! `ActivityIo` оборачивает сокет и отмечает момент последней полезной операции
-//! (чтение/запись > 0 байт). Сторожевая задача `watch_idle` завершается, когда
-//! активности не было дольше `idle` — вызывающий код гасит соединение по select'у.
+//! `ActivityIo` wraps the socket and records the moment of the last useful operation
+//! (a read/write of more than 0 bytes). The `watch_idle` watchdog returns once there
+//! has been no activity for longer than `idle` — the caller then drops the connection
+//! via `select!`.
 //!
-//! Обёртка навешивается на TCP-сокет **до** TLS, поэтому хендшейк тоже считается
-//! активностью, а h1 keep-alive и простаивающие h2-соединения закрываются одинаково.
+//! The wrapper sits on the TCP socket **before** TLS, so the handshake counts as
+//! activity too, and h1 keep-alive and idle h2 connections are closed the same way.
 
 use std::io;
 use std::pin::Pin;
@@ -16,12 +17,12 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// Отметка активности: миллисекунды от `base` (общая точка отсчёта соединения).
+/// Activity marker: milliseconds since `base` (the connection's common origin).
 #[derive(Clone)]
 pub struct Activity {
     last_ms: Arc<AtomicU64>,
-    /// Запросы в работе. Пока > 0, соединение не считается простаивающим, даже
-    /// если по сокету ничего не идёт: долгий хендлер — это не Slowloris.
+    /// Requests in flight. While > 0 the connection is not considered idle even if
+    /// nothing moves on the socket: a slow handler is not a Slowloris.
     in_flight: Arc<AtomicUsize>,
     base: Instant,
 }
@@ -40,13 +41,14 @@ impl Activity {
             .store(self.base.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
-    /// Сколько прошло с последней активности.
+    /// How long since the last activity.
     fn idle_for(&self) -> Duration {
         let now = self.base.elapsed().as_millis() as u64;
         Duration::from_millis(now.saturating_sub(self.last_ms.load(Ordering::Relaxed)))
     }
 
-    /// Взять guard на время обработки запроса (RAII: decrement на Drop, в т.ч. при панике).
+    /// Take a guard for the duration of request handling (RAII: decrements on Drop,
+    /// including on panic).
     pub fn request_guard(&self) -> RequestGuard {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         RequestGuard {
@@ -55,7 +57,7 @@ impl Activity {
     }
 }
 
-/// Пока жив — запрос считается активным (см. `Activity::request_guard`).
+/// While alive the request counts as active (see `Activity::request_guard`).
 pub struct RequestGuard {
     in_flight: Arc<AtomicUsize>,
 }
@@ -66,10 +68,11 @@ impl Drop for RequestGuard {
     }
 }
 
-/// Ждать, пока соединение простаивает дольше `idle`. Возвращается — значит пора закрывать.
+/// Wait until the connection has been idle longer than `idle`. Returning means it is
+/// time to close.
 pub async fn watch_idle(activity: Activity, idle: Duration) {
     loop {
-        // Есть запрос в работе → простоя нет; проверимся через окно заново.
+        // A request is in flight → not idle; re-check after another window.
         if activity.in_flight.load(Ordering::Relaxed) > 0 {
             tokio::time::sleep(idle).await;
             continue;
@@ -78,12 +81,12 @@ pub async fn watch_idle(activity: Activity, idle: Duration) {
         if quiet >= idle {
             return;
         }
-        // Спим ровно остаток окна: следующая проверка попадёт в момент истечения.
+        // Sleep exactly the remainder of the window: the next check lands on expiry.
         tokio::time::sleep(idle - quiet).await;
     }
 }
 
-/// Сокет с отметкой активности. `S: Unpin` (TcpStream/TlsStream) — проекция не нужна.
+/// A socket with activity tracking. `S: Unpin` (TcpStream/TlsStream) — no pin projection needed.
 pub struct ActivityIo<S> {
     inner: S,
     activity: Activity,

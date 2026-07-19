@@ -1,8 +1,8 @@
-//! Мост Rust↔JS: типы, пересекающие границу, и ThreadsafeFunction-хендлер.
+//! The Rust↔JS bridge: types that cross the boundary and the ThreadsafeFunction handler.
 //!
-//! На M2 в JS уходит уже сматченный запрос (`leaf_id` листа, `params`, `query`),
-//! обратно — `{ status?, headers?, body? }`.
-//! Полный контекст `c` (заголовки, ip, хелперы) появится на M3.
+//! JS receives an already matched request (route leaf `leaf_id`, `params`, `query`)
+//! and returns `{ status?, headers?, body? }`. The full context `c` (headers, ip,
+//! helpers) is assembled on the JS side — see js/context.ts.
 
 use std::collections::HashMap;
 
@@ -13,18 +13,18 @@ use napi_derive::napi;
 
 use crate::stream::BodyIo;
 
-/// Пара ключ-значение (для query, где ключи могут повторяться).
+/// Key-value pair (for query strings, where keys may repeat).
 #[napi(object)]
 pub struct KvPair {
     pub key: String,
     pub value: String,
 }
 
-/// Сматченный запрос, передаваемый в JS-диспетчер (один переход границы/запрос).
+/// A matched request handed to the JS dispatcher (one boundary crossing per request).
 ///
-/// `leaf_id` — индекс листа маршрута в JS-реестре хендлеров; `-1` = notFound.
-/// `path` — полный путь (с baseUrl); обёртка снимает префикс для `c.req.path`.
-/// `ip`/`ips`/`country`/`id` вычислены в Rust (§7, §6d B2).
+/// `leaf_id` — index of the route leaf in the JS handler registry; `-1` = notFound.
+/// `path` — full path (including baseUrl); the wrapper strips the prefix for `c.req.path`.
+/// `ip`/`ips`/`country`/`id` are computed in Rust (§7, §6d B2).
 #[napi(object)]
 pub struct MatchedRequest {
     pub leaf_id: i32,
@@ -38,18 +38,18 @@ pub struct MatchedRequest {
     pub ips: Vec<String>,
     pub country: Option<String>,
     pub id: String,
-    /// Провалидированные/коэрцированные значения (JSON-строки) — если у листа схема.
-    /// `c.req.valid('body'|'query'|'params')` в JS доигрывает valibot transform.
+    /// Validated/coerced values (JSON strings) — present when the leaf has a schema.
+    /// `c.req.valid('body'|'query'|'params')` in JS then applies the valibot transform.
     pub valid_body: Option<String>,
     pub valid_query: Option<String>,
     pub valid_params: Option<String>,
 }
 
-/// Ответ, который JS-хендлер возвращает (в составе `Promise`).
+/// The response a JS handler returns (inside a `Promise`).
 ///
-/// `headers` — упорядоченные пары с допуском повторов (несколько `set-cookie`).
-/// `streamed = true` → тело идёт через `BodyIo::write` (канальный `Body`),
-/// поле `body` игнорируется. Иначе тело — строка `body`.
+/// `headers` — ordered pairs, duplicates allowed (multiple `set-cookie`).
+/// `streamed = true` → the body flows through `BodyIo::write` (a channel-backed
+/// `Body`) and the `body` field is ignored. Otherwise the body is the `body` string.
 #[napi(object)]
 pub struct JsResponse {
     pub status: Option<u16>,
@@ -58,14 +58,14 @@ pub struct JsResponse {
     pub streamed: Option<bool>,
 }
 
-/// TSFN-обёртка над JS-диспетчером: `(req, bodyIo) => Promise<res>`.
+/// TSFN wrapper around the JS dispatcher: `(req, bodyIo) => Promise<res>`.
 ///
-/// Вызывается из любого tokio-потока; `call_async` возвращает `Promise`,
-/// который мы `await`-им как Rust-`Future` (без блокировки потока).
+/// Callable from any tokio thread; `call_async` returns a `Promise` that we `await`
+/// as a Rust `Future` (without blocking the thread).
 pub type Handler = ThreadsafeFunction<
-    (MatchedRequest, BodyIo), // T: данные в call_async
-    Promise<JsResponse>,      // Return: что возвращает JS (Promise)
-    (MatchedRequest, BodyIo), // CallJsBackArgs: аргументы JS-функции
+    (MatchedRequest, BodyIo), // T: data passed to call_async
+    Promise<JsResponse>,      // Return: what JS returns (a Promise)
+    (MatchedRequest, BodyIo), // CallJsBackArgs: arguments of the JS function
     Status,                   // ErrorStatus
-    false,                    // CalleeHandled: ошибки обрабатываем сами
+    false,                    // CalleeHandled: we handle errors ourselves
 >;

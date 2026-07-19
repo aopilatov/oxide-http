@@ -1,8 +1,8 @@
-// Серверы-участники бенчмарка, каждый поднимается в СВОЁМ процессе (§17).
-// Так генератор нагрузки не конкурирует с сервером за event loop — иначе
-// у @oxide-ts/http JS-хендлер дерётся за главный поток с самим клиентом.
+// Benchmark participants, each started in its OWN process (§17).
+// That way the load generator does not compete with the server for the event loop —
+// otherwise the @oxide-ts/http JS handler fights the client for the main thread.
 //
-// Запуск: node bench/servers.mjs <target> <port>
+// Run: node bench/servers.mjs <target> <port>
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import http from 'node:http';
@@ -22,8 +22,8 @@ const starters = {
     await app.listen({ port, host: '127.0.0.1' });
   },
 
-  // Нативная ручка: отвечает целиком в Rust, JS не будится. Показывает цену
-  // самого моста — разницу между этой строкой и /json.
+  // Native endpoint: answered entirely in Rust, JS never wakes. Shows the cost of the
+  // bridge itself — the difference between this line and /json.
   async 'oxide-native'() {
     const { Server } = await import(join(here, '../js/index.ts'));
     const app = new Server({ health: { path: '/json' } });
@@ -67,7 +67,7 @@ const starters = {
 
 const start = starters[target];
 if (!start) {
-  console.error(`неизвестный участник: ${target}`);
+  console.error(`unknown participant: ${target}`);
   process.exit(2);
 }
 await start();

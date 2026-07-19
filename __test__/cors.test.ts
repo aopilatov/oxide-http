@@ -14,13 +14,13 @@ async function up(build) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-test('M6: CORS preflight отвечается в Rust, НЕ будя JS', async () => {
+test('M6: CORS preflight is answered in Rust, WITHOUT waking JS', async () => {
   let jsWoken = false;
   const s = await up({
     config: { cors: { origin: '*' } },
     routes: (app) =>
       app.options('/x', () => {
-        jsWoken = true; // не должно вызваться на preflight
+        jsWoken = true; // must not run on preflight
         return 'js';
       }),
   });
@@ -36,15 +36,15 @@ test('M6: CORS preflight отвечается в Rust, НЕ будя JS', async 
     assert.equal(res.status, 204);
     assert.equal(res.headers.get('access-control-allow-origin')!, '*');
     assert.ok(res.headers.get('access-control-allow-methods')!.includes('POST'));
-    // allowedHeaders не задан → отражаем запрошенные
+    // allowedHeaders unset → reflect the requested ones
     assert.equal(res.headers.get('access-control-allow-headers')!, 'content-type, authorization');
-    assert.equal(jsWoken, false, 'JS не должен просыпаться на preflight');
+    assert.equal(jsWoken, false, 'JS must not wake up on preflight');
   } finally {
     s.close();
   }
 });
 
-test('M6: запрещённый origin отклонён (403) на preflight', async () => {
+test('M6: forbidden origin is rejected (403) on preflight', async () => {
   const s = await up({
     config: { cors: { origin: ['https://ok.com'] } },
     routes: (app) => app.post('/x', (c) => c.text('ok')),
@@ -61,7 +61,7 @@ test('M6: запрещённый origin отклонён (403) на preflight', 
   }
 });
 
-test('M6: CORS-заголовки на обычном ответе (allowed origin)', async () => {
+test('M6: CORS headers on a regular response (allowed origin)', async () => {
   const s = await up({
     config: { cors: { origin: ['https://ok.com'], credentials: true, exposedHeaders: ['x-total'] } },
     routes: (app) => app.get('/data', (c) => c.json({ ok: true })),
@@ -78,7 +78,7 @@ test('M6: CORS-заголовки на обычном ответе (allowed orig
   }
 });
 
-test('M6: обычный запрос с чужого origin — без ACAO, но обрабатывается', async () => {
+test('M6: a regular request from a foreign origin — no ACAO, but still served', async () => {
   const s = await up({
     config: { cors: { origin: ['https://ok.com'] } },
     routes: (app) => app.get('/data', (c) => c.text('served')),
@@ -86,14 +86,14 @@ test('M6: обычный запрос с чужого origin — без ACAO, н
   try {
     const res = await fetch(`${s.base}/data`, { headers: { origin: 'https://evil.com' } });
     assert.equal(res.status, 200);
-    assert.equal(await res.text(), 'served'); // сервер отвечает
-    assert.equal(res.headers.get('access-control-allow-origin')!, null); // но без ACAO
+    assert.equal(await res.text(), 'served'); // the server responds
+    assert.equal(res.headers.get('access-control-allow-origin')!, null); // but without ACAO
   } finally {
     s.close();
   }
 });
 
-test('M6: credentials + origin=* → ACAO отражает конкретный origin (не *)', async () => {
+test('M6: credentials + origin=* → ACAO reflects the concrete origin (not *)', async () => {
   const s = await up({
     config: { cors: { origin: '*', credentials: true } },
     routes: (app) => app.get('/d', (c) => c.text('ok')),
@@ -107,7 +107,7 @@ test('M6: credentials + origin=* → ACAO отражает конкретный 
   }
 });
 
-test('M6: preflight с maxAge', async () => {
+test('M6: preflight with maxAge', async () => {
   const s = await up({
     config: { cors: { origin: '*', maxAge: 3600 } },
     routes: (app) => app.post('/x', (c) => c.text('ok')),
@@ -123,7 +123,7 @@ test('M6: preflight с maxAge', async () => {
   }
 });
 
-test('M6: без cors-конфига CORS-заголовков нет', async () => {
+test('M6: without a cors config there are no CORS headers', async () => {
   const s = await up({
     routes: (app) => app.get('/x', (c) => c.text('ok')),
   });
@@ -135,7 +135,7 @@ test('M6: без cors-конфига CORS-заголовков нет', async ()
   }
 });
 
-test('M6: body-limit нативный (подтверждение) — 413 без cors', async () => {
+test('M6: native body-limit (confirmation) — 413 without cors', async () => {
   const s = await up({
     config: { bodyLimit: '1kb' },
     routes: (app) => app.post('/u', async (c) => c.text(await c.req.text())),

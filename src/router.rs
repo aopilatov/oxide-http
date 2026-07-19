@@ -1,38 +1,38 @@
-//! Роутинг на `matchit` (radix-tree). Дерево на каждый HTTP-метод + отдельное
-//! дерево для `ALL`. Матчинг и разбор `params` целиком в Rust (§5 дизайна).
+//! Routing on `matchit` (radix tree). One tree per HTTP method plus a separate tree
+//! for `ALL`. Matching and `params` extraction happen entirely in Rust (design §5).
 //!
-//! Публичный синтаксис путей — Hono-подобный (`:id`, `*path`); внутри
-//! транслируется в синтаксис matchit (`{id}`, `{*path}`). Форма `{id}.{ext}`
-//! (несколько параметров в сегменте) принимается как есть.
+//! The public path syntax is Hono-like (`:id`, `*path`); internally it is translated
+//! into matchit syntax (`{id}`, `{*path}`). The form `{id}.{ext}` (several parameters
+//! in one segment) is passed through as-is.
 
 use std::collections::HashMap;
 
 use matchit::Router;
 
-/// Определение маршрута, пришедшее из JS-обёртки.
+/// Route definition coming from the JS wrapper.
 pub struct RouteDef {
     pub method: String,
     pub path: String,
     pub leaf_id: i32,
 }
 
-/// Скомпилированные деревья маршрутов (иммутабельны после `build`).
+/// Compiled route trees (immutable after `build`).
 pub struct Routes {
-    /// method (UPPERCASE) -> дерево
+    /// method (UPPERCASE) -> tree
     by_method: HashMap<String, Router<i32>>,
-    /// маршруты, объявленные как `ALL` (fallback для любого метода)
+    /// routes declared as `ALL` (fallback for any method)
     all: Option<Router<i32>>,
 }
 
-/// Результат матчинга: id листа + извлечённые параметры пути.
+/// Match result: leaf id plus the extracted path parameters.
 pub struct Matched {
     pub leaf_id: i32,
     pub params: HashMap<String, String>,
 }
 
 impl Routes {
-    /// Собрать деревья из плоского списка. Ошибка matchit (конфликт/невалидный
-    /// паттерн) пробрасывается наверх (отдаётся из `listen()` в JS).
+    /// Build the trees from a flat list. A matchit error (conflict/invalid pattern)
+    /// propagates upward and is surfaced from `listen()` to JS.
     pub fn build(defs: Vec<RouteDef>) -> Result<Self, String> {
         let mut by_method: HashMap<String, Router<i32>> = HashMap::new();
         let mut all: Option<Router<i32>> = None;
@@ -47,13 +47,13 @@ impl Routes {
             };
             router
                 .insert(pattern.clone(), def.leaf_id)
-                .map_err(|e| format!("маршрут {} {}: {e}", def.method, def.path))?;
+                .map_err(|e| format!("route {} {}: {e}", def.method, def.path))?;
         }
 
         Ok(Routes { by_method, all })
     }
 
-    /// Сматчить (method, path). Сначала точное дерево метода, затем `ALL`.
+    /// Match (method, path). The method-specific tree first, then `ALL`.
     pub fn match_route(&self, method: &str, path: &str) -> Option<Matched> {
         if let Some(router) = self.by_method.get(method) {
             if let Ok(m) = router.at(path) {
@@ -68,11 +68,11 @@ impl Routes {
         None
     }
 
-    /// Методы, под которыми существует данный путь (для `405`/`Allow` и
-    /// авто-`OPTIONS`). Пустой список ⇒ путь не найден вовсе ⇒ `404`.
+    /// Methods under which this path exists (for `405`/`Allow` and auto-`OPTIONS`).
+    /// An empty list ⇒ the path does not exist at all ⇒ `404`.
     ///
-    /// Добавляет производные `HEAD` (если есть `GET`) и всегда `OPTIONS`
-    /// (обрабатываем автоматически). Результат отсортирован детерминированно.
+    /// Adds derived `HEAD` (when `GET` exists) and always `OPTIONS` (handled
+    /// automatically). The result is sorted deterministically.
     pub fn allowed_methods(&self, path: &str) -> Vec<String> {
         let mut methods: Vec<String> = self
             .by_method
@@ -81,7 +81,7 @@ impl Routes {
             .map(|(m, _)| m.clone())
             .collect();
 
-        // ALL матчит путь ⇒ разрешены все стандартные методы.
+        // ALL matches the path ⇒ every standard method is allowed.
         if self.all.as_ref().is_some_and(|r| r.at(path).is_ok()) {
             for m in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
                 if !methods.iter().any(|x| x == m) {
@@ -91,7 +91,7 @@ impl Routes {
         }
 
         if methods.is_empty() {
-            return methods; // путь не найден
+            return methods; // path not found
         }
 
         if methods.iter().any(|m| m == "GET") && !methods.iter().any(|m| m == "HEAD") {
@@ -117,8 +117,8 @@ fn to_matched(m: matchit::Match<'_, '_, &i32>) -> Matched {
     }
 }
 
-/// Трансляция публичного синтаксиса пути в синтаксис matchit.
-/// `:name` → `{name}`, `*name`/`*` → `{*name}`/`{*wildcard}`, `{...}` — как есть.
+/// Translate the public path syntax into matchit syntax.
+/// `:name` → `{name}`, `*name`/`*` → `{*name}`/`{*wildcard}`, `{...}` passes through.
 fn to_matchit(path: &str) -> String {
     let mut out = String::with_capacity(path.len() + 8);
     for (i, seg) in path.split('/').enumerate() {
@@ -129,7 +129,7 @@ fn to_matchit(path: &str) -> String {
             continue;
         }
         if let Some(rest) = seg.strip_prefix('*') {
-            // catch-all (matchit требует имя)
+            // catch-all (matchit requires a name)
             let name = if rest.is_empty() { "wildcard" } else { rest };
             out.push_str("{*");
             out.push_str(name);
@@ -143,8 +143,8 @@ fn to_matchit(path: &str) -> String {
     out
 }
 
-/// Заменяет `:name`-токены на `{name}` внутри одного сегмента
-/// (поддерживает несколько в сегменте, напр. `:id.:ext` → `{id}.{ext}`).
+/// Replaces `:name` tokens with `{name}` inside a single segment
+/// (supports several per segment, e.g. `:id.:ext` → `{id}.{ext}`).
 fn translate_colons(seg: &str, out: &mut String) {
     let mut chars = seg.chars().peekable();
     while let Some(c) = chars.next() {
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn static_and_param() {
         let r = Routes::build(defs(&[("GET", "/users/:id", 0), ("GET", "/users/me", 1)])).unwrap();
-        // static имеет приоритет над param (matchit авто)
+        // static wins over param (matchit does this automatically)
         let m = r.match_route("GET", "/users/me").unwrap();
         assert_eq!(m.leaf_id, 1);
         let m = r.match_route("GET", "/users/42").unwrap();
@@ -204,15 +204,15 @@ mod tests {
 
     #[test]
     fn multi_param_per_segment_rejected() {
-        // Ограничение matchit: один параметр на сегмент. `{id}.{ext}` отклоняется
-        // на этапе build. Обходной путь — матчить сегмент целиком и делить в хендлере.
+        // matchit limitation: one parameter per segment. `{id}.{ext}` is rejected at
+        // build time. The workaround is to match the whole segment and split in the handler.
         let result = Routes::build(defs(&[("GET", "/{id}.{ext}", 0)]));
         assert!(result.is_err());
     }
 
     #[test]
     fn whole_segment_param() {
-        // Рекомендованный обход: `report.pdf` матчится целиком в один параметр.
+        // Recommended workaround: `report.pdf` matches wholly into one parameter.
         let r = Routes::build(defs(&[("GET", "/files/:name", 0)])).unwrap();
         let m = r.match_route("GET", "/files/report.pdf").unwrap();
         assert_eq!(m.params.get("name").unwrap(), "report.pdf");
@@ -230,10 +230,10 @@ mod tests {
     fn not_found_and_method_not_allowed() {
         let r = Routes::build(defs(&[("GET", "/users", 0), ("POST", "/users", 1)])).unwrap();
         assert!(r.match_route("DELETE", "/users").is_none());
-        // путь есть, метода нет ⇒ 405; Allow включает GET/POST + HEAD + OPTIONS
+        // path exists, method does not ⇒ 405; Allow includes GET/POST + HEAD + OPTIONS
         let allowed = r.allowed_methods("/users");
         assert_eq!(allowed, vec!["GET", "HEAD", "OPTIONS", "POST"]);
-        // путь не найден вовсе ⇒ 404
+        // the path does not exist at all ⇒ 404
         assert!(r.allowed_methods("/nope").is_empty());
     }
 
@@ -249,13 +249,13 @@ mod tests {
         let result = Routes::build(defs(&[("GET", "/x", 0), ("GET", "/x", 1)]));
         match result {
             Err(e) => assert!(e.contains("/x")),
-            Ok(_) => panic!("ожидался конфликт маршрутов"),
+            Ok(_) => panic!("expected a route conflict"),
         }
     }
 
     #[test]
     fn base_url_glued_paths_match() {
-        // baseUrl склеен в JS: маршрут регистрируется уже как /api/v1/users/:id
+        // baseUrl is joined in JS: the route is registered as /api/v1/users/:id
         let r = Routes::build(defs(&[("GET", "/api/v1/users/:id", 0)])).unwrap();
         let m = r.match_route("GET", "/api/v1/users/9").unwrap();
         assert_eq!(m.params.get("id").unwrap(), "9");

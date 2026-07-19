@@ -14,7 +14,7 @@ async function up(build) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-test('M5: порядок луковицы (before → handler → after)', async () => {
+test('M5: onion order (before → handler → after)', async () => {
   const order: string[] = [];
   const s = await up({
     routes: (app) => {
@@ -42,7 +42,7 @@ test('M5: порядок луковицы (before → handler → after)', async
   }
 });
 
-test('M5: порядок хуков жизненного цикла', async () => {
+test('M5: lifecycle hook order', async () => {
   const order: string[] = [];
   const s = await up({
     routes: (app) => {
@@ -79,7 +79,7 @@ test('M5: порядок хуков жизненного цикла', async () =
   }
 });
 
-test('M5: short-circuit из onRequest (хендлер пропущен, onSend/onResponse идут)', async () => {
+test('M5: short-circuit from onRequest (handler skipped, onSend/onResponse still run)', async () => {
   const order: string[] = [];
   const s = await up({
     routes: (app) => {
@@ -87,7 +87,7 @@ test('M5: short-circuit из onRequest (хендлер пропущен, onSend/
         order.push('onRequest');
         c.text('blocked', 401); // short-circuit
       });
-      app.preHandler((c) => order.push('preHandler')); // не должен вызваться
+      app.preHandler((c) => order.push('preHandler')); // must not run
       app.onSend((c) => order.push('onSend'));
       app.onResponse((c) => order.push('onResponse'));
       app.get('/x', (c) => {
@@ -106,7 +106,7 @@ test('M5: short-circuit из onRequest (хендлер пропущен, onSend/
   }
 });
 
-test('M5: onError ловит throw из любого слоя', async () => {
+test('M5: onError catches a throw from any layer', async () => {
   const s = await up({
     routes: (app) => {
       app.onError((err, c) => c.json({ caught: err.message }, 500));
@@ -130,7 +130,7 @@ test('M5: onError ловит throw из любого слоя', async () => {
   }
 });
 
-test('M5: throw без onError → дефолтный 500, процесс жив', async () => {
+test('M5: throw without onError → default 500, process stays alive', async () => {
   const s = await up({
     routes: (app) => app.get('/boom', () => {
       throw new Error('unhandled');
@@ -139,7 +139,7 @@ test('M5: throw без onError → дефолтный 500, процесс жив
   try {
     const res = await fetch(`${s.base}/boom`);
     assert.equal(res.status, 500);
-    // процесс жив — следующий запрос работает
+    // the process is alive — the next request works
     const ok = await fetch(`${s.base}/boom`);
     assert.equal(ok.status, 500);
   } finally {
@@ -147,7 +147,7 @@ test('M5: throw без onError → дефолтный 500, процесс жив
   }
 });
 
-test('M5: таймаут → 504 + onTimeout + AbortSignal', async () => {
+test('M5: timeout → 504 + onTimeout + AbortSignal', async () => {
   let aborted = false;
   let onTimeoutRan = false;
   const s = await up({
@@ -158,7 +158,7 @@ test('M5: таймаут → 504 + onTimeout + AbortSignal', async () => {
       });
       app.get('/slow', async (c) => {
         c.req.signal.addEventListener('abort', () => (aborted = true));
-        await new Promise<void>((r) => setTimeout(r, 500)); // дольше таймаута
+        await new Promise<void>((r) => setTimeout(r, 500)); // longer than the timeout
         return c.text('too late');
       });
     },
@@ -167,13 +167,13 @@ test('M5: таймаут → 504 + onTimeout + AbortSignal', async () => {
     const res = await fetch(`${s.base}/slow`);
     assert.equal(res.status, 504);
     assert.equal(onTimeoutRan, true);
-    assert.equal(aborted, true, 'signal должен сработать');
+    assert.equal(aborted, true, 'the signal must fire');
   } finally {
     s.close();
   }
 });
 
-test('M5: маршрутные middleware и route-опции хуков', async () => {
+test('M5: route middleware and route-level hook options', async () => {
   const order: string[] = [];
   const mw = async (c, next) => {
     order.push('route-mw');
@@ -194,7 +194,7 @@ test('M5: маршрутные middleware и route-опции хуков', async
   }
 });
 
-test('M5: инкапсуляция групп — хуки суба не текут на родителя', async () => {
+test('M5: group encapsulation — sub-app hooks do not leak onto the parent', async () => {
   const seen: unknown[] = [];
   const sub = new Server();
   sub.onRequest((c) => seen.push(`sub-hook:${c.req.path}`));
@@ -209,14 +209,14 @@ test('M5: инкапсуляция групп — хуки суба не тек�
   try {
     await (await fetch(`${s.base}/g/inner`)).text();
     await (await fetch(`${s.base}/outer`)).text();
-    // sub-хук сработал только на /g/inner, не на /outer
+    // the sub hook ran only on /g/inner, not on /outer
     assert.deepEqual(seen, ['sub-hook:/g/inner']);
   } finally {
     s.close();
   }
 });
 
-test('M5: префиксный use применяется только под префиксом', async () => {
+test('M5: prefixed use applies only under that prefix', async () => {
   const hits: string[] = [];
   const s = await up({
     routes: (app) => {
@@ -237,7 +237,7 @@ test('M5: префиксный use применяется только под п
   }
 });
 
-test('M5: onSend может доработать заголовки ответа', async () => {
+test('M5: onSend can refine the response headers', async () => {
   const s = await up({
     routes: (app) => {
       app.onSend((c) => c.header('x-powered-by', 'oxide'));

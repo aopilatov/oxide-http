@@ -19,7 +19,7 @@ async function up(build) {
   return { port, server, close: () => server.close() };
 }
 
-test('M10a: listen эмитит listening, close эмитит shutdown+close', async () => {
+test('M10a: listen emits listening, close emits shutdown+close', async () => {
   const server = new Server();
   server.get('/', (c) => c.text('ok'));
   const seen: any[] = [];
@@ -36,7 +36,7 @@ test('M10a: listen эмитит listening, close эмитит shutdown+close', a
   assert.deepEqual(seen, [['listening', port], ['shutdown'], ['close']]);
 });
 
-test('M10a: занятый порт → listen реджектится и эмитит error', async () => {
+test('M10a: a busy port → listen rejects and emits error', async () => {
   const first = await up({ routes: (app) => app.get('/', (c) => c.text('ok')) });
   try {
     const second = new Server();
@@ -48,14 +48,14 @@ test('M10a: занятый порт → listen реджектится и эми�
       () => second.listen({ port: first.port, host: '127.0.0.1' }),
       /Address already in use|bind/,
     );
-    assert.ok(emitted, 'событие error должно прийти');
+    assert.ok(emitted, 'the error event must fire');
     assert.equal(second.listening, false);
   } finally {
     await first.close();
   }
 });
 
-test('M10a: close() дожидается in-flight запроса', async () => {
+test('M10a: close() waits for the in-flight request', async () => {
   let handlerDone = false;
   const s = await up({
     routes: (app) =>
@@ -66,23 +66,23 @@ test('M10a: close() дожидается in-flight запроса', async () => 
       }),
   });
 
-  // Запрос в полёте, ответ ещё не пришёл.
+  // Request in flight, the response has not arrived yet.
   const inflight = fetch(`http://127.0.0.1:${s.port}/slow`);
   await new Promise<void>((r) => setTimeout(r, 150));
 
-  await s.close(); // должен дождаться, а не оборвать
-  assert.equal(handlerDone, true, 'хендлер должен был досчитать до конца close()');
+  await s.close(); // must wait rather than cut it off
+  assert.equal(handlerDone, true, 'the handler must have finished before close() resolved');
 
   const res = await inflight;
   assert.equal(res.status, 200);
   assert.equal(await res.text(), 'finished');
 });
 
-test('M10a: порт освобождается сразу — можно забиндиться после close()', async () => {
+test('M10a: the port frees immediately — binding right after close() works', async () => {
   const s = await up({ routes: (app) => app.get('/', (c) => c.text('first')) });
   await s.close();
 
-  // Тот же порт должен быть свободен немедленно после резолва close().
+  // The same port must be free immediately after close() resolves.
   const again = new Server();
   again.get('/', (c) => c.text('second'));
   await again.listen({ port: s.port, host: '127.0.0.1' });
@@ -94,20 +94,20 @@ test('M10a: порт освобождается сразу — можно заб
   }
 });
 
-test('M10a: close() идемпотентен, параллельные вызовы ждут один drain', async () => {
+test('M10a: close() is idempotent, concurrent calls await one drain', async () => {
   const s = await up({ routes: (app) => app.get('/', (c) => c.text('ok')) });
   const closes = [s.close(), s.close(), s.close()];
   await Promise.all(closes);
-  await s.close(); // после завершения — тоже no-op
+  await s.close(); // after completion this is a no-op too
   assert.equal(s.server.listening, false);
 });
 
-test('M10a: shutdownTimeout обрывает застрявший запрос', async () => {
+test('M10a: shutdownTimeout cuts off a stuck request', async () => {
   const s = await up({
     config: { shutdownTimeout: '300ms' },
     routes: (app) =>
       app.get('/stuck', async (c) => {
-        await new Promise<void>((r) => setTimeout(r, 10_000)); // дольше дедлайна
+        await new Promise<void>((r) => setTimeout(r, 10_000)); // longer than the deadline
         return c.text('never');
       }),
   });
@@ -119,11 +119,11 @@ test('M10a: shutdownTimeout обрывает застрявший запрос',
   await s.close();
   const elapsed = Date.now() - t0;
 
-  assert.ok(elapsed < 3000, `close() должен уложиться в дедлайн, занял ${elapsed}ms`);
-  await inflight; // соединение оборвано — fetch реджектится, это ожидаемо
+  assert.ok(elapsed < 3000, `close() must fit within the deadline, took ${elapsed}ms`);
+  await inflight; // the connection was cut — fetch rejects, which is expected
 });
 
-test('M10a: во время shutdown новые соединения не принимаются', async () => {
+test('M10a: during shutdown new connections are not accepted', async () => {
   const s = await up({
     routes: (app) =>
       app.get('/slow', async (c) => {
@@ -136,7 +136,7 @@ test('M10a: во время shutdown новые соединения не при
   await new Promise<void>((r) => setTimeout(r, 100));
 
   const closing = s.close();
-  await new Promise<void>((r) => setTimeout(r, 100)); // listener уже закрыт, drain идёт
+  await new Promise<void>((r) => setTimeout(r, 100)); // the listener is closed, the drain is running
 
   const refused = await new Promise<any>((resolve) => {
     const sock = net.connect(s.port, '127.0.0.1');
@@ -146,23 +146,23 @@ test('M10a: во время shutdown новые соединения не при
     });
     sock.on('error', () => resolve(true));
   });
-  assert.equal(refused, true, 'listener должен быть закрыт до окончания drain');
+  assert.equal(refused, true, 'the listener must be closed before the drain ends');
 
   await closing;
-  assert.equal((await inflight).status, 200, 'запрос в полёте должен дожаться');
+  assert.equal((await inflight).status, 200, 'the in-flight request must finish');
 });
 
-test('M10a: SIGTERM → graceful shutdown и exit 0', async () => {
+test('M10a: SIGTERM → graceful shutdown and exit 0', async () => {
   const port = nextPort();
   const child = spawn(process.execPath, [join(here, 'fixtures/sigterm-server.ts'), String(port)], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
-    // Дожидаемся готовности.
+    // Wait until it is ready.
     await new Promise<void>((resolve, reject) => {
       child.stdout.on('data', (d) => (String(d).includes('ready') ? resolve() : null));
-      child.on('exit', () => reject(new Error('процесс упал до готовности')));
-      setTimeout(() => reject(new Error('сервер не поднялся')), 5000);
+      child.on('exit', () => reject(new Error('the process died before becoming ready')));
+      setTimeout(() => reject(new Error('the server did not start')), 5000);
     });
 
     const inflight = fetch(`http://127.0.0.1:${port}/slow`);
@@ -170,17 +170,17 @@ test('M10a: SIGTERM → graceful shutdown и exit 0', async () => {
     child.kill('SIGTERM');
 
     const res = await inflight;
-    assert.equal(res.status, 200, 'in-flight запрос должен пережить SIGTERM');
+    assert.equal(res.status, 200, 'the in-flight request must survive SIGTERM');
     assert.equal(await res.text(), 'drained');
 
     const code = await new Promise<any>((resolve) => child.on('exit', resolve));
-    assert.equal(code, 0, 'процесс должен выйти с кодом 0');
+    assert.equal(code, 0, 'the process must exit with code 0');
   } finally {
     if (child.exitCode === null) child.kill('SIGKILL');
   }
 });
 
-test('M10a: h2 получает GOAWAY на shutdown, текущий стрим дожимается', async () => {
+test('M10a: h2 receives GOAWAY on shutdown while the current stream finishes', async () => {
   const http2 = await import('node:http2');
   const s = await up({
     config: { h2c: true },
@@ -203,11 +203,11 @@ test('M10a: h2 получает GOAWAY на shutdown, текущий стрим 
     req.on('end', () => resolve(d));
     req.on('error', reject);
     req.end();
-    // Инициируем shutdown, пока стрим в полёте.
+    // Trigger the shutdown while the stream is in flight.
     setTimeout(() => s.close(), 150);
   });
 
-  assert.equal(body, 'h2-drained', 'стрим в полёте должен дожаться');
-  assert.equal(goaway, true, 'клиент должен получить GOAWAY');
+  assert.equal(body, 'h2-drained', 'the in-flight stream must finish');
+  assert.equal(goaway, true, 'the client must receive GOAWAY');
   client.close();
 });

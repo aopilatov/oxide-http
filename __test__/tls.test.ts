@@ -13,9 +13,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const CERT = readFileSync(join(here, 'fixtures/cert.pem'), 'utf8');
 const KEY = readFileSync(join(here, 'fixtures/key.pem'), 'utf8');
 
-// Порты намеренно ниже 32768: на Linux эфемерный диапазон начинается с 32768,
-// и тест с listen({port:0}) мог получить от ядра ровно наш фиксированный порт.
-// На macOS диапазон начинается с 49152, поэтому локально это не воспроизводилось.
+// The ports are deliberately below 32768: on Linux the ephemeral range starts at 32768,
+// so a test using listen({port:0}) could be handed exactly our fixed port by the kernel.
+// On macOS the range starts at 49152, which is why this never reproduced locally.
 let PORT = 20900;
 const nextPort = () => PORT++;
 
@@ -27,7 +27,7 @@ async function up(build) {
   return { port, close: () => server.close() };
 }
 
-/** HTTP/2 клиент (TLS или h2c) → один GET. */
+/** HTTP/2 client (TLS or h2c) → a single GET. */
 function h2get(url, opts = {}) {
   return new Promise<any>((resolve, reject) => {
     const client = http2.connect(url, opts);
@@ -66,9 +66,9 @@ test('M9: TLS + HTTP/1.1 fallback', async () => {
     routes: (app) => app.get('/', (c) => c.text('h1-over-tls')),
   });
   try {
-    // alpnProtocol живёт на сокете, а не на IncomingMessage. Читаем его в
-    // resolve-значение, а не ассертим внутри колбэка: throw там оборвал бы чтение
-    // ответа и оставил TLS-сокет открытым (процесс теста не завершился бы).
+    // alpnProtocol lives on the socket, not on IncomingMessage. We carry it into the
+    // resolved value instead of asserting inside the callback: a throw there would abort
+    // reading the response and leave the TLS socket open (the test process would hang).
     const { body, alpn } = await new Promise<any>((resolve, reject) => {
       const req = https.request(
         { host: '127.0.0.1', port: s.port, path: '/', ca: CERT, ALPNProtocols: ['http/1.1'] } as any,
@@ -103,7 +103,7 @@ test('M9: h2c prior-knowledge (plaintext HTTP/2)', async () => {
   }
 });
 
-test('M9: cert из Buffer грузится', async () => {
+test('M9: a cert from a Buffer loads', async () => {
   const s = await up({
     config: { tls: { cert: Buffer.from(CERT), key: Buffer.from(KEY) } },
     routes: (app) => app.get('/', (c) => c.text('buf-ok')),
@@ -124,7 +124,7 @@ test('M9: cert из Buffer грузится', async () => {
   }
 });
 
-test('M9: Slowloris — медленные заголовки отсекаются таймаутом', async () => {
+test('M9: Slowloris — slow headers are cut off by the timeout', async () => {
   const s = await up({
     config: { headerReadTimeout: '200ms' },
     routes: (app) => app.get('/', (c) => c.text('ok')),
@@ -141,21 +141,21 @@ test('M9: Slowloris — медленные заголовки отсекаютс
         }
       };
       socket.on('connect', () => {
-        // Шлём начало запроса и НЕ завершаем заголовки.
+        // Send the start of a request and do NOT terminate the headers.
         socket.write('GET / HTTP/1.1\r\nHost: x\r\n');
-        // не пишем финальный \r\n — сервер должен закрыть по таймауту
+        // no final \r\n — the server must close on timeout
       });
       socket.on('close', () => finish('closed'));
       socket.on('end', () => finish('closed'));
       setTimeout(() => finish('still-open'), 1500);
     });
-    assert.equal(closed, 'closed', 'соединение должно закрыться по headerReadTimeout');
+    assert.equal(closed, 'closed', 'the connection must close on headerReadTimeout');
   } finally {
     s.close();
   }
 });
 
-test('M9: HTTP/2 с настройками (maxConcurrentStreams, initialWindowSize)', async () => {
+test('M9: HTTP/2 with settings (maxConcurrentStreams, initialWindowSize)', async () => {
   const s = await up({
     config: {
       h2c: true,
@@ -172,9 +172,9 @@ test('M9: HTTP/2 с настройками (maxConcurrentStreams, initialWindowS
   }
 });
 
-/** Сырой HTTP/1.1-запрос по сокету; резолвится сырым ответом (или '' при обрыве).
- *  `write(socket, stop)` — писатель; `stop()` возвращает true, когда ответ уже пришёл
- *  и продолжать писать не нужно (иначе close с непрочитанными данными даёт RST). */
+/** Raw HTTP/1.1 request over a socket; resolves with the raw response (or '' if cut).
+ *  `write(socket, stop)` is the writer; `stop()` returns true once the response has
+ *  arrived and writing should cease (otherwise closing with unread data yields RST). */
 function raw(port, write, waitMs = 3000) {
   return new Promise<any>((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1');
@@ -194,15 +194,15 @@ function raw(port, write, waitMs = 3000) {
   });
 }
 
-test('M9: maxHeaderSize превышен → 431', async () => {
+test('M9: maxHeaderSize exceeded → 431', async () => {
   const s = await up({
     config: { maxHeaderSize: '8kb' },
     routes: (app) => app.get('/', (c) => c.text('ok')),
   });
   try {
-    // Пишем заголовок кусками и останавливаемся, как только пришёл ответ: hyper
-    // отвечает 431 и закрывает соединение, а недописанный «хвост» превратил бы
-    // close в RST — клиент потерял бы уже полученный ответ (ECONNRESET).
+    // Write the header in chunks and stop as soon as the response arrives: hyper answers
+    // 431 and closes the connection, and an unwritten tail would turn that close into an
+    // RST — the client would lose the response it already received (ECONNRESET).
     const res = await raw(s.port, (sock, stop) => {
       sock.write('GET / HTTP/1.1\r\nHost: x\r\nX-Big: ');
       let sent = 0;
@@ -212,36 +212,36 @@ test('M9: maxHeaderSize превышен → 431', async () => {
       };
       pump();
     });
-    assert.match(res, /^HTTP\/1\.1 431 /, `ожидался 431, получено: ${res.slice(0, 60)}`);
+    assert.match(res, /^HTTP\/1\.1 431 /, `expected 431, got: ${res.slice(0, 60)}`);
   } finally {
     s.close();
   }
 });
 
-test('M9: bodyReadTimeout — молчание в середине тела → 408', async () => {
+test('M9: bodyReadTimeout — silence mid-body → 408', async () => {
   const s = await up({
     config: { bodyReadTimeout: '300ms' },
     routes: (app) => app.post('/', async (c) => c.text(await c.req.text())),
   });
   try {
-    // Заявляем 100 байт, шлём 5 и замолкаем — сервер не должен ждать вечно.
+    // Declare 100 bytes, send 5 and go quiet — the server must not wait forever.
     const res = await raw(s.port, (sock) => {
       sock.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nhello');
     });
-    assert.match(res, /^HTTP\/1\.1 408 /, `ожидался 408, получено: ${res.slice(0, 60)}`);
+    assert.match(res, /^HTTP\/1\.1 408 /, `expected 408, got: ${res.slice(0, 60)}`);
   } finally {
     s.close();
   }
 });
 
-test('M9: idleTimeout закрывает простаивающий keep-alive', async () => {
+test('M9: idleTimeout closes an idle keep-alive connection', async () => {
   const s = await up({
     config: { idleTimeout: '400ms' },
     routes: (app) => app.get('/', (c) => c.text('ok')),
   });
   try {
     const t0 = Date.now();
-    // Один нормальный запрос, дальше молчим — соединение должно закрыться сервером.
+    // One normal request, then silence — the server must close the connection.
     const res = await raw(
       s.port,
       (sock) => sock.write('GET / HTTP/1.1\r\nHost: x\r\n\r\n'),
@@ -249,25 +249,25 @@ test('M9: idleTimeout закрывает простаивающий keep-alive',
     );
     const elapsed = Date.now() - t0;
     assert.match(res, /^HTTP\/1\.1 200 /);
-    assert.ok(elapsed < 2000, `соединение должно закрыться по idleTimeout, прошло ${elapsed}ms`);
+    assert.ok(elapsed < 2000, `the connection must close on idleTimeout, elapsed ${elapsed}ms`);
   } finally {
     s.close();
   }
 });
 
-test('M9: idleTimeout не рвёт долгий запрос (in-flight не простой)', async () => {
+test('M9: idleTimeout does not cut a long request (in-flight is not idle)', async () => {
   const s = await up({
     config: { idleTimeout: '300ms' },
     routes: (app) =>
       app.get('/slow', async (c) => {
-        // Хендлер думает дольше idleTimeout и ничего не пишет в сокет.
+        // The handler thinks longer than idleTimeout and writes nothing to the socket.
         await new Promise<void>((r) => setTimeout(r, 900));
         return c.text('slow-ok');
       }),
   });
   try {
     const res = await raw(s.port, (sock) => sock.write('GET /slow HTTP/1.1\r\nHost: x\r\n\r\n'));
-    assert.match(res, /^HTTP\/1\.1 200 /, `запрос не должен обрываться: ${res.slice(0, 60)}`);
+    assert.match(res, /^HTTP\/1\.1 200 /, `the request must not be cut off: ${res.slice(0, 60)}`);
     assert.match(res, /slow-ok/);
   } finally {
     s.close();

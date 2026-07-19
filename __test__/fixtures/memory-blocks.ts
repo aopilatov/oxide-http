@@ -1,9 +1,9 @@
-// Замер памяти по блокам запросов (§17). Запускается родительским тестом с
-// --expose-gc: без принудительного GC цифры RSS шумят и меряют не то.
+// Per-block memory measurement (§17). Started by the parent test with --expose-gc:
+// without forced GC the RSS numbers are noisy and measure the wrong thing.
 //
-// Идея: утечка даёт линейный рост (каждый блок +X МБ), а разовый прогрев аллокатора
-// и рост арен — выходят на плато. Поэтому первый блок после прогрева отбрасываем и
-// смотрим на прирост между установившимися блоками.
+// The idea: a leak grows linearly (every block adds X MB), while one-off allocator
+// warm-up and arena growth plateau. So we discard the first block after the warm-up and
+// look at the growth between steady-state blocks.
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -46,7 +46,7 @@ const runBlock = async () => {
   await hammer(`${base}/echo`, Math.floor(blockSize / 10), 16, { method: 'POST', body });
 };
 
-await runBlock(); // прогрев: пулы, JIT, арены аллокатора
+await runBlock(); // warm-up: pools, JIT, allocator arenas
 await settle();
 
 const samples: Array<{ rss: number; heapUsed: number; external: number }> = [];

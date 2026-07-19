@@ -15,7 +15,7 @@ async function up(build) {
   return { port, base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-/** Сырой HTTP-запрос через TCP (fetch не даёт слать «кривые» тела). */
+/** Raw HTTP request over TCP (fetch will not send malformed bodies). */
 function rawRequest(
   port: number,
   requestText: string,
@@ -26,8 +26,8 @@ function rawRequest(
     let data = '';
     socket.setEncoding('utf8');
     socket.on('data', (d) => (data += d));
-    // Соединение может быть сброшено (мусор после тела / Connection: close) —
-    // это не ошибка теста: ответ на первый запрос уже пришёл. Игнорируем.
+    // The connection may be reset (garbage after the body / Connection: close) — that is
+    // not a test failure: the response to the first request already arrived. Ignore it.
     socket.on('error', () => {});
     socket.on('connect', async () => {
       socket.write(requestText);
@@ -45,9 +45,9 @@ function rawRequest(
   });
 }
 
-test('SECURITY: лимит держится на СЫРОМ стриме (хендлер не проверяет размер)', async () => {
-  // Хендлер просто гоняет c.req.stream, НЕ проверяя размер сам — лимит обязан
-  // сработать в Rust, иначе DoS. bodyLimit 1kb, шлём ~10kb.
+test('SECURITY: the limit holds on the RAW stream (the handler does not check the size)', async () => {
+  // The handler just drains c.req.stream WITHOUT checking the size itself — the limit
+  // must fire in Rust, otherwise it is a DoS. bodyLimit 1kb, we send ~10kb.
   let received = 0;
   const s = await up({
     config: { bodyLimit: '1kb' },
@@ -59,22 +59,22 @@ test('SECURITY: лимит держится на СЫРОМ стриме (хен
   });
   try {
     const res = await fetch(`${s.base}/raw`, { method: 'POST', body: 'A'.repeat(10 * 1024) });
-    assert.equal(res.status, 413, 'сырой стрим должен упереться в лимит');
-    assert.ok(received <= 1024 + 65536, `Rust прочитал слишком много: ${received} байт`);
+    assert.equal(res.status, 413, 'the raw stream must hit the limit');
+    assert.ok(received <= 1024 + 65536, `Rust read too much: ${received} bytes`);
   } finally {
     s.close();
   }
 });
 
-test('SECURITY: лимит держится на chunked БЕЗ Content-Length', async () => {
-  // Transfer-Encoding: chunked — Content-Length нет вовсе. Лимит должен считать
-  // фактические байты. Шлём много мелких чанков через сырой сокет.
+test('SECURITY: the limit holds on chunked WITHOUT Content-Length', async () => {
+  // Transfer-Encoding: chunked — there is no Content-Length at all. The limit must count
+  // actual bytes. We send many small chunks over a raw socket.
   const s = await up({
     config: { bodyLimit: '2kb' },
     routes: (app) => app.post('/chunked', async (c) => c.text(await c.req.text())),
   });
   try {
-    // 20 chunk'ов по 512 байт = 10kb > 2kb.
+    // 20 chunks of 512 bytes = 10kb > 2kb.
     const chunks = [] as any[];
     for (let i = 0; i < 20; i++) {
       chunks.push(`200\r\n${'B'.repeat(512)}\r\n`);
@@ -83,13 +83,13 @@ test('SECURITY: лимит держится на chunked БЕЗ Content-Length',
     const req =
       `POST /chunked HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n`;
     const res = await rawRequest(s.port, req, { bodyChunks: chunks });
-    assert.equal(res.status, 413, 'chunked без CL должен упереться в лимит');
+    assert.equal(res.status, 413, 'chunked without CL must hit the limit');
   } finally {
     s.close();
   }
 });
 
-test('SECURITY: ранний 413 по заявленному Content-Length (тело не читается)', async () => {
+test('SECURITY: early 413 from the declared Content-Length (the body is never read)', async () => {
   let handlerCalled = false;
   const s = await up({
     config: { bodyLimit: '1kb' },
@@ -100,20 +100,20 @@ test('SECURITY: ранний 413 по заявленному Content-Length (т�
       }),
   });
   try {
-    // Заявляем большой Content-Length — отказ должен прийти сразу.
+    // We declare a large Content-Length — the refusal must come immediately.
     const req =
       `POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n`;
     const res = await rawRequest(s.port, req, { settleMs: 200 });
     assert.equal(res.status, 413);
-    assert.equal(handlerCalled, false, 'хендлер не должен вызываться при раннем 413');
+    assert.equal(handlerCalled, false, 'the handler must not run on an early 413');
   } finally {
     s.close();
   }
 });
 
-test('SECURITY: Content-Length врёт МЕНЬШЕ — hyper фреймит по CL, лишнее не течёт в тело', async () => {
-  // Заявляем CL=5, шлём больше. hyper отдаст ровно 5 байт; хвост — уже следующий
-  // (pipelined) запрос, а не часть тела. Лимит не обходится.
+test('SECURITY: Content-Length understates — hyper frames by CL, the excess never enters the body', async () => {
+  // We declare CL=5 and send more. hyper yields exactly 5 bytes; the tail becomes the
+  // next (pipelined) request, not part of the body. The limit cannot be bypassed.
   const s = await up({
     config: { bodyLimit: '1mb' },
     routes: (app) => app.post('/cl', async (c) => c.json({ len: (await c.req.text()).length })),
@@ -121,17 +121,17 @@ test('SECURITY: Content-Length врёт МЕНЬШЕ — hyper фреймит п
   try {
     const req =
       `POST /cl HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nHELLO` +
-      'X'.repeat(10000); // лишние байты после тела
+      'X'.repeat(10000); // extra bytes after the body
     const res = await rawRequest(s.port, req, { settleMs: 200 });
     assert.equal(res.status, 200);
-    assert.match(res.raw, /"len":5/, 'тело должно быть ровно 5 байт (CL), лишнее не подмешалось');
+    assert.match(res.raw, /"len":5/, 'the body must be exactly 5 bytes (CL), with no extra mixed in');
   } finally {
     s.close();
   }
 });
 
-test('SECURITY: без лимита (bodyLimit не задан) большое тело всё же читается', async () => {
-  // Санити: если лимит явно не задан низким — работает как обычно (дефолт 10mb).
+test('SECURITY: without a limit (bodyLimit unset) a large body is still read', async () => {
+  // Sanity: when no low limit is set it behaves normally (10mb default).
   const s = await up({
     routes: (app) => app.post('/ok', async (c) => c.json({ len: (await c.req.text()).length })),
   });

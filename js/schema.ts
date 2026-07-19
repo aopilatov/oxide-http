@@ -1,24 +1,25 @@
-// Схемы (§6b): источник — valibot (конвертируется в JSON Schema для Rust) либо
-// сырой JSON Schema. Rust делает структурную валидацию/коэрцию вне event loop;
-// здесь — конвертация, valibot transform/refine (preValidation) и стрип ответа.
+// Schemas (§6b): the source is either valibot (converted to JSON Schema for Rust) or
+// raw JSON Schema. Rust performs structural validation/coercion off the event loop;
+// this module handles conversion, valibot transform/refine (preValidation) and
+// response stripping.
 
-/** Схема маршрута: valibot-схема либо сырой JSON Schema. */
+/** Route schema: a valibot schema or raw JSON Schema. */
 export type SchemaSource = ValibotSchema | JsonSchemaObject;
 
-/** Минимальная форма valibot-схемы, которую мы различаем на рантайме. */
+/** The minimal valibot schema shape we detect at runtime. */
 export interface ValibotSchema {
   readonly '~standard'?: unknown;
   readonly kind?: string;
   readonly '~run'?: unknown;
 }
 
-/** Кусок JSON Schema, который нам нужен (остальное не трогаем). */
+/** The slice of JSON Schema we care about (everything else is left alone). */
 export interface JsonSchemaObject {
   properties?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
-/** Одна проблема валидации в формате ответа `400` (§6b). */
+/** A single validation problem in the `400` response format (§6b). */
 export interface ValidationIssue {
   in: IssueLocation;
   path: string;
@@ -26,17 +27,17 @@ export interface ValidationIssue {
   code: string;
 }
 
-/** Где именно не сошлось. */
+/** Where exactly the mismatch happened. */
 export type IssueLocation = 'body' | 'query' | 'params';
 
-/** Форма issue от valibot, на которую мы опираемся. */
+/** The valibot issue shape we rely on. */
 interface ValibotIssue {
   path?: ReadonlyArray<{ key?: unknown }>;
   message: string;
   type?: string;
 }
 
-/** Результат `safeParse` от valibot. */
+/** The result of valibot's `safeParse`. */
 interface ValibotParseResult {
   success: boolean;
   output?: unknown;
@@ -46,15 +47,15 @@ interface ValibotParseResult {
 type ToJsonSchemaFn = (schema: unknown, opts: { errorMode: string }) => JsonSchemaObject;
 type SafeParseFn = (schema: unknown, data: unknown) => ValibotParseResult;
 
-// valibot и @valibot/to-json-schema — опциональные зависимости: без схем они не
-// нужны вовсе. Грузим их динамическим import() один раз на listen() (см.
-// `loadSchemaDeps`), а не через createRequire: модуль исполняется и как ESM
-// (.ts напрямую в разработке), и как CJS (после сборки), а `import.meta`
-// в CJS-выводе запрещён.
+// valibot and @valibot/to-json-schema are optional dependencies: without schemas they
+// are not needed at all. They are loaded via a dynamic import() once per listen() (see
+// `loadSchemaDeps`) rather than createRequire, because this module runs both as ESM
+// (.ts directly during development) and as CJS (after the build), and `import.meta` is
+// forbidden in CJS output.
 let _toJsonSchema: ToJsonSchemaFn | undefined;
 let _safeParse: SafeParseFn | undefined;
 
-/** Подгрузить valibot-зависимости. Зовётся из `listen()`, когда есть схемы. */
+/** Load the valibot dependencies. Called from `listen()` when schemas are present. */
 export async function loadSchemaDeps(): Promise<void> {
   if (_toJsonSchema && _safeParse) return;
   try {
@@ -62,13 +63,13 @@ export async function loadSchemaDeps(): Promise<void> {
       import('@valibot/to-json-schema'),
       import('valibot'),
     ]);
-    // Намеренно сужаем сторонние типы до минимальной формы, которая нам нужна:
-    // мы опираемся только на структурную часть JSON Schema и на success/issues.
+    // Deliberately narrow the third-party types to the minimal shape we need: we rely
+    // only on the structural part of JSON Schema and on success/issues.
     _toJsonSchema = toJson.toJsonSchema as unknown as ToJsonSchemaFn;
     _safeParse = valibot.safeParse as unknown as SafeParseFn;
   } catch (cause) {
     throw new Error(
-      'для schema-опций нужны пакеты valibot и @valibot/to-json-schema: ' +
+      'schema options require the valibot and @valibot/to-json-schema packages: ' +
         'npm i valibot @valibot/to-json-schema',
       { cause },
     );
@@ -77,27 +78,28 @@ export async function loadSchemaDeps(): Promise<void> {
 
 function requireDeps(): { toJsonSchema: ToJsonSchemaFn; safeParse: SafeParseFn } {
   if (!_toJsonSchema || !_safeParse) {
-    throw new Error('внутренняя ошибка: loadSchemaDeps() не был вызван до работы со схемой');
+    throw new Error('internal error: loadSchemaDeps() was not called before using a schema');
   }
   return { toJsonSchema: _toJsonSchema, safeParse: _safeParse };
 }
 
-/** valibot-схема? (Standard Schema / внутренние маркеры valibot). */
+/** Is this a valibot schema? (Standard Schema / valibot's internal markers). */
 export function isValibot(s: unknown): s is ValibotSchema {
   if (s == null || typeof s !== 'object') return false;
   const o = s as Record<string, unknown>;
   return o['~standard'] != null || o['kind'] === 'schema' || typeof o['~run'] === 'function';
 }
 
-// errorMode:'ignore' — конвертируем ТОЛЬКО структурную часть (типы/min/max/...).
-// transform/check не мапятся в JSON Schema (это JS) — их доигрывает valibot в preValidation.
+// errorMode:'ignore' — convert ONLY the structural part (types/min/max/...).
+// transform/check do not map to JSON Schema (they are JS) — valibot applies them in
+// preValidation.
 const TO_JSON_OPTS = { errorMode: 'ignore' } as const;
 
-/** Схема → строка JSON Schema (структурная часть, для Rust). */
+/** Schema → JSON Schema string (the structural part, for Rust). */
 export function toJsonSchemaString(schema: SchemaSource | null | undefined): string | undefined {
   if (schema == null) return undefined;
   if (isValibot(schema)) return JSON.stringify(valibotToJsonSchema(schema));
-  // сырой JSON Schema
+  // raw JSON Schema
   return JSON.stringify(schema);
 }
 
@@ -105,19 +107,19 @@ function valibotToJsonSchema(schema: ValibotSchema): JsonSchemaObject {
   return requireDeps().toJsonSchema(schema, TO_JSON_OPTS);
 }
 
-/** Множество имён свойств верхнего уровня (для стрипа ответа). */
+/** The set of top-level property names (used for response stripping). */
 export function topProps(schema: SchemaSource | null | undefined): Set<string> | null {
   if (schema == null) return null;
   const js = isValibot(schema) ? valibotToJsonSchema(schema) : schema;
   return js.properties ? new Set(Object.keys(js.properties)) : null;
 }
 
-/** valibot safeParse (для transform/refine на стадии preValidation). */
+/** valibot safeParse (for transform/refine during the preValidation stage). */
 export function valibotSafeParse(schema: ValibotSchema, data: unknown): ValibotParseResult {
   return requireDeps().safeParse(schema, data);
 }
 
-/** valibot issues → машиночитаемый список `[{ in, path, message, code }]`. */
+/** valibot issues → a machine-readable list `[{ in, path, message, code }]`. */
 export function valibotIssues(
   issues: ReadonlyArray<ValibotIssue>,
   location: IssueLocation,

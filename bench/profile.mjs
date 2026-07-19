@@ -1,5 +1,5 @@
-// Профиль перехода границы: гоняет варианты из profile-servers.mjs и печатает
-// раскладку «мкс на запрос» по слоям. Запуск: node bench/profile.mjs [--duration=8]
+// Boundary-crossing profile: runs the variants from profile-servers.mjs and prints a
+// per-layer "µs per request" breakdown. Run: node bench/profile.mjs [--duration=8]
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -15,10 +15,10 @@ const CONNECTIONS = arg('connections', 64);
 const WARMUP_MS = 2000;
 
 const VARIANTS = [
-  { id: 'native', name: 'native (JS не будится)' },
+  { id: 'native', name: 'native (JS never wakes)' },
   { id: 'bridge', name: 'bridge (TSFN + MatchedRequest)' },
   { id: 'ctx', name: 'ctx (+ buildContext)' },
-  { id: 'full', name: 'full (+ луковица и хуки)' },
+  { id: 'full', name: 'full (+ onion and hooks)' },
 ];
 
 function once(agent, opts) {
@@ -73,7 +73,7 @@ async function startServer(id, port) {
   });
   if (!ready) {
     child.kill('SIGKILL');
-    throw new Error(`${id} не поднялся:\n${err}`);
+    throw new Error(`${id} failed to start:\n${err}`);
   }
   return child;
 }
@@ -89,7 +89,7 @@ for (const v of VARIANTS) {
     const usPerReq = 1e6 / r.rps;
     rows.push({ ...v, ...r, usPerReq });
     console.log(
-      `${v.name.padEnd(32)} rps=${String(r.rps).padStart(7)}  ${usPerReq.toFixed(2)} мкс/запрос  ошибок=${r.errors}`,
+      `${v.name.padEnd(32)} rps=${String(r.rps).padStart(7)}  ${usPerReq.toFixed(2)} us/request  errors=${r.errors}`,
     );
   } finally {
     child.kill('SIGKILL');
@@ -98,13 +98,13 @@ for (const v of VARIANTS) {
   }
 }
 
-console.log('\n--- раскладка (разности соседних слоёв) ---');
+console.log('\n--- breakdown (differences between adjacent layers) ---');
 for (let i = 1; i < rows.length; i++) {
   const delta = rows[i].usPerReq - rows[i - 1].usPerReq;
-  console.log(`${rows[i].name.padEnd(32)} +${delta.toFixed(2)} мкс`);
+  console.log(`${rows[i].name.padEnd(32)} +${delta.toFixed(2)} us`);
 }
 const total = rows.at(-1).usPerReq - rows[0].usPerReq;
-console.log(`${'ИТОГО сверх нативного пути'.padEnd(32)} +${total.toFixed(2)} мкс`);
+console.log(`${'TOTAL over the native path'.padEnd(32)} +${total.toFixed(2)} us`);
 
 console.log('\n--- JSON ---');
 console.log(JSON.stringify({ node: process.version, connections: CONNECTIONS, rows }, null, 2));

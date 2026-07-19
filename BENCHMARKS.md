@@ -1,32 +1,32 @@
-# Бенчмарки `@oxide-ts/http`
+# `@oxide-ts/http` benchmarks
 
-Замеры делаются харнессом [bench/run.mjs](bench/run.mjs):
+Measurements are produced by the harness in [bench/run.mjs](bench/run.mjs):
 
 ```bash
 node bench/run.mjs --duration=10 --connections=64
-# полное сравнение (участники подключаются, если установлены):
+# full comparison (participants join in if installed):
 npm i -D fastify hono @hono/node-server && node bench/run.mjs
 ```
 
-## Методика
+## Methodology
 
-- Каждый сервер поднимается в **отдельном процессе** ([bench/servers.mjs](bench/servers.mjs)).
-  Это принципиально: когда сервер и генератор нагрузки живут в одном процессе,
-  JS-хендлер конкурирует с клиентом за event loop, и нативный сервер оказывается
-  в заведомо худших условиях. Первая версия харнесса этим и грешила — цифры
-  различались почти вдвое.
-- Клиент — `node:http` с keep-alive агентом, без внешних зависимостей.
-- Прогрев 2с, затем замер; считаются RPS, p50, p99.
-- Сценарий `/json`: маршрут возвращает небольшой JSON-объект.
+- Every server runs in a **separate process** ([bench/servers.mjs](bench/servers.mjs)).
+  This matters: when the server and the load generator share a process, the JS handler
+  competes with the client for the event loop and a native server ends up at a clear
+  disadvantage. The first version of the harness had exactly that flaw — the numbers
+  differed by almost a factor of two.
+- The client is `node:http` with a keep-alive agent, no external dependencies.
+- 2s warm-up, then measurement; RPS, p50 and p99 are reported.
+- The `/json` scenario: the route returns a small JSON object.
 
-### Ограничение, которое надо держать в голове
+### A limitation worth keeping in mind
 
-Генератор нагрузки — тоже Node, и на быстрых серверах **он сам становится узким
-местом**. Ниже это видно прямо: нативная ручка и `node:http` упираются в один и тот
-же потолок и не растут при увеличении числа соединений. Значит, для них замер
-показывает потолок клиента, а не сервера.
+The load generator is Node as well, and against fast servers **it becomes the bottleneck
+itself**. That is visible directly below: the native endpoint and `node:http` hit the same
+ceiling and do not grow when the connection count increases. For those two the measurement
+therefore shows the client's ceiling, not the server's.
 
-Авторитетные цифры нужно снимать внешним генератором с отдельной машины:
+Authoritative numbers require an external generator from a separate machine:
 
 ```bash
 oha -z 30s -c 64 http://<host>:<port>/json          # HTTP/1.1
@@ -34,126 +34,128 @@ bombardier -d 30s -c 64 http://<host>:<port>/json
 h2load -n 200000 -c 64 -m 32 https://<host>:<port>/json   # HTTP/2
 ```
 
-## Результаты
+## Results
 
-Железо: Apple M-series, 16 ядер, macOS (darwin-arm64), Node v24.16.0.
-Прогон: `--duration=8 --connections=64`.
+Hardware: Apple M-series, 16 cores, macOS (darwin-arm64), Node v24.16.0.
+Run: `--duration=8 --connections=64`.
 
-| Сервер | RPS | p50 | p99 |
+| Server | RPS | p50 | p99 |
 |---|---:|---:|---:|
-| `node:http` | 68 905 | 0.89 ms | 1.78 ms |
-| `@oxide-ts/http`, нативная ручка (без JS) | 67 869 | 0.89 ms | 1.84 ms |
-| `@oxide-ts/http`, JS-хендлер | 39 896 | 1.40 ms | 4.14 ms |
+| `node:http` | 68,905 | 0.89 ms | 1.78 ms |
+| `@oxide-ts/http`, native endpoint (no JS) | 67,869 | 0.89 ms | 1.84 ms |
+| `@oxide-ts/http`, JS handler | 39,896 | 1.40 ms | 4.14 ms |
 
-Тот же прогон при `--connections=192`:
+The same run with `--connections=192`:
 
-| Сервер | RPS | p50 | p99 |
+| Server | RPS | p50 | p99 |
 |---|---:|---:|---:|
-| `node:http` | 65 477 | 2.89 ms | 3.56 ms |
-| `@oxide-ts/http`, нативная ручка | 64 606 | 2.92 ms | 3.75 ms |
-| `@oxide-ts/http`, JS-хендлер | 40 069 | 4.23 ms | 11.59 ms |
+| `node:http` | 65,477 | 2.89 ms | 3.56 ms |
+| `@oxide-ts/http`, native endpoint | 64,606 | 2.92 ms | 3.75 ms |
+| `@oxide-ts/http`, JS handler | 40,069 | 4.23 ms | 11.59 ms |
 
-`fastify` и `hono` в этот прогон не попали — не установлены в окружении замера.
+`fastify` and `hono` were not part of this run — they are not installed in the measurement
+environment.
 
-## Что из этого следует
+## What follows from this
 
-**1. Rust-путь упирается в клиента, а не в себя.** Нативная ручка и `node:http`
-дают одинаковый результат и **не растут** при увеличении соединений с 64 до 192
-(даже слегка проседают). Это поведение насыщенного клиента. Реальный потолок
-Rust-пути отсюда не виден — нужен внешний генератор.
+**1. The Rust path is limited by the client, not by itself.** The native endpoint and
+`node:http` produce identical results and **do not grow** when connections go from 64 to
+192 (they even dip slightly). That is saturated-client behaviour. The real ceiling of the
+Rust path is not visible here — an external generator is needed.
 
-**2. Главная цена — переход границы в JS.** Разница между нативной ручкой и
-JS-хендлером на одном и том же сервере: 67.9k → 39.9k RPS, то есть **≈10.6 мкс
-на запрос** (25.1 мкс против 14.5 мкс). Это TSFN-вызов, `Promise` через границу,
-сборка контекста `c` и прогон луковицы.
+**2. The dominant cost is crossing into JS.** The difference between the native endpoint
+and a JS handler on the same server: 67.9k → 39.9k RPS, i.e. **≈10.6 µs per request**
+(25.1 µs versus 14.5 µs). That is the TSFN call, the `Promise` across the boundary,
+building the context `c` and running the onion.
 
-**3. Исходная гипотеза проекта на маршрутах с JS-хендлером пока не подтверждается.**
-`@oxide-ts/http` с JS-хендлером медленнее `node:http` (39.9k против 68.9k). Выигрыш
-сейчас есть только там, где JS не будится вообще: роутинг, `404`/`405`, CORS
-preflight, валидация схемы с отказом, пробы, `413`/`415` — всё это отвечает из Rust
-и работает на скорости нативной ручки.
+**3. The project's original hypothesis does not hold for routes with a JS handler.**
+`@oxide-ts/http` with a JS handler is slower than `node:http` (39.9k versus 68.9k). The win
+today exists only where JS never wakes at all: routing, `404`/`405`, CORS preflight, a
+schema rejection, probes, `413`/`415` — all of which are answered from Rust and run at the
+speed of the native endpoint.
 
-Это не приговор архитектуре, но и не то, ради чего она задумывалась. Прежде чем
-заявлять преимущество по скорости, нужно разобрать эти 10 мкс на составляющие.
+This is not a verdict on the architecture, but it is not what the architecture was built
+for either. Before claiming a speed advantage, those 10 µs need to be broken down.
 
-## Профиль перехода границы
+## Profiling the boundary crossing
 
-Разбор по слоям — [bench/profile.mjs](bench/profile.mjs) + [bench/profile-servers.mjs](bench/profile-servers.mjs).
-Каждый слой добавляет к предыдущему ровно одну вещь; `ELU` — загрузка главного потока
-(event loop utilization) серверного процесса под нагрузкой.
+A layer-by-layer breakdown — [bench/profile.mjs](bench/profile.mjs) plus
+[bench/profile-servers.mjs](bench/profile-servers.mjs). Each layer adds exactly one thing
+to the previous one; `ELU` is the event loop utilization of the server process under load.
 
-| Слой | RPS | мкс/запрос | ELU | Δ к предыдущему |
+| Layer | RPS | µs/request | ELU | Δ vs previous |
 |---|---:|---:|---:|---:|
-| `native` — JS не будится | 66 774 | 14.98 | **0.000** | — |
-| `bridge` — TSFN + `Promise`, колбэк отдаёт константу | 57 403 | 17.42 | **0.976** | +2.44 мкс |
-| `touch` — то же + чтение **всех** полей napi-объекта | 58 052 | 17.23 | ~0.98 | −0.19 мкс |
-| `ctx` — + `buildContext` и `buildNativeResponse` | 45 369 | 22.04 | **1.000** | +4.81 мкс |
-| `full` — + луковица middleware и хуки | 42 048 | 23.78 | **1.000** | +1.74 мкс |
+| `native` — JS never wakes | 66,774 | 14.98 | **0.000** | — |
+| `bridge` — TSFN + `Promise`, callback returns a constant | 57,403 | 17.42 | **0.976** | +2.44 µs |
+| `touch` — same plus reading **all** fields of the napi object | 58,052 | 17.23 | ~0.98 | −0.19 µs |
+| `ctx` — plus `buildContext` and `buildNativeResponse` | 45,369 | 22.04 | **1.000** | +4.81 µs |
+| `full` — plus the middleware onion and hooks | 42,048 | 23.78 | **1.000** | +1.74 µs |
 
-### Что это означает
+### What this means
 
-**1. Любой маршрут с JS-хендлером упирается в один поток.** Как только JS вовлечён,
-ELU выходит на ~1.0 — даже у минимального колбэка, который просто возвращает готовую
-константу. Сколько бы ни было воркеров tokio, пропускная способность таких маршрутов
-ограничена временем главного потока. У нативного пути ELU = 0.000: там JS не участвует
-вообще, и потолок задаёт уже клиент замера, а не сервер.
+**1. Any route with a JS handler is bound by a single thread.** As soon as JS is involved,
+ELU reaches ~1.0 — even for a minimal callback that just returns a prepared constant. No
+matter how many tokio workers exist, the throughput of such routes is limited by
+main-thread time. The native path shows ELU = 0.000: JS is not involved there at all, and
+the ceiling is set by the measurement client rather than the server.
 
-**2. Чтение данных через границу бесплатно.** Вариант `touch` читает *все* поля
-`MatchedRequest` — заголовки, query, params, ip, ips, id — и стоит столько же, сколько
-вариант, не трогающий их вовсе (17.23 против 17.40 мкс, разница в пределах шума).
-Это снимает гипотезу о дорогом доступе к napi-объектам: форму данных на границе
-переделывать не нужно.
+**2. Reading data across the boundary is free.** The `touch` variant reads *every* field of
+`MatchedRequest` — headers, query, params, ip, ips, id — and costs the same as the variant
+that touches none of them (17.23 versus 17.40 µs, within noise). That rules out the
+hypothesis of expensive napi object access: the boundary data shape does not need redesign.
 
-**3. Дорогая часть — наш собственный JS-слой.** `buildContext` + `buildNativeResponse`
-добавляют 4.81 мкс, луковица — ещё 1.74 мкс: вместе **6.55 мкс**, около 27% времени
-главного потока на запрос. Это и есть адресуемый резерв.
+**3. The expensive part is our own JS layer.** `buildContext` plus `buildNativeResponse`
+add 4.81 µs and the onion another 1.74 µs: **6.55 µs** together, roughly 27% of main-thread
+time per request. That is the addressable headroom.
 
-Любопытная деталь: в изолированном микро-замере (тесный цикл, один и тот же входной
-объект) `buildContext` + `c.json` + `buildNativeResponse` укладываются в **0.86 мкс** —
-в пять с лишним раз меньше, чем в реальном пути. Разница — цена того, что на каждый
-запрос создаётся ~25 замыканий, несколько `Map` и крупный объектный литерал, и живут
-они через границу промиса, а не умирают в тесном цикле. Размер молодого поколения V8
-(`--max-semi-space-size=64`) на результат не влияет — это не давление на GC как таковое.
+A curious detail: in an isolated micro-benchmark (a tight loop over the same input object)
+`buildContext` + `c.json` + `buildNativeResponse` fit into **0.86 µs** — more than five
+times less than on the real path. The difference is the price of allocating ~25 closures,
+several `Map`s and a large object literal per request, all of which live across a promise
+boundary instead of dying inside a tight loop. V8's young-generation size
+(`--max-semi-space-size=64`) does not change the result — this is not GC pressure as such.
 
-**4. Стратегический вывод: оптимизация обёртки не сделает JS-маршруты быстрее `node:http`.**
-Сам round-trip через границу — 17.4 мкс главного потока, и это пол. `node:http`
-обрабатывает весь запрос за ~14.5 мкс. Даже обёртка с нулевой стоимостью оставила бы
-нас медленнее на JS-маршрутах.
+**4. Strategic conclusion: optimizing the wrapper will not make JS routes faster than
+`node:http`.** The round trip across the boundary alone is 17.4 µs of main-thread time, and
+that is the floor. `node:http` handles an entire request in ~14.5 µs. Even a zero-cost
+wrapper would leave us slower on JS routes.
 
-Архитектура выигрывает там, где JS не будится: роутинг, `404`/`405`, `Allow`, CORS
-preflight, отказ по схеме, пробы, `413`/`415`/`431`, лимиты и таймауты. На маршруте,
-который всё равно уходит в JS-хендлер, преимущества по скорости нет и не будет —
-преимущества там другие (валидация и лимиты до пробуждения event loop, backpressure,
-graceful shutdown, метрики без JS).
+The architecture wins where JS never wakes: routing, `404`/`405`, `Allow`, CORS preflight,
+schema rejection, probes, `413`/`415`/`431`, limits and timeouts. On a route that ends up in
+a JS handler anyway there is no speed advantage and there will not be one — the advantages
+there are different (validation and limits before the event loop wakes, backpressure,
+graceful shutdown, metrics without JS).
 
-## Что мерить и чинить дальше
+## What to measure and fix next
 
-- ✅ **Профиль перехода границы снят** — см. раздел выше. Итог: доступ к данным
-  через границу бесплатен, дорогие — наш JS-слой (6.55 мкс) и сам round-trip (17.4 мкс).
-- **Сократить аллокации в `buildContext`** — единственный реально адресуемый резерв
-  (~6.5 мкс из 23.8). Направления: перенести методы контекста на прототип вместо
-  ~25 замыканий на запрос; лениво собирать `query`, заголовки, `_store`, логгер.
-  Потолок выигрыша — вернуться к ~17.4 мкс, то есть всё ещё медленнее `node:http`.
-- **Проверить внешним генератором** — снять настоящий потолок Rust-пути и понять,
-  насколько велик запас.
-- **Добавить сценарии:** стриминг/SSE, multipart-загрузка, маршрут со схемой
-  (там валидация в Rust должна давать преимущество), HTTP/2 через `h2load`.
-- **Сравнить с `fastify` и `hono`** — установить и прогнать.
+- ✅ **The boundary-crossing profile has been taken** — see the section above. Conclusion:
+  data access across the boundary is free; the expensive parts are our JS layer (6.55 µs)
+  and the round trip itself (17.4 µs).
+- **Reduce allocations in `buildContext`** — the only genuinely addressable headroom
+  (~6.5 µs out of 23.8). Directions: move context methods onto a prototype instead of ~25
+  closures per request; build `query`, headers, `_store` and the logger lazily. The ceiling
+  of this work is returning to ~17.4 µs, which is still slower than `node:http`.
+- **Verify with an external generator** — to establish the real ceiling of the Rust path and
+  how much headroom actually exists.
+- **Add scenarios:** streaming/SSE, multipart uploads, a route with a schema (where Rust-side
+  validation should pay off), and HTTP/2 through `h2load`.
+- **Compare against `fastify` and `hono`** — install them and run.
 
-## Тесты живучести
+## Survivability tests
 
-Отдельно от скорости, в наборе есть проверки стабильности
-([__test__/stability.test.mjs](__test__/stability.test.mjs)):
+Separately from speed, the suite contains stability checks
+([__test__/stability.test.ts](__test__/stability.test.ts)):
 
-- память под нагрузкой выходит на плато, а не растёт линейно (замер по блокам в
-  дочернем процессе с `--expose-gc`; RSS: +98 / +7 / +5 / +2 / +0.1 МБ на блок
-  в 20k запросов — прирост затухает, `heapUsed` стоит на ~8 МБ);
-- 3000 запросов подряд с `throw` в хендлере → 3000 ответов `500`, процесс жив;
-- под смешанной нагрузкой (`ok`/`throw`/`reject`/тело) `unhandledRejection`
-  не срабатывает ни разу;
-- оборванные клиентом запросы не копят ресурсы;
-- 30 циклов `listen`/`close` не оставляют портов и хендлов.
+- memory under load plateaus instead of growing linearly (measured in blocks in a child
+  process with `--expose-gc`; RSS: +98 / +7 / +5 / +2 / +0.1 MB per 20k-request block —
+  the growth decays while `heapUsed` stays at ~8 MB);
+- 3000 consecutive requests with a `throw` in the handler → 3000 `500` responses, process
+  alive;
+- under mixed load (`ok`/`throw`/`reject`/body) `unhandledRejection` never fires;
+- client-aborted requests do not accumulate resources;
+- 30 `listen`/`close` cycles leave no ports or handles behind.
 
-Базовый RSS сервера — около 190 МБ на 16-ядерной машине: это стеки воркеров tokio
-(число берётся из cgroup-квоты, см. §6c A3) плюс буферы hyper и куча V8. В контейнере
-с `limits.cpu: 1` воркеров будет меньше — соответственно меньше и базовая память.
+The server's baseline RSS is about 190 MB on a 16-core machine: tokio worker stacks (the
+count comes from the cgroup quota, see §6c A3) plus hyper buffers and the V8 heap. In a
+container with `limits.cpu: 1` there will be fewer workers and correspondingly less
+baseline memory.

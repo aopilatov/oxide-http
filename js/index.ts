@@ -1,6 +1,6 @@
-// Публичная обёртка над нативным `RustServer`. Регистрация маршрутов,
-// middleware (луковица) и хуков жизненного цикла; роутинг/матчинг/404/405 — в Rust.
-// Цепочки предкомпилируются на listen() (см. pipeline.ts), контекст — context.ts.
+// The public wrapper around the native `RustServer`. Route, middleware (onion) and
+// lifecycle-hook registration; routing/matching/404/405 happen in Rust.
+// Chains are precompiled on listen() (see pipeline.ts); the context lives in context.ts.
 
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -56,9 +56,9 @@ export { HttpError } from './context.ts';
 export type { Context, CookieOptions, MultipartPart } from './context.ts';
 export type { Handler, Middleware, Hook, ErrorHook } from './pipeline.ts';
 
-// --- публичные типы конфигурации ---
+// --- public configuration types ---
 
-/** CORS (§6a). `origin`-функция не нативна — для динамики пишите JS-middleware. */
+/** CORS (§6a). An `origin` function is not native — write a JS middleware for dynamic logic. */
 export interface CorsConfig {
   origin?: string | string[];
   methods?: string[];
@@ -68,7 +68,7 @@ export interface CorsConfig {
   maxAge?: number;
 }
 
-/** TLS (§12): PEM-строка, путь к файлу либо Buffer. */
+/** TLS (§12): a PEM string, a file path, or a Buffer. */
 export interface TlsConfig {
   cert: string | Buffer;
   key: string | Buffer;
@@ -81,16 +81,16 @@ export interface Http2Config {
   maxResetStreamsPerSec?: number;
 }
 
-/** Пробы и метрики (§11). Пустая строка в пути = ручка выключена. */
+/** Probes and metrics (§11). An empty path disables the endpoint. */
 export interface HealthConfig {
   path?: string;
   readyPath?: string;
   metricsPath?: string;
-  /** Отдельный порт: тогда на основном порту проб и метрик нет. */
+  /** A separate port: probes and metrics are then absent from the main port. */
   port?: number;
 }
 
-/** Лимиты multipart (§9a). */
+/** Multipart limits (§9a). */
 export interface MultipartConfig {
   maxFileSize?: ByteSize;
   maxFieldSize?: ByteSize;
@@ -100,7 +100,7 @@ export interface MultipartConfig {
   allowedExtensions?: string[];
 }
 
-/** Конфигурация сервера. */
+/** Server configuration. */
 export interface ServerConfig {
   baseUrl?: string;
   requestId?: { header?: string };
@@ -110,32 +110,32 @@ export interface ServerConfig {
   customCountryHeaders?: string[];
   cors?: CorsConfig;
   tls?: TlsConfig;
-  /** h2c prior-knowledge на plaintext-порту (§12). */
+  /** h2c prior-knowledge on the plaintext port (§12). */
   h2c?: boolean;
   http2?: Http2Config;
-  // таймауты (§6c A2)
+  // timeouts (§6c A2)
   headerReadTimeout?: Duration;
   bodyReadTimeout?: Duration;
   idleTimeout?: Duration;
   handshakeTimeout?: Duration;
   maxHeaders?: number;
   maxHeaderSize?: ByteSize;
-  // жизненный цикл (§10)
+  // lifecycle (§10)
   shutdownTimeout?: Duration;
-  /** Пауза «readiness снят, но ещё принимаем» — под k8s 5–15с. */
+  /** The "readiness dropped but still accepting" pause — 5–15s under k8s. */
   preShutdownDelay?: Duration;
   handleSignals?: boolean;
-  // сеть и платформа (§6c B9, A3, A4)
+  // network and platform (§6c B9, A3, A4)
   backlog?: number;
   reusePort?: boolean;
   noDelay?: boolean;
   maxConnections?: number;
   proxyProtocol?: boolean;
   workerThreads?: number | 'auto';
-  // наблюдаемость (§11)
+  // observability (§11)
   health?: HealthConfig;
   accessLog?: boolean;
-  // перегрузка (§6c C5)
+  // overload (§6c C5)
   maxConcurrentRequests?: number;
   maxQueue?: number;
   queueTimeout?: Duration;
@@ -143,21 +143,21 @@ export interface ServerConfig {
   overloadShedAfter?: Duration;
 }
 
-/** Опции маршрута: схемы, multipart и маршрутные хуки. */
+/** Route options: schemas, multipart and route-level hooks. */
 export type RouteOptions = {
   schema?: RouteSchema;
   multipart?: boolean | MultipartConfig;
 } & Partial<Record<StageName, Hook | Hook[]>>;
 
-/** Аргументы `listen()`: TCP либо Unix-сокет. */
+/** `listen()` arguments: TCP or a Unix socket. */
 export interface ListenArgs {
   port?: number;
   host?: string;
-  /** Unix-сокет (§6c B9); задан → `port`/`host` игнорируются. */
+  /** Unix socket (§6c B9); when set, `port`/`host` are ignored. */
   path?: string;
 }
 
-/** Запрос для `app.inject()` (§17). */
+/** A request for `app.inject()` (§17). */
 export interface InjectRequest {
   method?: string;
   path?: string;
@@ -166,7 +166,7 @@ export interface InjectRequest {
   query?: Record<string, string>;
 }
 
-/** Ответ `app.inject()`. */
+/** The `app.inject()` response. */
 export interface InjectResult {
   status: number;
   headers: Record<string, string>;
@@ -176,17 +176,17 @@ export interface InjectResult {
   json<T = unknown>(): T;
 }
 
-/** События сервера (§6d B7). */
+/** Server events (§6d B7). */
 export type ServerEvent = 'listening' | 'error' | 'close' | 'shutdown';
 
-/** Полезная нагрузка события `listening`: TCP-адрес либо путь Unix-сокета. */
+/** Payload of the `listening` event: a TCP address or a Unix socket path. */
 export interface ListeningInfo {
   port?: number;
   host?: string;
   path?: string;
 }
 
-/** Сигнатуры обработчиков по событию. */
+/** Handler signatures per event. */
 export interface ServerEventMap {
   listening: (info: ListeningInfo) => void;
   error: (err: unknown) => void;
@@ -194,13 +194,13 @@ export interface ServerEventMap {
   shutdown: () => void;
 }
 
-/** Опции периодической проверки готовности (§11). */
+/** Options for the periodic readiness check (§11). */
 export interface ReadinessCheckOptions {
   interval?: number;
   timeout?: number;
 }
 
-// --- внутренние типы ---
+// --- internal types ---
 
 interface RouteEntry {
   method: string;
@@ -214,8 +214,8 @@ interface RouteEntry {
 
 type HooksByStage = Record<StageName, Array<Scoped<Hook | ErrorHook>>>;
 
-// Страховочный process-level хендлер (§8): в норме не срабатывает — срабатывание
-// означает баг обёртки (не пойманный reject). Логируем, но процесс НЕ роняем.
+// Process-level safety net (§8): normally never fires — if it does, it means a bug in
+// the wrapper (an uncaught reject). We log it but do NOT bring the process down.
 let safetyNetInstalled = false;
 function installSafetyNet(): void {
   if (safetyNetInstalled) return;
@@ -225,14 +225,14 @@ function installSafetyNet(): void {
       JSON.stringify({
         level: 'error',
         time: new Date().toISOString(),
-        msg: 'unhandledRejection (баг обёртки @oxide-ts/http — процесс не падает)',
+        msg: 'unhandledRejection (a bug in the @oxide-ts/http wrapper — the process stays up)',
         reason: reason instanceof Error ? reason.stack : String(reason),
       }) + '\n',
     );
   });
 }
 
-/** Нормализация префикса: '' | '/' → ''; ведущий слэш обяз.; хвостовой (и /*) убираем. */
+/** Prefix normalization: '' | '/' → ''; a leading slash is required; trailing (and /*) removed. */
 function normalizeBase(b: string | undefined): string {
   if (!b || b === '/') return '';
   let s = b.startsWith('/') ? b : '/' + b;
@@ -241,14 +241,14 @@ function normalizeBase(b: string | undefined): string {
   return s || '';
 }
 
-/** Склейка префикса и пути маршрута (path === '/' не даёт двойного слэша). */
+/** Join a prefix and a route path (path === '/' does not produce a double slash). */
 function join(base: string, path: string): string {
   const p = path.startsWith('/') ? path : '/' + path;
   if (p === '/') return base === '' ? '/' : base;
   return base + p;
 }
 
-/** Пустой набор хуков по стадиям. */
+/** An empty set of hooks per stage. */
 function emptyHooks(): HooksByStage {
   const h = {} as HooksByStage;
   for (const stage of ALL_STAGES) h[stage] = [];
@@ -258,20 +258,20 @@ function emptyHooks(): HooksByStage {
 export class Server {
   readonly #native: RustServer;
   #routes: RouteEntry[] = [];
-  #middleware: Array<Scoped<Middleware>> = []; // луковица (глобальные + префиксные)
+  #middleware: Array<Scoped<Middleware>> = []; // the onion (global plus prefixed)
   #hooks: HooksByStage = emptyHooks();
   #baseUrl = '';
   #notFound: Handler | null = null;
-  #chains: Chain[] = []; // предкомпилированные цепочки по leafId (после listen)
+  #chains: Chain[] = []; // precompiled chains by leafId (after listen)
   #notFoundChain: Chain | null = null;
-  #responseStrip: Array<ResponseStrip | null> = []; // по leafId
+  #responseStrip: Array<ResponseStrip | null> = []; // by leafId
   #options: NativeListenOptions;
   #requestIdHeader: string;
   #bodyLimit: number | undefined;
   #requestTimeout: number | null;
   #events = new EventEmitter();
   #listening = false;
-  #closing: Promise<void> | null = null; // делает close() идемпотентным
+  #closing: Promise<void> | null = null; // makes close() idempotent
   #signalCleanup: (() => void) | null = null;
   #handleSignals: boolean;
   #readinessTimer: NodeJS.Timeout | null = null;
@@ -289,12 +289,12 @@ export class Server {
       customCountryHeaders: config.customCountryHeaders ?? [],
       requestIdHeader: this.#requestIdHeader,
     };
-    // Отсутствие ключа и null для napi одинаковы (Option::None), но типы
-    // опциональных полей null не принимают — просто не задаём ключ.
+    // For napi an absent key and null mean the same (Option::None), but the optional
+    // field types do not accept null — so we simply omit the key.
     if (this.#bodyLimit !== undefined) options.bodyLimit = this.#bodyLimit;
     this.#options = options;
 
-    // Опциональные объекты/Option-поля задаём только когда есть: napi не принимает null.
+    // Optional objects/Option fields are set only when present: napi rejects null.
     if (config.cors) options.cors = normalizeCors(config.cors);
     if (config.tls) options.tls = resolveTls(config.tls);
     if (config.h2c) options.h2c = true;
@@ -313,24 +313,24 @@ export class Server {
     if (config.shutdownTimeout != null) {
       options.shutdownTimeout = parseDuration(config.shutdownTimeout);
     }
-    // Пауза «readiness снят, но ещё принимаем» — под k8s ставить 5–15с, чтобы
-    // балансировщик успел увести трафик до отказа в соединениях (§10 + §11).
+    // The "readiness dropped but still accepting" pause — set 5–15s under k8s so the
+    // balancer can drain traffic away before refusals start (§10 + §11).
     if (config.preShutdownDelay != null) {
       options.preShutdownDelay = parseDuration(config.preShutdownDelay);
     }
-    // Socket-опции (§6c B9) и PROXY protocol (A4).
+    // Socket options (§6c B9) and PROXY protocol (A4).
     if (config.backlog != null) options.backlog = config.backlog;
     if (config.reusePort != null) options.reusePort = config.reusePort;
     if (config.noDelay != null) options.noDelay = config.noDelay;
     if (config.maxConnections != null) options.maxConnections = config.maxConnections;
     if (config.proxyProtocol != null) options.proxyProtocol = config.proxyProtocol;
-    // workerThreads: число | 'auto' (по cgroup-квоте). 'auto' = не задавать явно.
+    // workerThreads: a number | 'auto' (from the cgroup quota). 'auto' = leave unset.
     if (typeof config.workerThreads === 'number') {
       options.workerThreads = config.workerThreads;
     } else if (config.workerThreads != null && config.workerThreads !== 'auto') {
-      throw new TypeError("workerThreads: число либо 'auto'");
+      throw new TypeError("workerThreads: a number or 'auto'");
     }
-    // Пробы, метрики, access-log (§11). Пустая строка в пути = ручка выключена.
+    // Probes, metrics, access log (§11). An empty path disables the endpoint.
     if (config.health) {
       const h = config.health;
       if (h.path != null) options.healthPath = h.path;
@@ -339,7 +339,7 @@ export class Server {
       if (h.port != null) options.adminPort = h.port;
     }
     if (config.accessLog != null) options.accessLog = config.accessLog;
-    // Защита от перегрузки (§6c C5).
+    // Overload protection (§6c C5).
     if (config.maxConcurrentRequests != null) {
       options.maxConcurrentRequests = config.maxConcurrentRequests;
     }
@@ -349,14 +349,14 @@ export class Server {
     if (config.overloadShedAfter != null) {
       options.overloadShedAfter = parseDuration(config.overloadShedAfter);
     }
-    // SIGTERM/SIGINT → graceful shutdown (§10). Выключается { handleSignals: false }
-    // — например когда процессом уже управляет внешний супервизор.
+    // SIGTERM/SIGINT → graceful shutdown (§10). Disabled with { handleSignals: false }
+    // — for example when an external supervisor already manages the process.
     this.#handleSignals = config.handleSignals !== false;
     if (config.http2) options.http2 = normalizeHttp2(config.http2);
     this.#native = new RustServer();
   }
 
-  // --- маршруты ---
+  // --- routes ---
 
   #add(method: string, path: string, args: unknown[]): this {
     // args: [options?, ...middleware, handler]
@@ -373,23 +373,23 @@ export class Server {
     }
     const handler = list.pop();
     if (typeof handler !== 'function') {
-      throw new TypeError(`${method} ${path}: хендлер должен быть функцией`);
+      throw new TypeError(`${method} ${path}: handler must be a function`);
     }
     this.#routes.push({
       method,
       path: join(this.#baseUrl, path),
-      middleware: list as Middleware[], // маршрутные middleware (перед хендлером)
+      middleware: list as Middleware[], // route middleware (before the handler)
       hooks,
       schema, // { body?, query?, params?, response? } — valibot | JSON Schema
-      multipart, // нормализованные опции multipart | null
+      multipart, // normalized multipart options | null
       handler: handler as Handler,
     });
     return this;
   }
 
-  // Перегрузки нужны для контекстной типизации: при rest-параметре с
-  // объединением типов TS не может вывести `c` в стрелке и подставляет any —
-  // ни автодополнения у пользователя, ни проверки в тестах.
+  // The overloads exist for contextual typing: with a union-typed rest parameter TS
+  // cannot infer `c` in the arrow and falls back to any — no autocomplete for users and
+  // no checking in tests.
   get(path: string, handler: Handler): this;
   get(path: string, options: RouteOptions, handler: Handler): this;
   get(path: string, ...a: Array<RouteOptions | Middleware | Handler>): this;
@@ -447,9 +447,9 @@ export class Server {
   }
 
 
-  // --- middleware (луковица) ---
+  // --- middleware (the onion) ---
 
-  /** `app.use(fn)` — глобальный; `app.use(prefix, ...fns)` — по префиксу. */
+  /** `app.use(fn)` — global; `app.use(prefix, ...fns)` — scoped by prefix. */
   use(...args: Array<string | Middleware>): this {
     let prefix = this.#baseUrl;
     const list = [...args];
@@ -457,33 +457,33 @@ export class Server {
       prefix = join(this.#baseUrl, normalizeBase(list.shift() as string));
     }
     for (const fn of list) {
-      if (typeof fn !== 'function') throw new TypeError('use: middleware должен быть функцией');
+      if (typeof fn !== 'function') throw new TypeError('use: middleware must be a function');
       this.#middleware.push({ prefix, fn });
     }
     return this;
   }
 
-  // --- хуки ---
+  // --- hooks ---
 
-  /** Обобщённая регистрация хука. */
+  /** Generic hook registration. */
   addHook(name: StageName, fn: Hook | ErrorHook): this {
     if (name === 'onError') return this.onError(fn as ErrorHook);
-    if (!this.#hooks[name]) throw new TypeError(`неизвестный хук: ${name}`);
-    if (typeof fn !== 'function') throw new TypeError(`${name}: обработчик должен быть функцией`);
+    if (!this.#hooks[name]) throw new TypeError(`unknown hook: ${name}`);
+    if (typeof fn !== 'function') throw new TypeError(`${name}: handler must be a function`);
     this.#hooks[name].push({ prefix: this.#baseUrl, fn });
     return this;
   }
 
-  /** Единый обработчик ошибок `onError(err, c)`. Можно навесить несколько. */
+  /** The unified error handler `onError(err, c)`. Several may be registered. */
   onError(fn: ErrorHook): this {
-    if (typeof fn !== 'function') throw new TypeError('onError: обработчик должен быть функцией');
+    if (typeof fn !== 'function') throw new TypeError('onError: handler must be a function');
     this.#hooks.onError.push({ prefix: this.#baseUrl, fn });
     return this;
   }
 
-  // Именованные методы-хуки. Раньше навешивались циклом в конструкторе — теперь
-  // это обычные методы прототипа: и типы видны, и на каждый экземпляр не
-  // создаётся по 11 замыканий.
+  // Named hook methods. They used to be attached in a constructor loop — now they are
+  // ordinary prototype methods: the types are visible and no 11 closures are allocated
+  // per instance.
   onRequest(fn: Hook): this {
     return this.addHook('onRequest', fn);
   }
@@ -518,12 +518,12 @@ export class Server {
     return this.addHook('onClose', fn);
   }
 
-  // --- группы ---
+  // --- groups ---
 
-  /** Смонтировать суб-приложение под префиксом (инкапсуляция через префикс-матчинг). */
+  /** Mount a sub-application under a prefix (encapsulation via prefix matching). */
   route(prefix: string, sub: Server): this {
     if (!(sub instanceof Server)) {
-      throw new TypeError('route(prefix, sub): sub должен быть экземпляром Server');
+      throw new TypeError('route(prefix, sub): sub must be a Server instance');
     }
     const P = join(this.#baseUrl, normalizeBase(prefix));
     const remap = (pfx: string): string => (pfx === '' ? P : join(P, pfx));
@@ -540,31 +540,31 @@ export class Server {
     return this;
   }
 
-  /** Кастомный обработчик 404 (иначе 404 отдаёт Rust без пробуждения JS). */
+  /** Custom 404 handler (otherwise Rust answers 404 without waking JS). */
   notFound(handler: Handler): this {
     this.#notFound = handler;
     return this;
   }
 
-  // --- запуск ---
+  // --- startup ---
 
-  /** Слушать TCP (`{ port, host }`) либо Unix-сокет (`{ path }`) — §6c B9. */
+  /** Listen on TCP (`{ port, host }`) or a Unix socket (`{ path }`) — §6c B9. */
   async listen({ port, host = '0.0.0.0', path }: ListenArgs = {}): Promise<this> {
     if (path != null) {
-      if (typeof path !== 'string') throw new TypeError('listen: path должен быть строкой');
+      if (typeof path !== 'string') throw new TypeError('listen: path must be a string');
       this.#options.unixPath = path;
-      port = 0; // нативный слой игнорирует порт при заданном unixPath
+      port = 0; // the native layer ignores the port when unixPath is set
     } else if (typeof port !== 'number') {
-      throw new TypeError('listen: нужен числовой port либо path для Unix-сокета');
+      throw new TypeError('listen: a numeric port or a path for a Unix socket is required');
     }
     installSafetyNet();
 
-    // Схемы: конвертация в JSON Schema (для Rust) + инъекция valibot-preValidation.
+    // Schemas: conversion to JSON Schema (for Rust) plus valibot preValidation injection.
     if (this.#routes.some((r) => r.schema != null)) await loadSchemaDeps();
     this.#responseStrip = this.#routes.map((r) => compileResponseStrip(r.schema));
     for (const r of this.#routes) injectValidation(r);
 
-    // Предкомпиляция цепочек для каждого листа маршрута.
+    // Precompile the chain for every route leaf.
     this.#chains = this.#routes.map((r) => buildChain(r, this.#middleware, this.#hooks));
     if (this.#notFound) {
       this.#notFoundChain = buildChain(
@@ -595,13 +595,14 @@ export class Server {
         table,
         this.#notFound != null,
         this.#options,
-        // napi передаёт кортеж (MatchedRequest, BodyIo) одним аргументом-массивом.
+        // napi passes the (MatchedRequest, BodyIo) tuple as a single array argument.
         ([req, bodyIo]: [NativeRequest, BodyIo]) => this.#dispatch(req, bodyIo),
       );
     } catch (err) {
-      // Bind падает синхронно (EADDRINUSE и т.п.) — отдаём и событием, и reject'ом.
-      // emit только при наличии слушателя: 'error' без подписчика в EventEmitter
-      // роняет процесс, а у нас инвариант «процесс не падает» (§8).
+      // Bind fails synchronously (EADDRINUSE and friends) — we surface it both as an
+      // event and as a reject. We emit only when a listener exists: an 'error' with no
+      // subscriber brings the process down in EventEmitter, and our invariant is that
+      // the process stays up (§8).
       if (this.#events.listenerCount('error') > 0) this.#events.emit('error', err);
       throw err;
     }
@@ -612,7 +613,7 @@ export class Server {
     return this;
   }
 
-  /** Подписка на server-события: `listening`, `error`, `close`, `shutdown` (§6d B7). */
+  /** Subscribe to server events: `listening`, `error`, `close`, `shutdown` (§6d B7). */
   on<E extends ServerEvent>(event: E, fn: ServerEventMap[E]): this {
     this.#events.on(event, fn as (...args: unknown[]) => void);
     return this;
@@ -622,14 +623,14 @@ export class Server {
     return this;
   }
 
-  /** Graceful shutdown (§10): закрыть listener, дожать in-flight, затем резолвнуться.
-   *  Идемпотентен и безопасен для параллельных вызовов — все ждут один и тот же drain. */
+  /** Graceful shutdown (§10): close the listener, finish in-flight requests, then
+   *  resolve. Idempotent and safe for concurrent calls — they all await the same drain. */
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
     this.#closing = (async () => {
       this.#events.emit('shutdown');
-      // Readiness снимается в Rust в начале drain'а; здесь гасим свой таймер,
-      // чтобы он не перевыставил флаг обратно посреди остановки.
+      // Readiness is dropped in Rust at the start of the drain; here we stop our timer
+      // so it cannot flip the flag back mid-shutdown.
       this.#stopReadinessCheck();
       await this.#native.close();
       this.#listening = false;
@@ -644,14 +645,14 @@ export class Server {
     return this.#listening;
   }
 
-  /** Тест-харнесс без сокета (§17): запрос идёт по in-memory каналу через тот же
-   *  конвейер — роутинг, схемы, CORS, метрики, JS-луковица.
+  /** Socket-free test harness (§17): the request travels through an in-memory pipe and
+   *  the very same pipeline — routing, schemas, CORS, metrics, the JS onion.
    *
-   *  Если сервер ещё не поднят, поднимаем его на эфемерном порту (маршруты и схемы
-   *  компилируются именно в `listen()`); сам запрос через сокет не идёт. */
+   *  If the server is not started yet we start it on an ephemeral port (routes and
+   *  schemas are compiled inside `listen()`); the request itself never uses a socket. */
   async inject(req: InjectRequest = {}): Promise<InjectResult> {
     const { method = 'GET', path = '/', headers = {}, body, query } = req;
-    if (this.#closed) throw new Error('inject: сервер закрыт (close() уже вызван)');
+    if (this.#closed) throw new Error('inject: server is closed (close() was already called)');
     if (!this.#listening) await this.listen({ port: 0, host: '127.0.0.1' });
 
     let url = path;
@@ -664,14 +665,14 @@ export class Server {
     for (const [k, v] of Object.entries(headers)) {
       for (const one of Array.isArray(v) ? v : [v]) {
         const value = String(one);
-        // Значение заголовка обязано укладываться в байты (ByteString): реальный
-        // HTTP-клиент откажется такое отправить, и харнесс обязан вести себя так же.
-        // Иначе тест на inject зелёный, а тот же код по сети падает.
+        // A header value must fit into bytes (ByteString): a real HTTP client refuses
+        // to send anything else, and the harness must behave the same way. Otherwise an
+        // inject test passes while the same code fails over the network.
         const bad = [...value].findIndex((ch) => ch.codePointAt(0)! > 0xff);
         if (bad >= 0) {
           throw new TypeError(
-            `inject: значение заголовка «${k}» содержит символ вне диапазона байта ` +
-              `(позиция ${bad}); HTTP такое не передаёт`,
+            `inject: header "${k}" contains a character outside the byte range ` +
+              `(position ${bad}); HTTP cannot carry that`,
           );
         }
         pairs.push({ key: k, value });
@@ -692,8 +693,8 @@ export class Server {
 
     const res = await this.#native.inject(method.toUpperCase(), url, pairs, payload);
 
-    // Заголовки отдаём и объектом (удобно ассертить), и списком пар (set-cookie
-    // может повторяться, а объект схлопнул бы дубликаты).
+    // Headers are exposed both as an object (convenient to assert on) and as a pair
+    // list (set-cookie may repeat, and an object would collapse duplicates).
     const headerObj: Record<string, string> = {};
     for (const { key, value } of res.headers) {
       const prev = headerObj[key];
@@ -710,23 +711,23 @@ export class Server {
     };
   }
 
-  /** Ручной readiness (§11): `false` → `/readyz` отдаёт 503, liveness не трогаем. */
+  /** Manual readiness (§11): `false` → `/readyz` returns 503; liveness is untouched. */
   setReady(ready: boolean): this {
     this.#native.setReady(Boolean(ready));
     return this;
   }
 
-  /** Периодическая проверка готовности (§11): БД, очередь, прогрев кеша.
+  /** Periodic readiness check (§11): database, queue, cache warm-up.
    *
-   *  Колбэк крутится по таймеру на JS-стороне и пушит результат в Rust, а `/readyz`
-   *  отвечает мгновенно из атомика. Иначе каждая проба k8s (раз в секунду на под)
-   *  будила бы event loop — ровно то, чего пробы в Rust и должны избегать.
-   *  Ошибка/таймаут колбэка трактуются как «не готов». */
+   *  The callback runs on a timer on the JS side and pushes its verdict into Rust, while
+   *  `/readyz` answers instantly from an atomic. Otherwise every k8s probe (once a second
+   *  per pod) would wake the event loop — exactly what Rust-side probes exist to avoid.
+   *  A callback error or timeout counts as "not ready". */
   setReadinessCheck(
     fn: () => boolean | void | Promise<boolean | void>,
     { interval = 2000, timeout = 1000 }: ReadinessCheckOptions = {},
   ): this {
-    if (typeof fn !== 'function') throw new TypeError('setReadinessCheck: нужна функция');
+    if (typeof fn !== 'function') throw new TypeError('setReadinessCheck: a function is required');
     this.#stopReadinessCheck();
 
     const tick = async (): Promise<void> => {
@@ -738,17 +739,17 @@ export class Server {
             setTimeout(() => rej(new Error('timeout')), timeout),
           ),
         ]);
-        ok = verdict !== false; // undefined/любое не-false = готов
+        ok = verdict !== false; // undefined/anything non-false means ready
       } catch {
-        ok = false; // упал или не уложился — считаем неготовым
+        ok = false; // threw or timed out — treat as not ready
       }
       if (this.#readinessTimer) this.setReady(ok);
     };
 
     this.#readinessTimer = setInterval(() => void tick(), interval);
-    // Таймер не должен держать процесс живым сам по себе.
+    // The timer must not keep the process alive on its own.
     this.#readinessTimer.unref?.();
-    void tick(); // первый прогон сразу, не ждём интервал
+    void tick(); // run once immediately instead of waiting for the interval
     return this;
   }
 
@@ -785,7 +786,7 @@ export class Server {
   async #dispatch(nreq: NativeRequest, bodyIo: BodyIo): Promise<NativeResponse> {
     const chain = nreq.leafId < 0 ? this.#notFoundChain : this.#chains[nreq.leafId];
     if (!chain) {
-      // Недостижимо: таблица маршрутов и цепочки строятся из одного массива.
+      // Unreachable: the route table and the chains are built from the same array.
       return { status: 500, headers: [], body: 'Internal Server Error' };
     }
     const c = buildContext(nreq, bodyIo, {
@@ -804,11 +805,11 @@ export class Server {
       } else {
         await runCore(chain, c);
       }
-      // «до-записи» хуки — всегда (short-circuit/normal/error/timeout).
+      // "before write" hooks always run (short-circuit/normal/error/timeout).
       await runAfterHooks(chain.preSerialization, c);
       await runAfterHooks(chain.onSend, c);
     } catch (err) {
-      // Последний рубеж: ошибка в onSend/preSerialization → 500 (или статус HttpError).
+      // Last line of defence: an error in onSend/preSerialization → 500 (or the HttpError status).
       if (!c._finalized) {
         c._body = undefined;
         if (err instanceof HttpError) c.text(err.message || 'Error', err.status);
@@ -818,11 +819,11 @@ export class Server {
 
     const response = buildNativeResponse(c);
 
-    // onResponse — наблюдение, всегда; ошибки глушим (не влияют на ответ).
+    // onResponse is observation only and always runs; its errors are swallowed.
     try {
       await runAfterHooks(chain.onResponse, c);
     } catch {
-      // onResponse не должен ломать ответ
+      // onResponse must not break the response
     }
     return response;
   }
@@ -830,8 +831,8 @@ export class Server {
 
 const DEFAULT_CORS_METHODS = ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'];
 
-/** Нормализовать config.cors к нативным CorsOptions (§6a).
- *  Option<Vec>-поля napi не принимают null → опускаем ключ, когда не задан. */
+/** Normalize config.cors into native CorsOptions (§6a).
+ *  napi's Option<Vec> fields reject null → omit the key when unset. */
 function normalizeCors(cors: CorsConfig): NativeCorsOptions {
   const origin = cors.origin ?? '*';
   const out: NativeCorsOptions = {
@@ -839,14 +840,14 @@ function normalizeCors(cors: CorsConfig): NativeCorsOptions {
     methods: cors.methods ?? DEFAULT_CORS_METHODS,
     credentials: Boolean(cors.credentials),
   };
-  // napi Option<T> не принимает null → задаём ключ только когда значение есть.
-  if (cors.allowedHeaders) out.allowedHeaders = cors.allowedHeaders; // иначе отражаем запрошенные
+  // napi's Option<T> rejects null → set the key only when a value exists.
+  if (cors.allowedHeaders) out.allowedHeaders = cors.allowedHeaders; // otherwise reflect requested
   if (cors.exposedHeaders) out.exposedHeaders = cors.exposedHeaders;
   if (cors.maxAge != null) out.maxAge = Math.floor(cors.maxAge);
   return out;
 }
 
-/** Резолв TLS: путь → чтение файла, Buffer → строка, PEM-строка как есть (§12). */
+/** TLS resolution: path → read file, Buffer → string, PEM string as-is (§12). */
 function resolveTls(tls: TlsConfig): { cert: string; key: string } {
   return { cert: resolvePem(tls.cert), key: resolvePem(tls.key) };
 }
@@ -855,10 +856,10 @@ function resolvePem(v: string | Buffer): string {
   if (typeof v === 'string') {
     return v.includes('-----BEGIN') ? v : fs.readFileSync(v, 'utf8');
   }
-  throw new TypeError('tls cert/key: строка (PEM или путь) либо Buffer');
+  throw new TypeError('tls cert/key: a string (PEM or path) or a Buffer');
 }
 
-/** Нормализовать config.http2 → нативные Http2Options (initialWindowSize принимает '1mb'). */
+/** Normalize config.http2 → native Http2Options (initialWindowSize accepts '1mb'). */
 function normalizeHttp2(h: Http2Config): NativeHttp2Options {
   const out: NativeHttp2Options = {};
   if (h.maxConcurrentStreams != null) out.maxConcurrentStreams = h.maxConcurrentStreams;
@@ -867,7 +868,7 @@ function normalizeHttp2(h: Http2Config): NativeHttp2Options {
   return out;
 }
 
-/** Нормализовать опцию multipart (`true` | `{...}`) к нативным MultipartOptions (§9a). */
+/** Normalize the multipart option (`true` | `{...}`) into native MultipartOptions (§9a). */
 function normalizeMultipart(mp: boolean | MultipartConfig): NativeMultipartOptions {
   const o: MultipartConfig = mp === true ? {} : mp === false ? {} : mp;
   const out: NativeMultipartOptions = {
@@ -876,13 +877,13 @@ function normalizeMultipart(mp: boolean | MultipartConfig): NativeMultipartOptio
     maxFiles: o.maxFiles ?? 10,
     maxFields: o.maxFields ?? 100,
   };
-  // Option<Vec> napi не принимает null → ключ только когда задан.
+  // napi's Option<Vec> rejects null → set the key only when provided.
   if (o.allowedMimeTypes) out.allowedMimeTypes = o.allowedMimeTypes;
   if (o.allowedExtensions) out.allowedExtensions = o.allowedExtensions;
   return out;
 }
 
-/** Собрать map статус→Set(имён свойств) для стрипа ответа по response-схеме. */
+/** Build a status→Set(property names) map for response stripping by the response schema. */
 function compileResponseStrip(schema: RouteSchema | null): ResponseStrip | null {
   if (!schema?.response) return null;
   const map: ResponseStrip = {};
@@ -896,7 +897,7 @@ function compileResponseStrip(schema: RouteSchema | null): ResponseStrip | null 
 const VALIDATED_LOCATIONS = ['body', 'query', 'params'] as const;
 const VALIDATION_ORDER = ['params', 'query', 'body'] as const;
 
-/** Внедрить синтетический preValidation-хук для valibot transform/refine (§6b). */
+/** Inject a synthetic preValidation hook for valibot transform/refine (§6b). */
 function injectValidation(route: RouteEntry): void {
   const schema = route.schema;
   if (!schema) return;
@@ -906,13 +907,13 @@ function injectValidation(route: RouteEntry): void {
     const s: SchemaSource | undefined = schema[loc];
     if (isValibot(s)) valibotSchemas[loc] = s;
   }
-  if (Object.keys(valibotSchemas).length === 0) return; // сырой JSON Schema — transform не нужен
+  if (Object.keys(valibotSchemas).length === 0) return; // raw JSON Schema — no transform needed
 
   const hook: Hook = async (c: Context) => {
     for (const loc of VALIDATION_ORDER) {
       const vs = valibotSchemas[loc];
       if (!vs) continue;
-      // Сырое значение: коэрцированное из Rust; для сжатого тела читаем в JS.
+      // Raw value: coerced by Rust; for a compressed body we read it in JS.
       const raw =
         loc === 'body' && c.req._rustValid.body === undefined
           ? await c.req.json()
@@ -923,7 +924,7 @@ function injectValidation(route: RouteEntry): void {
         c.json({ error: 'validation', issues }, 400);
         return; // short-circuit
       }
-      c.req._valid[loc] = res.output; // transform применён
+      c.req._valid[loc] = res.output; // the transform has been applied
     }
   };
 
@@ -933,7 +934,7 @@ function injectValidation(route: RouteEntry): void {
   };
 }
 
-/** Нормализовать route-опции `{onRequest:[...]|fn, preHandler, ...}` к `{stage:[fn]}`. */
+/** Normalize route options `{onRequest:[...]|fn, preHandler, ...}` into `{stage:[fn]}`. */
 function normalizeRouteHooks(opts: RouteOptions): Partial<Record<StageName, Hook[]>> {
   const hooks: Partial<Record<StageName, Hook[]>> = {};
   for (const stage of ALL_STAGES) {

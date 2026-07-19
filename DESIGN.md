@@ -1,226 +1,252 @@
-# HTTP/HTTP2-сервер для Node.js на Rust — дизайн-документ
+# A Rust-based HTTP/HTTP2 server for Node.js — design document
 
-Статус: черновик v1 (согласован по ключевым решениям)
-Дата: 2026-07-03
+Status: draft v1 (the key decisions are settled)
+Date: 2026-07-03
 
-## 1. Цель
+## 1. Goal
 
-Быстрый HTTP/1.1 + HTTP/2 сервер для Node.js, реализованный как **нативный аддон на Rust**
-(napi-rs). Протокол, TLS, парсинг и роутинг живут в Rust и параллелятся по всем ядрам;
-в JS остаётся только прикладная логика (async API-хендлеры и middleware). Целевой профиль
-нагрузки — **I/O-bound JSON-API** (БД, внешние сервисы), без серверного рендеринга.
-Разворачивается в **Kubernetes**.
+A fast HTTP/1.1 + HTTP/2 server for Node.js, implemented as a **native Rust addon**
+(napi-rs). The protocol, TLS, parsing and routing live in Rust and spread across all cores;
+JS is left with application logic only (async API handlers and middleware). The target load
+profile is an **I/O-bound JSON API** (databases, external services), with no server-side
+rendering. Deployed to **Kubernetes**.
 
-## 2. Ключевые решения (сводка)
+## 2. Key decisions (summary)
 
-| # | Решение | Выбор |
+| # | Decision | Choice |
 |---|---|---|
-| 0 | Имя | Пакет **`@oxide-ts/http`**, класс **`Server`** |
-| 1 | Интеграция с Node | Нативный аддон (**napi-rs**), `.node` в процессе Node |
-| 2 | Публичный API | Свой минималистичный (Hono-подобный), **не** drop-in `node:http` |
-| 3 | TLS | Терминируется в Rust (**rustls**), ALPN → h2 / http1.1 |
-| 4 | Async-хендлеры | Да (возврат `Promise`, `await` результата на мосту) |
-| 5 | Параллелизм JS | **Один** JS-поток (event loop). Масштаб — репликами в k8s, ~1 vCPU/под |
-| 6 | Роутинг | В Rust на **`matchit`** (radix-tree) |
-| 7 | Возможности роутера | static, `:param`, catch-all в конце. **Нет**: mid-path wildcard, опциональные, regex-constraints, несколько параметров в сегменте (ограничение matchit — см. §5) |
-| 8 | Middleware | «Луковица» с `next()` (код до и после), управляется из Rust |
-| 9 | Контекст `c` | Каноничен **в JS** (обычный объект), `set/get`/`c.res` без пересечения границы |
-| 10 | Нативные middleware v1 | **body-limit + cors + timeout**. compression → фаза 2 |
-| 11 | Привязка middleware | Глобальные + по префиксу + маршрутные + группы. **Предкомпиляция** цепочек на `listen()` |
-| 12 | Ошибки | `try/catch` вокруг `next()`; непойманное → `app.onError` → дефолтный 500; `catch_unwind` на границах; процесс не падает никогда |
-| 13 | Контракт ответа | `c.json/c.text/c.status/c.header` (осн.) + возврат значения как сахар |
-| 14 | Тело запроса/ответа | **Стриминг** в обе стороны с backpressure |
-| 15 | Форма стримов | **Web Streams** (`ReadableStream`/`WritableStream`) + адаптеры к Node-стримам |
-| 16 | Graceful shutdown | Rust ловит SIGTERM/SIGINT, drain с дедлайном, `GOAWAY` для h2, ждёт in-flight (вкл. JS), событие `shutdown` + `await server.close()` |
-| 17 | Health / observability | `/healthz`+`/readyz` в Rust (+ JS readiness-колбэк), `/metrics` Prometheus, JSON-лог в stdout |
-| 18 | Конфигурация | Единый конфиг-объект; TLS путь/Buffer; multi-port (health/metrics отдельно) |
-| 19 | h2c | Prior-knowledge cleartext HTTP/2 (для mesh/LB) |
-| 20 | Сборка/доставка | napi-rs CLI, prebuild в npm, baseline glibc 2.17 + musl, x64/arm64. Node 18+ (N-API 8) |
+| 0 | Name | The package **`@oxide-ts/http`**, the class **`Server`** |
+| 1 | Node integration | A native addon (**napi-rs**), a `.node` inside the Node process |
+| 2 | Public API | Our own minimal one (Hono-like), **not** a drop-in `node:http` |
+| 3 | TLS | Terminated in Rust (**rustls**), ALPN → h2 / http1.1 |
+| 4 | Async handlers | Yes (return a `Promise`, `await` the result at the bridge) |
+| 5 | JS parallelism | **One** JS thread (the event loop). Scale with k8s replicas, ~1 vCPU/pod |
+| 6 | Routing | In Rust on **`matchit`** (radix tree) |
+| 7 | Router features | static, `:param`, a trailing catch-all. **No**: mid-path wildcard, optional params, regex constraints, several params in one segment (a matchit limitation — see §5) |
+| 8 | Middleware | An "onion" with `next()` (code before and after), driven from Rust |
+| 9 | The context `c` | Canonical **in JS** (a plain object); `set/get` and `c.res` never cross the boundary |
+| 10 | Native middleware in v1 | **body-limit + cors + timeout**. compression → phase 2 |
+| 11 | Middleware binding | Global + by prefix + per route + groups. Chains are **precompiled** on `listen()` |
+| 12 | Errors | `try/catch` around `next()`; uncaught → `app.onError` → the default 500; `catch_unwind` at the boundaries; the process never dies |
+| 13 | Response contract | `c.json/c.text/c.status/c.header` (primary) plus a returned value as sugar |
+| 14 | Request/response bodies | **Streaming** in both directions with backpressure |
+| 15 | Stream shape | **Web Streams** (`ReadableStream`/`WritableStream`) plus adapters to Node streams |
+| 16 | Graceful shutdown | Rust catches SIGTERM/SIGINT, drains with a deadline, `GOAWAY` for h2, waits for in-flight (JS included), a `shutdown` event plus `await server.close()` |
+| 17 | Health / observability | `/healthz` + `/readyz` in Rust (plus a JS readiness callback), `/metrics` in Prometheus format, a JSON log on stdout |
+| 18 | Configuration | A single config object; TLS as a path or a Buffer; multi-port (health/metrics separately) |
+| 19 | h2c | Prior-knowledge cleartext HTTP/2 (for a mesh or an LB) |
+| 20 | Build/delivery | napi-rs CLI, prebuilds on npm, baseline glibc 2.17 plus musl, x64/arm64. Node 18+ (N-API 8) |
 
-## 3. Архитектура: путь одного запроса
+## 3. Architecture: the path of a single request
 
 ```
-   сеть
+   network
     │
     ▼
-┌─────────────────────────── RUST (пул потоков tokio, все ядра) ───────────────────────────┐
+┌────────────────────── RUST (a tokio thread pool, all cores) ──────────────────────────────┐
 │ 1. accept → rustls (TLS + ALPN) → hyper (HTTP/1.1 | HTTP/2 | h2c prior-knowledge)         │
-│ 2. matchit: маршрут + params.  Нет → 404/405 в Rust (или app.notFound)                     │
-│ 3. нативные middleware на краях: cors preflight / body-limit / timeout — могут прервать    │
-│ 4. предкомпилированная цепочка слотов для этого листа маршрута                             │
+│ 2. matchit: route + params.  No match → 404/405 in Rust (or app.notFound)                  │
+│ 3. native middleware at the edges: cors preflight / body-limit / timeout — may short-circuit│
+│ 4. the precompiled slot chain for this route leaf                                          │
 └───────────────────────────────────────────┬───────────────────────────────────────────────┘
-                                             │ ThreadsafeFunction (один переход/запрос)
-                                             │ передаём: method, path, params, headers,
-                                             │ bodyLimit, дескриптор потока тела
+                                             │ ThreadsafeFunction (one crossing per request)
+                                             │ we pass: method, path, params, headers,
+                                             │ bodyLimit, a body-stream descriptor
                                              ▼
-┌─────────────────────────── JS (один event loop, libuv) ───────────────────────────────────┐
-│ 5. строим c → прогоняем луковицу JS-middleware + хендлер (async)                            │
-│    try/catch вокруг всего → app.onError.  Backpressure стрима через Web Streams             │
-│ 6. resolve(Promise) с готовым c.res: статус, заголовки, тело (Buffer | ReadableStream)      │
+┌────────────────────── JS (a single event loop, libuv) ────────────────────────────────────┐
+│ 5. build c → run the JS middleware onion plus the handler (async)                          │
+│    try/catch around everything → app.onError.  Stream backpressure via Web Streams         │
+│ 6. resolve(Promise) with a finished c.res: status, headers, body (Buffer | ReadableStream) │
 └───────────────────────────────────────────┬───────────────────────────────────────────────┘
-                                             │ JS Promise ↔ Rust Future (await без блокировки)
+                                             │ JS Promise ↔ Rust Future (awaited without blocking)
                                              ▼
-┌─────────────────────────── RUST ──────────────────────────────────────────────────────────┐
-│ 7. пишем ответ в hyper; для стрима тянем чанки из JS по мере разгрузки сокета              │
-│    «после-next» нативные middleware (compression — фаза 2)                                  │
-│ 8. метрики (латентность, код, размер) — считаются в Rust почти бесплатно                    │
+┌────────────────────── RUST ───────────────────────────────────────────────────────────────┐
+│ 7. write the response into hyper; for a stream, pull chunks from JS as the socket drains   │
+│    "after-next" native middleware (compression — phase 2)                                  │
+│ 8. metrics (latency, code, size) — counted in Rust at almost no cost                       │
 └────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Примитивы napi-rs: **`ThreadsafeFunction`** (Rust→JS из любого tokio-потока),
-**интеграция JS-`Promise` ↔ Rust-`Future`**, собственный **`tokio`-рантайм** внутри аддона
-(параллельно libuv event loop). JS всегда на потоке libuv; весь Rust-I/O — на потоках tokio.
+The napi-rs primitives: **`ThreadsafeFunction`** (Rust→JS from any tokio thread),
+**the JS-`Promise` ↔ Rust-`Future` integration**, and our own **`tokio` runtime** inside the
+addon (running alongside the libuv event loop). JS always stays on the libuv thread; all
+Rust I/O happens on tokio threads.
 
-## 4. Публичный JS API (эскиз)
+## 4. The public JS API (a sketch)
 
 ```js
 import { Server } from '@oxide-ts/http';
 
 const app = new Server({
-  baseUrl: '/api/v1',               // глобальный префикс всех маршрутов приложения (health/metrics НЕ наследуют)
-  customIpHeaders: ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for'],  // c.req.ip из первого заполненного
-  customCountryHeaders: ['cf-ipcountry', 'x-country-code'],  // c.req.country из первого заполненного
-  tls: { cert: './cert.pem', key: './key.pem' },  // путь или Buffer/PEM; нет tls → plaintext
+  baseUrl: '/api/v1',               // a global prefix for every application route (health/metrics do NOT inherit it)
+  customIpHeaders: ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for'],  // c.req.ip comes from the first one present
+  customCountryHeaders: ['cf-ipcountry', 'x-country-code'],  // c.req.country from the first one present
+  tls: { cert: './cert.pem', key: './key.pem' },  // a path or a Buffer/PEM; no tls → plaintext
   http1: true,
-  h2c: false,                       // prior-knowledge cleartext h2 на plaintext-порту
+  h2c: false,                       // prior-knowledge cleartext h2 on the plaintext port
   bodyLimit: '10mb',
   maxHeaderSize: '16kb',
   requestTimeout: '30s',
-  headerReadTimeout: '10s',         // A2: пока читаются заголовки (Slowloris)
-  bodyReadTimeout: '30s',           // A2: пока читается тело
-  idleTimeout: '60s',               // A2: простой на keep-alive соединении
+  headerReadTimeout: '10s',         // A2: while the headers are being read (Slowloris)
+  bodyReadTimeout: '30s',           // A2: while the body is being read
+  idleTimeout: '60s',               // A2: idling on a keep-alive connection
   keepAliveTimeout: '75s',
-  shutdownTimeout: '30s',           // < terminationGracePeriodSeconds пода
-  workerThreads: 'auto',            // A3: потоки tokio; 'auto' = учёт cgroup CPU-квоты пода, не ядер ноды
-  proxyProtocol: false,             // A4: PROXY protocol v1/v2 от L4-LB (AWS NLB) → реальный peer-IP
-  maxConcurrentRequests: 500,       // C5: лимит in-flight; сверх — 503 + readiness not-ready (см. ниже)
-  maxQueue: 0,                      // C5: очередь ожидания слота (0 = без очереди, сразу 503)
-  queueTimeout: '1s',               // C5: сколько ждать слот в очереди до 503
+  shutdownTimeout: '30s',           // < the pod's terminationGracePeriodSeconds
+  workerThreads: 'auto',            // A3: tokio threads; 'auto' = the pod's cgroup CPU quota, not the node's cores
+  proxyProtocol: false,             // A4: PROXY protocol v1/v2 from an L4 LB (AWS NLB) → the real peer IP
+  maxConcurrentRequests: 500,       // C5: the in-flight limit; beyond it → 503 + readiness not-ready (see below)
+  maxQueue: 0,                      // C5: a queue waiting for a slot (0 = no queue, an immediate 503)
+  queueTimeout: '1s',               // C5: how long to wait in the queue before a 503
   socket: { noDelay: true, reusePort: false, backlog: 1024, maxConnections: null },  // B9
-  requestId: { header: 'x-request-id', generate: 'uuidv7' },  // B2: генерим, если нет; кладём в c
+  requestId: { header: 'x-request-id', generate: 'uuidv7' },  // B2: generated when missing; placed into c
   http2: {
     enabled: true, maxConcurrentStreams: 250, initialWindowSize: '1mb',
-    maxResetStreamsPerSec: 100,     // A1: защита от Rapid Reset (CVE-2023-44487)
+    maxResetStreamsPerSec: 100,     // A1: Rapid Reset protection (CVE-2023-44487)
   },
   health:  { liveness: '/healthz', readiness: '/readyz' },
-  metrics: { enabled: true, path: '/metrics', port: 9090 },  // отдельный порт
-  logger:  { format: 'json' },      // B3: c.log с request-id
+  metrics: { enabled: true, path: '/metrics', port: 9090 },  // a separate port
+  logger:  { format: 'json' },      // B3: c.log carrying the request id
 });
 
-// middleware (луковица)
-app.use(async (c, next) => {              // глобальный
+// middleware (the onion)
+app.use(async (c, next) => {              // global
   const t = performance.now();
   await next();
   c.res.headers.set('x-time', String(performance.now() - t));
 });
-app.use('/admin/*', authMiddleware);      // по префиксу
+app.use('/admin/*', authMiddleware);      // by prefix
 
-// маршруты (+ маршрутные middleware)
+// routes (plus route middleware)
 app.get('/users/:id', validate, (c) => c.json({ id: c.req.params.id }));
 app.post('/users', async (c) => {
   const body = await c.req.json();
-  return c.json({ created: body }, 201);   // возврат значения = сахар над c.json
+  return c.json({ created: body }, 201);   // a returned value = sugar over c.json
 });
 
-// группы / суб-приложения
+// groups / sub-applications
 app.route('/api/v1', apiV1);
 
-// ошибки и 404
+// errors and 404
 app.onError((err, c) => c.json({ error: err.message }, 500));
-app.notFound((c) => c.json({ error: 'not found' }, 404));  // опц., иначе 404 в Rust
+app.notFound((c) => c.json({ error: 'not found' }, 404));  // optional, otherwise a 404 from Rust
 
-// readiness-колбэк (Rust дёргает его на /readyz)
+// the readiness callback (Rust invokes it on /readyz)
 app.setReadinessCheck(async () => db.isConnected());
 
-// жизненный цикл
+// lifecycle
 app.on('shutdown', async () => { await db.close(); });
 await app.listen({ port: 3000, host: '0.0.0.0' });
 ```
 
-## 5. Роутинг
+## 5. Routing
 
-- Движок — **`matchit` 0.8** (radix-tree). Матчинг и разбор `params` в Rust.
-- Поддерживается: static; `:param` (один сегмент); catch-all в конце (`/static/*path`);
-  приоритет static над param (авто).
-- **Не** поддерживается: mid-path wildcard, опциональные параметры, regex-constraints,
-  а также **несколько параметров в одном сегменте** (`/{id}.{ext}`) — жёсткое ограничение
-  matchit 0.8 («один параметр на сегмент»). Обход: матчить сегмент целиком (`/:name`) и
-  делить в хендлере. Опциональность → два маршрута; формат `:id` → валидация в хендлере.
-  <!-- M2: правка относительно черновика — matchit не умеет multi-param per segment. -->
-- Публичный синтаксис — Hono-подобный (`:id`, `*path`); внутри транслируется в
-  matchit-синтаксис (`{id}`, `{*path}`). Форма `{id}` также принимается как есть.
-- Методы: `get/post/put/patch/delete/head/options` + `all`.
-- 404/405 отдаёт Rust без пробуждения JS (если не задан `app.notFound`).
-- **`baseUrl`** (глобальный префикс, напр. `/api/v1`): приклеивается ко всем маршрутам **при регистрации** (в предкомпиляции дерева, рантайм без накладных); складывается с групповыми префиксами (`baseUrl` + `app.route(prefix)` + маршрут).
-  - `c.req.path` — **без** префикса (`/users/42`), полный доступен как `c.req.url`/`c.req.rawPath` → хендлеры не зависят от точки монтирования.
-  - **Health/metrics — абсолютные**, префикс не наследуют (пробы k8s бьют по `/healthz` и т.п.; могут жить на отдельном порту).
-  - Нормализация значения: ведущий слэш обязателен, хвостовой убирается; пустой/`'/'` = без префикса.
+- The engine is **`matchit` 0.8** (a radix tree). Matching and `params` parsing happen in Rust.
+- Supported: static; `:param` (a single segment); a trailing catch-all (`/static/*path`);
+  static takes priority over param (automatically).
+- **Not** supported: mid-path wildcards, optional parameters, regex constraints, and
+  **several parameters in one segment** (`/{id}.{ext}`) — a hard limitation of matchit 0.8
+  ("one parameter per segment"). The workaround: match the whole segment (`/:name`) and split
+  inside the handler. Optionality → two routes; an `:id` format → validation in the handler.
+  <!-- M2: a correction relative to the draft — matchit cannot do multi-param per segment. -->
+- The public syntax is Hono-like (`:id`, `*path`); internally it is translated into matchit
+  syntax (`{id}`, `{*path}`). The `{id}` form is also accepted as-is.
+- Methods: `get/post/put/patch/delete/head/options` plus `all`.
+- 404/405 are produced by Rust without waking JS (unless `app.notFound` is set).
+- **`baseUrl`** (a global prefix, e.g. `/api/v1`) is glued onto every route **at registration
+  time** (while the tree is precompiled, so there is no runtime cost); it composes with group
+  prefixes (`baseUrl` + `app.route(prefix)` + the route).
+  - `c.req.path` is **without** the prefix (`/users/42`); the full one is available as
+    `c.req.url`/`c.req.rawPath` → handlers do not depend on their mount point.
+  - **Health/metrics are absolute** and do not inherit the prefix (k8s probes hit `/healthz`
+    and friends; they may live on a separate port).
+  - Value normalization: a leading slash is required, a trailing one is stripped; empty or
+    `'/'` means no prefix.
 
-## 6. Middleware (луковица)
+## 6. Middleware (the onion)
 
-- Модель Koa/Hono: `(c, next) => { /* до */ await next(); /* после */ }`.
-- Цепочка **предкомпилируется на `listen()`**: для каждого листа роутера заранее строится
-  финальный упорядоченный список слотов (нативные Rust + JS), в рантайме — просто исполняется.
-- Слот бывает **нативный (Rust)** или **JS**. Подряд идущие JS-слоты Rust отдаёт в JS одним
-  куском → один переход границы на запрос (а не 2×N).
-- Нативные middleware работают на **краях** луковицы (не видят `c.set('user')`, т.к. контекст в JS).
-- Источники цепочки: глобальные `app.use(mw)` + префиксные `app.use('/p/*', mw)` +
-  маршрутные `app.get(path, ...mw, handler)` + группы `app.route(prefix, sub)`; порядок — по регистрации.
+- The Koa/Hono model: `(c, next) => { /* before */ await next(); /* after */ }`.
+- The chain is **precompiled on `listen()`**: for every router leaf a final ordered list of
+  slots (native Rust plus JS) is built ahead of time; at runtime it is simply executed.
+- A slot is either **native (Rust)** or **JS**. Consecutive JS slots are handed to JS in a
+  single piece → one boundary crossing per request (not 2×N).
+- Native middleware works at the **edges** of the onion (it cannot see `c.set('user')`,
+  because the context lives in JS).
+- Chain sources: global `app.use(mw)` + prefixed `app.use('/p/*', mw)` + route-level
+  `app.get(path, ...mw, handler)` + groups `app.route(prefix, sub)`; the order follows
+  registration.
 
-## 6a. Жизненный цикл запроса и хуки (Fastify-стиль поверх луковицы)
+## 6a. The request lifecycle and hooks (Fastify style on top of the onion)
 
-Именованные хуки жизненного цикла; на каждое событие можно навесить **массив** обработчиков.
-Часть хуков физически в Rust — без JS-подписки они отрабатывают в Rust, event loop спит.
+Named lifecycle hooks; every event accepts an **array** of handlers. Some hooks physically
+live in Rust — with no JS subscription they run in Rust and the event loop stays asleep.
 
-**Полный конвейер одного запроса (сверху вниз):**
+**The full pipeline of one request (top to bottom):**
 
 ```
-onConnect            (Rust)  новое TCP/TLS-соединение (на соединение, не на запрос)
+onConnect            (Rust)  a new TCP/TLS connection (per connection, not per request)
 ─────────────────────────────────────────────────────────────────
-[ нативный cors: preflight OPTIONS ]  (Rust, ДО onRequest — JS не будится вовсе)
-onRequest            (JS)    заголовки распарсены, ДО роутинга (ранний rate-limit/auth)
-[ matchit: маршрут ]         нет → notFound (Rust, либо app.notFound в JS)
-[ нативные-вход: cors(origin-check) → body-limit → timeout(старт дедлайна) ]  (Rust)
-preParsing           (JS)    перед чтением тела (можно подменить поток)
-[ чтение тела с учётом bodyLimit + входящая декомпрессия (B5) ]
-preValidation        (Rust+JS) A6: Rust структурно по JSON Schema (вне loop) → 400; затем JS-valibot доигрывает transform/refine
-preHandler           (JS)    тело доступно и валидно, перед луковицей+хендлером
-┌── ЛУКОВИЦА middleware: before → ХЕНДЛЕР → after ──┐
-└───────────────────────────────────────────────────┘
-preSerialization     (JS)    перед сериализацией результата в байты
-onSend               (JS)    ответ сформирован, перед записью (нативные-выход: cors-заголовки; compression — фаза 2)
-[ запись в сокет ]           (Rust)
-onResponse           (Rust)  обработка завершена (не обяз. успешно отправлено); лог/метрики/очистка
-onClose              (Rust)  соединение закрыто
+[ native cors: preflight OPTIONS ]  (Rust, BEFORE onRequest — JS is not woken at all)
+onRequest            (JS)    headers parsed, BEFORE routing (early rate-limit/auth)
+[ matchit: the route ]       no match → notFound (Rust, or app.notFound in JS)
+[ native inbound: cors(origin check) → body-limit → timeout(start the deadline) ]  (Rust)
+preParsing           (JS)    before the body is read (the stream can be swapped)
+[ read the body honouring bodyLimit + inbound decompression (B5) ]
+preValidation        (Rust+JS) A6: Rust checks structure against JSON Schema (off the loop) → 400; then JS valibot finishes transform/refine
+preHandler           (JS)    the body is available and valid, before the onion + handler
+┌── the middleware ONION: before → HANDLER → after ──┐
+└────────────────────────────────────────────────────┘
+preSerialization     (JS)    before the result is serialized into bytes
+onSend               (JS)    the response is formed, before writing (native outbound: cors headers; compression — phase 2)
+[ write to the socket ]      (Rust)
+onResponse           (Rust)  processing finished (not necessarily sent successfully); logging/metrics/cleanup
+onClose              (Rust)  the connection is closed
 ─────────────────────────────────────────────────────────────────
-ИСКЛЮЧЕНИЯ (в любой момент):
-onError   (JS)   единый: наблюдение + формирование ответа; нет ответа → 500
-onTimeout (Rust) дедлайн истёк → signal abort → хуки → c.res или дефолт 504
-onAbort   (Rust) клиент отвалился до ответа → signal abort → хуки → финализация
+EXCEPTIONS (at any moment):
+onError   (JS)   unified: observation plus building the response; no response → 500
+onTimeout (Rust) the deadline expired → abort the signal → hooks → c.res or the default 504
+onAbort   (Rust) the client went away before the response → abort the signal → hooks → finalization
 ```
 
-**Семантика (согласовано):**
-- Обработчики события — **последовательно** в порядке регистрации, каждый `async`, `await`-ится по очереди.
-- **Short-circuit:** хук сформировал `c.res`/вернул ответ → конвейер прерывается, хендлер пропускается, но `onSend`/`onResponse` выполняются всегда.
-- Единый **`c`** на весь жизненный цикл (`set/get`, `c.req`, `c.res`).
-- Любой `throw`/reject в любом хуке → единый **`onError`** (формирует ответ; несколько обработчиков — последовательно, итоговый `c.res` уходит клиенту; нет ответа → 500).
-- **«После»-хуки** (`onSend`/`onResponse`) идут **всегда** (ошибка/прерывание/таймаут/дисконнект) — гарантия лог/метрик/очистки. `onResponse` — только наблюдение.
-- **Scope:** глобальные + групповые (инкапсуляция, как в Fastify — не «протекают») + маршрутные. Цепочки на стадию **предкомпилируются на `listen()`**. Порядок сборки: глоб → групп → маршрут, по регистрации (без разворота для «после»).
-- **API:** именованные методы `app.onRequest(fn)`, `app.preHandler(fn)`, … (осн.) + `app.addHook(name, fn)` (обобщённый). Маршрутные — через опции: `app.get('/x', { onRequest:[...], preHandler:[...] }, handler)`.
-- **Rust-level хуки без подписки не будят JS**; с подпиской — async-хендлер дожидается (in-flight учитывается graceful shutdown'ом).
-- **Нативные middleware вход/выход:** cors — preflight `OPTIONS` в Rust до `onRequest` (JS не будится) + origin-check на входе + `Access-Control-*` заголовки на `onSend`; body-limit — только вход (`413`); timeout — вход (старт дедлайна) → ветка `onTimeout`.
+**Semantics (settled):**
+- The handlers of one event run **sequentially** in registration order, each `async`, each
+  awaited in turn.
+- **Short-circuit:** a hook that formed `c.res` or returned a response stops the pipeline and
+  the handler is skipped, but `onSend`/`onResponse` always run.
+- A single **`c`** spans the whole lifecycle (`set/get`, `c.req`, `c.res`).
+- Any `throw`/reject in any hook goes to the single **`onError`** (which builds the response;
+  several handlers run in sequence, the resulting `c.res` goes to the client; no response → 500).
+- **"After" hooks** (`onSend`/`onResponse`) **always** run (error, short-circuit, timeout,
+  disconnect) — that is the guarantee behind logging/metrics/cleanup. `onResponse` is
+  observation only.
+- **Scope:** global + group-level (encapsulated, as in Fastify — they do not "leak") + route
+  level. Per-stage chains are **precompiled on `listen()`**. Assembly order: global → group →
+  route, following registration (with no reversal for the "after" ones).
+- **API:** named methods `app.onRequest(fn)`, `app.preHandler(fn)`, … (primary) plus
+  `app.addHook(name, fn)` (generic). Route-level ones go through the options:
+  `app.get('/x', { onRequest:[...], preHandler:[...] }, handler)`.
+- **Rust-level hooks do not wake JS when nobody subscribed**; with a subscription the async
+  handler is awaited (and counted as in-flight by graceful shutdown).
+- **Native inbound/outbound middleware:** cors — the preflight `OPTIONS` in Rust before
+  `onRequest` (JS is not woken) plus an origin check inbound plus `Access-Control-*` headers
+  on `onSend`; body-limit — inbound only (`413`); timeout — inbound (starting the deadline) →
+  the `onTimeout` branch.
 
-**Отмена (таймаут / дисконнект):**
-- `c.req.signal` — стандартный `AbortSignal`, срабатывает при таймауте **или** дисконнекте (передавать в `fetch`/драйвер БД для кооперативной отмены). Срабатывает максимум один раз.
-- **Таймаут:** signal abort → `onTimeout` → `c.res` или дефолт **504**; запоздавший результат хендлера отбрасывается без ошибки.
-- **Дисконнект:** signal abort → `onAbort` → финализация; отправлять некуда, результат отбрасывается.
-- Флаги в `c` для «после»-хуков: `c.res.sent`, `c.aborted` — различать успех/дисконнект/таймаут.
-- Терминальное событие ровно одно: `onResponse` **или** `onAbort` **или** таймаут-ветка — не пересекаются.
+**Cancellation (timeout / disconnect):**
+- `c.req.signal` is a standard `AbortSignal`, fired on a timeout **or** a disconnect (pass it
+  to `fetch`/a database driver for cooperative cancellation). It fires at most once.
+- **Timeout:** abort the signal → `onTimeout` → `c.res` or the default **504**; a late handler
+  result is discarded without an error.
+- **Disconnect:** abort the signal → `onAbort` → finalization; there is nowhere to send, so
+  the result is discarded.
+- Flags in `c` for the "after" hooks: `c.res.sent`, `c.aborted` — to tell success from a
+  disconnect or a timeout.
+- There is exactly one terminal event: `onResponse` **or** `onAbort` **or** the timeout
+  branch — they never overlap.
 
-## 6b. Схемы запроса/ответа (A6, valibot → JSON Schema → нативный Rust)
+## 6b. Request/response schemas (A6, valibot → JSON Schema → native Rust)
 
-Источник истины — **valibot** (типы через `v.InferOutput`); принимаем и «сырой» JSON Schema.
-zod/arktype (Standard Schema) через их `toJsonSchema` — фаза 2.
+The source of truth is **valibot** (types via `v.InferOutput`); raw JSON Schema is accepted
+too. zod/arktype (Standard Schema) through their `toJsonSchema` — phase 2.
 
 ```js
 import * as v from 'valibot';
@@ -228,231 +254,288 @@ const CreateUser = v.object({ name: v.pipe(v.string(), v.minLength(2)), age: v.p
 
 app.post('/users', {
   schema: { body: CreateUser, query: v.object({ ref: v.optional(v.string()) }), response: { 200: UserOut } },
-}, (c) => c.json(c.req.valid('body')));   // c.req.valid('body'|'query'|'params') — типизировано
+}, (c) => c.json(c.req.valid('body')));   // c.req.valid('body'|'query'|'params') — typed
 ```
 
-- **На `listen()`**: valibot → JSON Schema (`@valibot/to-json-schema`) → Rust компилирует валидатор
-  (`jsonschema`) и быстрый сериализатор ответа (аналог `fast-json-stringify`).
-- **Слоёная валидация:** Rust — структурно (типы/required/min-max/enum/pattern/format) **вне event loop** → `400`;
-  затем JS-valibot доигрывает `transform`/кастомные `check` над структурно-валидными данными (стадия `preValidation`).
-- **Коэрция** query/params (всегда строки): Rust приводит по схеме (`?age=42` → number).
-- **Ответ:** нативная сериализация по схеме + **отсечение лишних полей** (не утечёт то, чего нет в схеме);
-  валидация ответа — только в **dev**, в prod просто сериализуем.
-- **Ошибки валидации:** `400` + машиночитаемый `[{ path, message, code }]`; переопределяемо в `onError`/спец-хуке.
+- **On `listen()`**: valibot → JSON Schema (`@valibot/to-json-schema`) → Rust compiles a
+  validator (`jsonschema`) and a fast response serializer (the analogue of
+  `fast-json-stringify`).
+- **Layered validation:** Rust checks structure (types/required/min-max/enum/pattern/format)
+  **off the event loop** → `400`; then JS valibot finishes `transform` and custom `check` over
+  structurally valid data (the `preValidation` stage).
+- **Coercion** of query/params (always strings): Rust converts them according to the schema
+  (`?age=42` → a number).
+- **Response:** native serialization by the schema plus **stripping of extra fields** (nothing
+  outside the schema can leak); response validation happens in **dev** only, in production we
+  just serialize.
+- **Validation errors:** `400` plus a machine-readable `[{ path, message, code }]`;
+  overridable in `onError` or a dedicated hook.
 
-## 6c. Безопасность и сеть (A1–A4, B9, B10)
+## 6c. Security and networking (A1–A4, B9, B10)
 
-- **A1 HTTP/2 Rapid Reset (CVE-2023-44487):** лимит reset-стримов (`http2.maxResetStreamsPerSec`), защита от DoS.
-- **A2 Таймауты чтения** (против Slowloris): `headerReadTimeout`, `bodyReadTimeout`, `idleTimeout` — отдельно от `requestTimeout`.
-- **A3 tokio worker-threads vs CPU-квота:** `workerThreads: 'auto'` читает cgroup CPU-квоту пода (не число ядер ноды),
-  чтобы не оверпровижнить при лимите ~1 vCPU. Можно задать число явно.
-- **A4 PROXY protocol v1/v2:** за L4-LB (AWS NLB) реальный peer-IP берётся из PROXY-префикса на сокете (socket-level).
-  Складывается с `customIpHeaders` (сначала снимаем PROXY, потом смотрим заголовки).
-- **B9 Socket-опции:** `TCP_NODELAY` (латентность API, вкл. по умолчанию), `SO_REUSEPORT`, `backlog`, `maxConnections`;
-  прослушивание **Unix-сокета** (`listen({ path })`).
-- **B10 HTTP-корректность:** авто-`HEAD` (как GET без тела), авто-`OPTIONS`, `405` + заголовок `Allow`,
-  `431 Request Header Fields Too Large` при превышении `maxHeaderSize`, `501` на неизвестный метод.
-- **C5 `maxConcurrentRequests` (защита от перегрузки + разгрузка через k8s):** in-flight считаем в Rust.
-  Реальность: обычный Service (kube-proxy) не умеет per-request «отдать другому поду» — только косвенно.
-  **Двухслойно:**
-  1. **Мгновенный `503`** сверх жёсткого лимита (`+ Retry-After`, для h2 — `GOAWAY`, чтобы клиент переоткрылся
-     на другой под); за retry-способным ingress/mesh (nginx/Envoy/Istio) запрос «переезжает» без ошибки у клиента.
-  2. **Readiness → not-ready** при устойчивой перегрузке → k8s убирает под из эндпоинтов (новые соединения уходят).
-     Замечание: readiness влияет только на **новые соединения**; уже открытое h2-соединение шлёт стримы на тот же под,
-     поэтому слой 1 (`503`/`GOAWAY`) для h2 важнее.
-  - **Очередь** (`maxQueue`, дефолт 0 = без): краткий всплеск ждёт слот до `queueTimeout`, затем `503`.
-- **WebSocket — НЕ поддерживаем** (только API); архитектуру под upgrade не закладываем.
+- **A1 HTTP/2 Rapid Reset (CVE-2023-44487):** a reset-stream limit
+  (`http2.maxResetStreamsPerSec`), protecting against DoS.
+- **A2 Read timeouts** (against Slowloris): `headerReadTimeout`, `bodyReadTimeout`,
+  `idleTimeout` — separate from `requestTimeout`.
+- **A3 tokio worker threads vs the CPU quota:** `workerThreads: 'auto'` reads the pod's cgroup
+  CPU quota (not the node's core count), so we do not overprovision under a ~1 vCPU limit. A
+  number can be given explicitly.
+- **A4 PROXY protocol v1/v2:** behind an L4 LB (AWS NLB) the real peer IP is taken from the
+  PROXY prefix on the socket (socket level). It composes with `customIpHeaders` (first strip
+  PROXY, then look at the headers).
+- **B9 Socket options:** `TCP_NODELAY` (API latency, on by default), `SO_REUSEPORT`,
+  `backlog`, `maxConnections`; listening on a **Unix socket** (`listen({ path })`).
+- **B10 HTTP correctness:** auto-`HEAD` (like GET without a body), auto-`OPTIONS`, `405` plus
+  an `Allow` header, `431 Request Header Fields Too Large` when `maxHeaderSize` is exceeded,
+  `501` for an unknown method.
+- **C5 `maxConcurrentRequests` (overload protection plus shedding through k8s):** in-flight is
+  counted in Rust. Reality: a plain Service (kube-proxy) cannot hand a request to another pod
+  per request — only indirectly. **Two layers:**
+  1. **An immediate `503`** past the hard limit (`+ Retry-After`; for h2 a `GOAWAY`, so the
+     client reopens against another pod); behind a retry-capable ingress or mesh
+     (nginx/Envoy/Istio) the request "moves" without the client seeing an error.
+  2. **Readiness → not-ready** under sustained overload → k8s removes the pod from the
+     endpoints (new connections go elsewhere). Note: readiness affects **new connections**
+     only; an already-open h2 connection keeps sending streams to the same pod, which is why
+     layer 1 (`503`/`GOAWAY`) matters more for h2.
+  - **A queue** (`maxQueue`, default 0 = none): a brief spike waits for a slot up to
+    `queueTimeout`, then gets a `503`.
+- **WebSocket is NOT supported** (APIs only); we do not design for upgrades.
 
-## 6d. DX / API-дополнения (группа B)
+## 6d. DX / API additions (group B)
 
-- **B1 Cookies:** `c.req.cookie(name)` (парсинг) + `c.cookie(name, val, { httpOnly, secure, sameSite, maxAge, path, domain })`;
-  подписанные/шифрованные — фаза 2 (через `Set-Cookie` отдельными строками, см. §модель заголовков).
-- **B2 Request ID:** если нет `x-request-id` — генерируем **UUIDv7**; кладём в `c.req.id`, пробрасываем в ответ.
-- **B3 Контекстный логгер `c.log`:** структурный JSON с `requestId` в каждой записи.
-- **B4 urlencoded:** `application/x-www-form-urlencoded` → `await c.req.formData()`/`c.req.parseBody()`.
-- **B5 Входящая декомпрессия:** `Content-Encoding: gzip/br` на запросе — распаковка в Rust (с учётом `bodyLimit` по распакованному).
-- **B6 Response-хелперы:** `c.redirect(url, code=302)`, `c.notFound()`, SSE — `c.streamSSE(cb)` поверх Web Streams.
-- **B7 Server-события:** `app.on('listening'|'error'|'close', ...)`; при неудачном bind (EADDRINUSE) — reject `listen()` с явной ошибкой.
-- **B8 `app.inject(req)`:** тест-харнесс без реального сокета (быстрые интеграционные тесты).
+- **B1 Cookies:** `c.req.cookie(name)` (parsing) plus
+  `c.cookie(name, val, { httpOnly, secure, sameSite, maxAge, path, domain })`; signed and
+  encrypted ones are phase 2 (through separate `Set-Cookie` lines, see the header model section).
+- **B2 Request ID:** when there is no `x-request-id` we generate a **UUIDv7**; it goes into
+  `c.req.id` and is echoed in the response.
+- **B3 The contextual logger `c.log`:** structured JSON with the `requestId` in every record.
+- **B4 urlencoded:** `application/x-www-form-urlencoded` → `await c.req.formData()` /
+  `c.req.parseBody()`.
+- **B5 Inbound decompression:** `Content-Encoding: gzip/br` on the request — unpacked in Rust
+  (with `bodyLimit` applied to the decompressed size).
+- **B6 Response helpers:** `c.redirect(url, code=302)`, `c.notFound()`, SSE via
+  `c.streamSSE(cb)` on top of Web Streams.
+- **B7 Server events:** `app.on('listening'|'error'|'close', ...)`; on a failed bind
+  (EADDRINUSE) `listen()` rejects with an explicit error.
+- **B8 `app.inject(req)`:** a test harness without a real socket (fast integration tests).
 
-## 7. Контекст `c` (в JS)
+## 7. The context `c` (in JS)
 
-- `c.req` — `method`, `path`, `params`, `query`, `headers`, тело: `c.req.stream` (Web `ReadableStream`),
-  `await c.req.json()` / `.text()` / `.arrayBuffer()` (буферизуют до `bodyLimit`).
-- `c.req.ip` / `c.req.ips` — клиентский IP (вычисляется в **Rust**): идём по `customIpHeaders` по порядку,
-  берём первый присутствующий и непустой заголовок; `X-Forwarded-For`-цепочку (`client, proxy1, ...`)
-  разбиваем по запятым — `ip` = первый (левый) элемент с trim'ом, `ips` = весь массив. Ни один не заполнен
-  или список не задан → **peer-адрес TCP-сокета** (`ip` есть всегда).
-  ⚠️ Доверять forwarded-заголовкам безопасно **только за доверенным прокси**; trust-proxy CIDR — фаза 2.
-- `c.req.country` — страна клиента (Rust): первый заполненный из `customCountryHeaders`, trim + uppercase
-  (ISO 3166-1 alpha-2; спецзначения Cloudflare `XX`/`T1` — как есть). Нет источника → `undefined`.
-  Серверный GeoIP по IP — фаза 2.
-- `c.set(k, v)` / `c.get(k)` — обмен данными между middleware (чистый JS, бесплатно).
-- `c.res` — мутабельный: `c.status(n)`, `c.header(k, v)`, `c.res.headers` (правится и «после next»).
-- Хелперы ответа: `c.json(v, status?)`, `c.text(v, status?)`, `c.body(bufferOrStream, status?)`.
+- `c.req` — `method`, `path`, `params`, `query`, `headers`, and the body: `c.req.stream`
+  (a Web `ReadableStream`), `await c.req.json()` / `.text()` / `.arrayBuffer()` (which buffer
+  up to `bodyLimit`).
+- `c.req.ip` / `c.req.ips` — the client IP (computed in **Rust**): we walk `customIpHeaders`
+  in order and take the first header that is present and non-empty; an `X-Forwarded-For`
+  chain (`client, proxy1, ...`) is split on commas — `ip` is the first (leftmost) element,
+  trimmed, and `ips` is the whole array. If none is filled in or no list was configured, the
+  **TCP socket's peer address** is used (`ip` is always present).
+  ⚠️ Trusting forwarded headers is safe **only behind a trusted proxy**; trust-proxy CIDRs are
+  phase 2.
+- `c.req.country` — the client's country (Rust): the first non-empty one out of
+  `customCountryHeaders`, trimmed and uppercased (ISO 3166-1 alpha-2; the Cloudflare special
+  values `XX`/`T1` are passed through as-is). No source → `undefined`. Server-side GeoIP by IP
+  is phase 2.
+- `c.set(k, v)` / `c.get(k)` — sharing data between middleware (pure JS, free).
+- `c.res` is mutable: `c.status(n)`, `c.header(k, v)`, `c.res.headers` (editable even "after
+  next").
+- Response helpers: `c.json(v, status?)`, `c.text(v, status?)`, `c.body(bufferOrStream, status?)`.
 
-## 8. Обработка ошибок (жёсткий инвариант: процесс не падает)
+## 8. Error handling (a hard invariant: the process never dies)
 
-- Каждый вызов JS с моста обёрнут: синхронный `throw` и `reject` Promise → ошибка для `onError`.
-- JS-слой оборачивает всю луковицу в общий `try/catch` → любое исключение доходит до `app.onError(err, c)`.
-- Локальный `try/catch` вокруг `await next()` в middleware работает естественно (обработать самому).
-- Если `app.onError` сам бросит → последний рубеж: дефолтный 500 + лог.
-- Rust: `catch_unwind` на всех границах; паника → 500, процесс жив.
-- Страховочный process-level `unhandledRejection`-хендлер с явным логом (в норме не срабатывает; срабатывание = баг обёртки).
+- Every JS call from the bridge is wrapped: a synchronous `throw` and a rejected Promise both
+  become an error for `onError`.
+- The JS layer wraps the whole onion in one `try/catch` → any exception reaches
+  `app.onError(err, c)`.
+- A local `try/catch` around `await next()` in a middleware works naturally (handle it yourself).
+- If `app.onError` itself throws → the last line of defence: the default 500 plus a log.
+- Rust: `catch_unwind` at every boundary; a panic → 500, and the process stays alive.
+- A safety-net process-level `unhandledRejection` handler with an explicit log (it should
+  never fire; firing means the wrapper has a bug).
 
-## 9. Стриминг (Web Streams, backpressure через мост)
+## 9. Streaming (Web Streams, backpressure across the bridge)
 
-- **Запрос**: `c.req.stream` — Web `ReadableStream`; `for await (const chunk of ...)`.
-  Backpressure: JS сигналит Rust «готов принять ещё».
-- **Ответ**: `c.body(new ReadableStream(...))` или async-iterable (сахар). Backpressure: Rust
-  сигналит JS «сокет разгрузился». Кейсы: SSE, крупные выгрузки/загрузки, проксирование.
-- Совместимость с Node-стримами — через `Readable.fromWeb`/`toWeb`.
+- **Request:** `c.req.stream` is a Web `ReadableStream`; `for await (const chunk of ...)`.
+  Backpressure: JS signals Rust "ready for more".
+- **Response:** `c.body(new ReadableStream(...))` or an async iterable (sugar). Backpressure:
+  Rust signals JS "the socket has drained". Use cases: SSE, large downloads/uploads, proxying.
+- Compatibility with Node streams goes through `Readable.fromWeb`/`toWeb`.
 
-## 9a. Multipart (`multipart/form-data`, загрузка файлов) — опция маршрута
+## 9a. Multipart (`multipart/form-data`, file uploads) — a route option
 
-Включается **per-route**; парсинг — в **Rust** (потоковый `multer`), вне event loop.
+Enabled **per route**; parsing happens in **Rust** (streaming `multer`), off the event loop.
 
 ```js
 app.post('/upload', {
-  multipart: {                       // true = дефолтные лимиты; объект = переопределение
+  multipart: {                       // true = default limits; an object = overrides
     maxFileSize: '50mb', maxFiles: 10, maxFields: 100, maxFieldSize: '1mb',
-    allowedMimeTypes: ['image/*', 'application/pdf'],   // wildcard поддерживается
+    allowedMimeTypes: ['image/*', 'application/pdf'],   // wildcards are supported
     allowedExtensions: ['.png', '.jpg', '.jpeg', '.pdf'],
   }
 }, async (c) => {
-  for await (const part of c.req.parts()) {            // A: потоково (основной)
+  for await (const part of c.req.parts()) {            // A: streaming (the primary way)
     if (part.filename) await uploadToS3(part.stream);  // part: { name, filename?, contentType?, stream }
     else fields[part.name] = await part.text();
   }
-  // либо B (сахар для мелких форм): const form = await c.req.formData();  // Web FormData, всё в память
+  // or B (sugar for small forms): const form = await c.req.formData();  // Web FormData, all in memory
 });
 ```
 
-- **Content-Type не `multipart/form-data`** при включённом флаге → `415`.
-- **Отдача в JS:** основной — `c.req.parts()` (async-итератор, файл = Web `ReadableStream`, backpressure через мост);
-  сахар — `c.req.formData()` (Web `FormData`, в память, под защитой `maxFileSize`).
-- **Лимиты (per-route, дефолты из глобального конфига):** `maxFileSize`→`413`, `maxFiles`/`maxFields`→`400`,
-  `maxFieldSize`. Прерывание в Rust до передачи в JS, где возможно.
-- **Ограничение типов (только к частям с `filename`):** `allowedMimeTypes` (по `Content-Type` части, wildcard `image/*`)
-  **и** `allowedExtensions` (по `filename`); нарушение → **`415`**, до вычитывания файла. Обе проверки в Rust.
-- **Диск не трогаем** (без автозаписи temp-файлов) — только потоки/буферы. Helper `saveTo(path)` — фаза 2.
+- **A Content-Type that is not `multipart/form-data`** with the flag enabled → `415`.
+- **Handing data to JS:** primarily `c.req.parts()` (an async iterator where a file is a Web
+  `ReadableStream`, with backpressure across the bridge); the sugar is `c.req.formData()`
+  (a Web `FormData`, in memory, protected by `maxFileSize`).
+- **Limits (per route, defaults from the global config):** `maxFileSize`→`413`,
+  `maxFiles`/`maxFields`→`400`, `maxFieldSize`. Aborted in Rust before reaching JS where
+  possible.
+- **Type restrictions (applied only to parts with a `filename`):** `allowedMimeTypes` (by the
+  part's `Content-Type`, with an `image/*` wildcard) **and** `allowedExtensions` (by
+  `filename`); a violation → **`415`**, before the file is read. Both checks happen in Rust.
+- **We never touch the disk** (no automatic temp files) — streams and buffers only. A
+  `saveTo(path)` helper is phase 2.
 
-## 10. Жизненный цикл / graceful shutdown (k8s)
+## 10. Lifecycle / graceful shutdown (k8s)
 
-1. SIGTERM/SIGINT ловит Rust. 2. Закрывает listener (нет новых соединений).
-3. Readiness → «не готов» (k8s уводит трафик). 4. Ждёт in-flight (вкл. JS-хендлеры), h2 → `GOAWAY`.
-5. Дедлайн `shutdownTimeout` (< `terminationGracePeriodSeconds`) → форс-разрыв остатков.
-6. Событие `shutdown` в JS (закрыть пул БД и т.п.), `await server.close()`. 7. Выход с кодом 0.
-- Опционально: JS может перехватить сигнал сам.
+1. Rust catches SIGTERM/SIGINT. 2. It closes the listener (no new connections).
+3. Readiness → "not ready" (k8s steers traffic away). 4. It waits for in-flight requests
+(JS handlers included), h2 gets a `GOAWAY`. 5. The `shutdownTimeout` deadline
+(< `terminationGracePeriodSeconds`) → the remainder is forcibly torn down.
+6. The `shutdown` event fires in JS (close the DB pool and so on), `await server.close()`.
+7. Exit with code 0.
+- Optional: JS can intercept the signal itself.
 
 ## 11. Health / observability
 
-- `/healthz` (liveness) — Rust отвечает мгновенно, JS не будится.
-- `/readyz` (readiness) — Rust; учитывает shutdown и опциональный `app.setReadinessCheck()` (спрашивает JS).
-- `/metrics` — Prometheus из Rust: RPS, латентности (гистограммы), коды, соединения/стримы, размеры. Выключаемо.
-- Структурный JSON-лог в stdout.
-- Health/metrics можно вынести на **отдельный порт** (не светить наружу).
-- Опц. (фаза 2): проброс `traceparent` (W3C Trace Context).
+- `/healthz` (liveness) — Rust answers instantly, JS is not woken.
+- `/readyz` (readiness) — Rust; it accounts for shutdown and the optional
+  `app.setReadinessCheck()` (which asks JS).
+- `/metrics` — Prometheus from Rust: RPS, latencies (histograms), status codes,
+  connections/streams, sizes. Can be turned off.
+- A structured JSON log on stdout.
+- Health/metrics can be moved to a **separate port** (so they are not exposed publicly).
+- Optional (phase 2): propagating `traceparent` (W3C Trace Context).
 
-## 12. TLS и протоколы
+## 12. TLS and protocols
 
-- **rustls**; сертификаты — путь к файлу или Buffer/PEM-строка.
-- TLS-порт: ALPN согласует **h2** / **http/1.1**.
-- Plaintext-порт: **http/1.1** и/или **h2c prior-knowledge** (по флагам конфига). h2c upgrade не поддерживаем.
-- Фаза 2: hot-reload сертификатов (cert-manager / ротация Let's Encrypt).
+- **rustls**; certificates as a file path or a Buffer/PEM string.
+- The TLS port: ALPN negotiates **h2** / **http/1.1**.
+- The plaintext port: **http/1.1** and/or **h2c prior-knowledge** (per config flags). The h2c
+  upgrade dance is not supported.
+- Phase 2: certificate hot-reload (cert-manager / Let's Encrypt rotation).
 
-## 13. Сборка и доставка
+## 13. Building and delivery
 
-- Тулинг: **`@napi-rs/cli`** (кросс-компиляция, `.d.ts`, platform-пакеты, prebuild-публикация).
-- **N-API 8** (Node 18+): один бинарник на все версии Node (ABI-стабильно).
-- libc аддона обязан совпадать с libc Node → публикуем несколько вариантов, загрузчик выбирает
-  через `detect-libc` + `optionalDependencies`.
-- glibc-варианты собираются в **docker-образах napi-rs** против baseline **glibc 2.17** (manylinux2014)
-  → работают на **Ubuntu / UBI 8/9/10 / Debian / Amazon Linux / RHEL**.
+- Tooling: **`@napi-rs/cli`** (cross-compilation, `.d.ts`, platform packages, prebuild
+  publishing).
+- **N-API 8** (Node 18+): one binary for every Node version (ABI-stable).
+- The addon's libc must match Node's libc → we publish several variants and the loader picks
+  one via `detect-libc` plus `optionalDependencies`.
+- The glibc variants are built in the **napi-rs docker images** against the **glibc 2.17**
+  baseline (manylinux2014) → they work on **Ubuntu / UBI 8/9/10 / Debian / Amazon Linux / RHEL**.
 
-Матрица (приоритет ↓):
+The matrix (priority ↓):
 
-| Триплет | Покрытие | Приоритет |
+| Triple | Coverage | Priority |
 |---|---|---|
-| `x86_64-unknown-linux-gnu` (baseline 2.17) | Ubuntu, **UBI 9/10**, Debian, AmazonLinux — x64 | 1 |
-| `aarch64-unknown-linux-gnu` (baseline) | то же на ARM64 / Graviton | 1 |
+| `x86_64-unknown-linux-gnu` (baseline 2.17) | Ubuntu, **UBI 9/10**, Debian, Amazon Linux — x64 | 1 |
+| `aarch64-unknown-linux-gnu` (baseline) | the same on ARM64 / Graviton | 1 |
 | `x86_64-unknown-linux-musl` | Alpine x64 | 2 |
 | `aarch64-unknown-linux-musl` | Alpine ARM64 | 2 |
-| `aarch64-apple-darwin` | локальная разработка (Mac M-серия) | dev |
-| `x86_64-apple-darwin` | Mac Intel | опц. |
-| `x86_64-pc-windows-msvc` | Windows-разработка | опц. |
+| `aarch64-apple-darwin` | local development (M-series Macs) | dev |
+| `x86_64-apple-darwin` | Intel Macs | optional |
+| `x86_64-pc-windows-msvc` | Windows development | optional |
 
-- Доставка: prebuild в npm (основной `@oxide-ts/http` + `@oxide-ts/http-linux-x64-gnu` и т.д. в `optionalDependencies`).
-  В Docker-образ Rust-тулчейн не нужен — `npm ci` тянет готовый бинарник.
+- Delivery: prebuilds on npm (the main `@oxide-ts/http` plus `@oxide-ts/http-linux-x64-gnu`
+  and friends in `optionalDependencies`). A Docker image needs no Rust toolchain — `npm ci`
+  pulls a ready binary.
 
-## 14. Предлагаемая структура проекта
+## 14. The proposed project layout
 
 ```
 http-rust/
-├── Cargo.toml               # crate cdylib, napi-rs
-├── package.json             # napi-конфиг, targets, optionalDependencies
+├── Cargo.toml               # a cdylib crate, napi-rs
+├── package.json             # the napi config, targets, optionalDependencies
 ├── build.rs
 ├── src/                     # Rust
-│   ├── lib.rs               # napi-экспорты, RustServer
+│   ├── lib.rs               # the napi exports, RustServer
 │   ├── server.rs            # tokio + hyper + rustls, listen/accept
-│   ├── router.rs            # matchit, предкомпиляция цепочек
-│   ├── bridge.rs            # ThreadsafeFunction, Promise↔Future, стрим-backpressure
-│   ├── middleware/          # нативные: body_limit, cors, timeout
-│   ├── stream.rs            # мост Web Streams ↔ hyper body
-│   ├── tls.rs               # rustls config, ALPN
+│   ├── router.rs            # matchit, chain precompilation
+│   ├── bridge.rs            # ThreadsafeFunction, Promise↔Future, stream backpressure
+│   ├── middleware/          # native: body_limit, cors, timeout
+│   ├── stream.rs            # the Web Streams ↔ hyper body bridge
+│   ├── tls.rs               # the rustls config, ALPN
 │   ├── health.rs            # /healthz, /readyz
 │   ├── metrics.rs           # Prometheus
-│   └── shutdown.rs          # сигналы, drain, GOAWAY
-├── js/                      # JS-обёртка
+│   └── shutdown.rs          # signals, drain, GOAWAY
+├── js/                      # the JS wrapper
 │   ├── index.js / index.d.ts
 │   ├── context.js           # c, c.req, c.res
-│   ├── onion.js             # композиция луковицы
-│   └── streams.js           # Web Streams адаптеры
-├── __test__/                # интеграционные тесты (JS)
+│   ├── onion.js             # onion composition
+│   └── streams.js           # Web Streams adapters
+├── __test__/                # integration tests (JS)
 ├── examples/
 └── DESIGN.md
 ```
 
-## 15. Фазировка
+## 15. Phasing
 
 **v1 (MVP):**
-- Мост Rust↔JS (ThreadsafeFunction, Promise↔Future).
+- The Rust↔JS bridge (ThreadsafeFunction, Promise↔Future).
 - tokio + hyper + rustls; HTTP/1.1, HTTP/2 (ALPN), h2c prior-knowledge.
-- Роутинг на matchit; методы; `baseUrl`; 404/405 в Rust; `app.notFound`/`app.onError`.
-- Луковица middleware с предкомпиляцией; глоб./префикс./маршрут./группы.
-- **Хуки жизненного цикла** (Fastify-стиль): `onRequest`…`onResponse`, `onError/onTimeout/onAbort`; `AbortSignal`.
-- Контекст в JS; `c.json/text/body/status/header`; возврат-значение как сахар; `c.req.ip/ips/country/id`; `c.log`.
-- Стриминг запрос/ответ через Web Streams + backpressure; multipart (per-route, `parts()`).
-- **Схемы (A6):** valibot → JSON Schema → нативная валидация/сериализация в Rust; слоёно; `preValidation`.
-- Нативные middleware: body-limit, cors, timeout.
-- **Безопасность/сеть (A1–A4):** Rapid-Reset лимит, read-таймауты, `workerThreads:auto` (cgroup), PROXY protocol; socket-опции; HEAD/OPTIONS/405/431; `maxConcurrentRequests` (503/GOAWAY + readiness-shedding + очередь).
-- **DX (B):** cookies, request-id (UUIDv7), urlencoded, входящая декомпрессия, `redirect/notFound/streamSSE`, server-события, `app.inject()`.
-- Graceful shutdown; `/healthz`, `/readyz` + readiness-колбэк; `/metrics`; JSON-лог; multi-port.
-- Сборка napi-rs: linux gnu x64/arm64 (baseline) + musl + darwin-arm64; prebuild в npm.
+- matchit routing; methods; `baseUrl`; 404/405 in Rust; `app.notFound`/`app.onError`.
+- The precompiled middleware onion; global/prefix/route/group scopes.
+- **Lifecycle hooks** (Fastify style): `onRequest`…`onResponse`,
+  `onError/onTimeout/onAbort`; `AbortSignal`.
+- The context in JS; `c.json/text/body/status/header`; a returned value as sugar;
+  `c.req.ip/ips/country/id`; `c.log`.
+- Request/response streaming through Web Streams with backpressure; multipart (per route,
+  `parts()`).
+- **Schemas (A6):** valibot → JSON Schema → native validation and serialization in Rust;
+  layered; `preValidation`.
+- Native middleware: body-limit, cors, timeout.
+- **Security/networking (A1–A4):** the Rapid Reset limit, read timeouts,
+  `workerThreads:auto` (cgroup), PROXY protocol; socket options; HEAD/OPTIONS/405/431;
+  `maxConcurrentRequests` (503/GOAWAY + readiness shedding + a queue).
+- **DX (B):** cookies, request id (UUIDv7), urlencoded, inbound decompression,
+  `redirect/notFound/streamSSE`, server events, `app.inject()`.
+- Graceful shutdown; `/healthz`, `/readyz` plus the readiness callback; `/metrics`; a JSON
+  log; multi-port.
+- The napi-rs build: linux gnu x64/arm64 (baseline) + musl + darwin-arm64; prebuilds on npm.
 
-**Фаза 2 (по мере надобности):**
-- Нативный **compression** (gzip/brotli, стриминг).
-- **worker_threads**-пул (только если профайлинг покажет CPU-bound JS — не ожидается).
-- Hot-reload TLS-сертификатов; trust-proxy CIDR; серверный GeoIP по IP.
-- zod/arktype (Standard Schema) через `toJsonSchema`; подписанные/шифрованные cookies; `saveTo()` для multipart; `allowedExtensions`→расширенный.
+**Phase 2 (as the need arises):**
+- Native **compression** (gzip/brotli, streaming).
+- A **worker_threads** pool (only if profiling shows CPU-bound JS — not expected).
+- TLS certificate hot-reload; trust-proxy CIDRs; server-side GeoIP by IP.
+- zod/arktype (Standard Schema) through `toJsonSchema`; signed and encrypted cookies;
+  `saveTo()` for multipart; an extended `allowedExtensions`.
 - W3C Trace Context / OpenTelemetry.
-- Доп. platform-таргеты (darwin-x64, windows).
-- **НЕ планируется:** WebSocket, статик-файлы, Range/трейлеры, HTML-рендеринг.
+- Extra platform targets (darwin-x64, windows).
+- **Not planned:** WebSocket, static files, Range/trailers, HTML rendering.
 
-## 17. Тестирование и бенчмарки
+## 17. Testing and benchmarks
 
-- **Rust unit** (`cargo test`): роутер, предкомпиляция цепочек, парсеры (query, единицы, заголовки), нативные middleware.
-- **JS-интеграционные** (сервер на случайном порту, `undici`/`fetch`): маршруты, params/query, порядок луковицы, `onError`, 404/405, стриминг (запрос/ответ, SSE), TLS+ALPN (h1/h2), h2c, graceful shutdown, health/metrics. На всех LTS-Node.
-- **Мост/утечки**: прогон N запросов, контроль RSS/heap; паника в Rust не роняет процесс; `unhandledRejection` не срабатывает.
-- **Бенчмарки**: `h2load` (h2), `bombardier`/`oha` (h1) — RPS, p50/p99; сравнение с `node:http`, Fastify, Hono-на-Node; отдельно стриминг/SSE.
-- **CI** (GitHub Actions): матрица сборки (linux gnu/musl x64/arm64, darwin) + `cargo test` + JS-тесты на Node 18/20/22/24; публикация prebuild по тегу.
+- **Rust unit tests** (`cargo test`): the router, chain precompilation, the parsers (query,
+  units, headers), native middleware.
+- **JS integration tests** (a server on a random port, `undici`/`fetch`): routes,
+  params/query, onion order, `onError`, 404/405, streaming (request/response, SSE), TLS+ALPN
+  (h1/h2), h2c, graceful shutdown, health/metrics. On every LTS Node.
+- **Bridge/leaks:** run N requests while watching RSS/heap; a Rust panic must not kill the
+  process; `unhandledRejection` must never fire.
+- **Benchmarks:** `h2load` (h2), `bombardier`/`oha` (h1) — RPS, p50/p99; compared against
+  `node:http`, Fastify and Hono-on-Node; streaming/SSE measured separately.
+- **CI** (GitHub Actions): the build matrix (linux gnu/musl x64/arm64, darwin) plus
+  `cargo test` plus the JS tests on Node 18/20/22/24; prebuild publishing on a tag.
 
-## 16. Открытые вопросы (все закрыты)
+## 16. Open questions (all closed)
 
-- ~~Имя npm-пакета / scope~~ → `@oxide-ts/http`, класс `Server`.
-- ~~Query-string парсинг~~ → в **Rust** заранее; `c.req.query` = last-wins строки; `c.req.queries('k')` → массив всех значений.
-- ~~Представление заголовков~~ → lowercase везде; `c.req.header(name)` + `c.res.headers` (`set`/`append`); `Set-Cookie` отдельными строками; псевдо-заголовки h2 скрыты.
-- ~~Формат единиц в конфиге~~ → принимаем **и строку, и число** (`'10mb'`/`'30s'` или байты/мс), тип `string | number`.
-- ~~Стратегия тестирования/бенчмарков~~ → см. §17.
-- ~~baseUrl, customIpHeaders, customCountryHeaders, multipart~~ → добавлены (§4, §9a).
-- ~~Аудит полноты (A1–A6, B1–B10, WebSocket, схемы)~~ → решено: A1–A4+A6+вся B в v1; WebSocket не поддерживаем; схемы valibot→JSON Schema→Rust.
+- ~~The npm package name / scope~~ → `@oxide-ts/http`, the class `Server`.
+- ~~Query-string parsing~~ → in **Rust** ahead of time; `c.req.query` = last-wins strings;
+  `c.req.queries('k')` → an array of every value.
+- ~~Header representation~~ → lowercase everywhere; `c.req.header(name)` plus `c.res.headers`
+  (`set`/`append`); `Set-Cookie` as separate lines; h2 pseudo-headers are hidden.
+- ~~The unit format in the config~~ → we accept **both a string and a number** (`'10mb'`/`'30s'`
+  or bytes/ms), typed `string | number`.
+- ~~The testing/benchmarking strategy~~ → see §17.
+- ~~baseUrl, customIpHeaders, customCountryHeaders, multipart~~ → added (§4, §9a).
+- ~~The completeness audit (A1–A6, B1–B10, WebSocket, schemas)~~ → decided: A1–A4 + A6 + all
+  of B in v1; WebSocket is not supported; schemas go valibot → JSON Schema → Rust.

@@ -1,8 +1,8 @@
-//! Мост тел запроса/ответа через границу napi с backpressure (§9).
+//! Request/response body bridge across the napi boundary with backpressure (§9).
 //!
-//! `BodyIo` — napi-класс, передаваемый в JS-диспетчер. `read()` тянет чанки
-//! тела запроса (Rust→JS), `write()/endWrite()` пушат тело ответа (JS→Rust).
-//! Оба направления — через bounded-каналы (cap 1): backpressure естественный.
+//! `BodyIo` is a napi class handed to the JS dispatcher. `read()` pulls request body
+//! chunks (Rust→JS); `write()/endWrite()` push the response body (JS→Rust).
+//! Both directions use bounded channels (cap 1), so backpressure comes for free.
 
 use std::convert::Infallible;
 use std::pin::Pin;
@@ -19,25 +19,25 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::multipart::MpEvent;
 
-/// Ёмкость каналов тела: 1 чанк «в полёте» → плотный backpressure.
+/// Body channel capacity: one chunk in flight → tight backpressure.
 pub const BODY_CHANNEL_CAP: usize = 1;
 
-/// Маркер превышения body-limit, передаётся в JS через `read()` (→ 413).
+/// Body-limit exceeded marker, surfaced to JS through `read()` (→ 413).
 pub const BODY_LIMIT_EXCEEDED: &str = "BODY_LIMIT_EXCEEDED";
 
-/// Маркер истёкшего `bodyReadTimeout` (→ 408).
+/// Expired `bodyReadTimeout` marker (→ 408).
 pub const BODY_READ_TIMEOUT: &str = "BODY_READ_TIMEOUT";
 
-/// Сообщение канала тела запроса: данные либо причина обрыва.
+/// Request body channel message: data or the reason the stream was cut.
 pub enum BodyMsg {
     Data(Bytes),
-    /// Тело превысило body-limit — читать сокет прекратили (защита от DoS).
+    /// The body exceeded body-limit — we stopped reading the socket (DoS guard).
     Overflow,
-    /// Клиент молчал дольше `bodyReadTimeout` — чтение оборвано (§6c A2).
+    /// The client was silent longer than `bodyReadTimeout` — reading aborted (§6c A2).
     Timeout,
 }
 
-/// Метаданные части multipart для JS.
+/// Multipart part metadata for JS.
 #[napi(object)]
 pub struct PartMeta {
     pub name: Option<String>,
@@ -45,20 +45,20 @@ pub struct PartMeta {
     pub content_type: Option<String>,
 }
 
-/// Состояние чтения multipart-потока.
+/// Multipart stream read state.
 struct MpState {
     rx: Receiver<MpEvent>,
-    ended: bool, // текущая часть закончилась (read_part → null)
+    ended: bool, // the current part is finished (read_part → null)
 }
 
-/// Мост тел одного запроса. Создаётся в Rust, отдаётся в JS как аргумент.
+/// Body bridge for a single request. Created in Rust, handed to JS as an argument.
 #[napi]
 pub struct BodyIo {
-    /// Приёмник чанков тела запроса (None → тела нет / multipart).
+    /// Receiver of request body chunks (None → no body / multipart).
     req_rx: TokioMutex<Option<Receiver<BodyMsg>>>,
-    /// Отправитель чанков тела ответа (None после endWrite / если не стримится).
+    /// Sender of response body chunks (None after endWrite / when not streaming).
     resp_tx: StdMutex<Option<Sender<Bytes>>>,
-    /// Поток событий multipart (None → маршрут не multipart).
+    /// Multipart event stream (None → the route is not multipart).
     mp: TokioMutex<Option<MpState>>,
 }
 
@@ -78,17 +78,17 @@ impl BodyIo {
 
 #[napi]
 impl BodyIo {
-    /// Прочитать следующий чанк тела запроса. `null` = конец.
-    /// Backpressure JS→Rust: сокет читается только когда JS дёрнул read().
+    /// Read the next request body chunk. `null` = end of body.
+    /// Backpressure JS→Rust: the socket is only read when JS calls read().
     #[napi]
     pub async fn read(&self) -> Result<Option<Buffer>> {
         let mut guard = self.req_rx.lock().await;
         match guard.as_mut() {
             Some(rx) => match rx.recv().await {
                 Some(BodyMsg::Data(b)) => Ok(Some(b.to_vec().into())),
-                // Превышение лимита → ошибка в JS (маппится в 413). Читать больше нельзя.
+                // Limit exceeded → error in JS (mapped to 413). No further reads.
                 Some(BodyMsg::Overflow) => Err(napi::Error::from_reason(BODY_LIMIT_EXCEEDED)),
-                // Молчание клиента дольше bodyReadTimeout → 408.
+                // Client silent longer than bodyReadTimeout → 408.
                 Some(BodyMsg::Timeout) => Err(napi::Error::from_reason(BODY_READ_TIMEOUT)),
                 None => Ok(None),
             },
@@ -96,8 +96,8 @@ impl BodyIo {
         }
     }
 
-    /// Записать чанк тела ответа. Резолвится, когда канал принял (backpressure
-    /// Rust→JS: hyper забирает по мере разгрузки сокета).
+    /// Write a response body chunk. Resolves once the channel accepts it (backpressure
+    /// Rust→JS: hyper drains it as the socket frees up).
     #[napi]
     pub async fn write(&self, chunk: Buffer) -> Result<()> {
         let tx = self.resp_tx.lock().unwrap().clone();
@@ -109,13 +109,13 @@ impl BodyIo {
         Ok(())
     }
 
-    /// Завершить тело ответа (закрыть канал → hyper видит конец).
+    /// Finish the response body (close the channel → hyper sees the end).
     #[napi]
     pub fn end_write(&self) {
         self.resp_tx.lock().unwrap().take();
     }
 
-    /// Следующая часть multipart (пропуская хвост недочитанной). `null` = конец формы.
+    /// Next multipart part (skipping the tail of an unread one). `null` = end of form.
     #[napi]
     pub async fn next_part(&self) -> Result<Option<PartMeta>> {
         let mut guard = self.mp.lock().await;
@@ -136,7 +136,7 @@ impl BodyIo {
                         content_type,
                     }));
                 }
-                // Хвост брошенной части — пропускаем до следующего Part.
+                // Tail of an abandoned part — skip ahead to the next Part.
                 Some(MpEvent::Chunk(_)) | Some(MpEvent::PartEnd) => continue,
                 Some(MpEvent::Reject { status, message }) => {
                     return Err(mp_reject(status, &message))
@@ -146,7 +146,7 @@ impl BodyIo {
         }
     }
 
-    /// Следующий чанк текущей части. `null` = конец части.
+    /// Next chunk of the current part. `null` = end of part.
     #[napi]
     pub async fn read_part(&self) -> Result<Option<Buffer>> {
         let mut guard = self.mp.lock().await;
@@ -163,7 +163,7 @@ impl BodyIo {
                 Ok(None)
             }
             Some(MpEvent::Reject { status, message }) => Err(mp_reject(status, &message)),
-            // Защита: Part без предшествующего next_part / конец потока.
+            // Safety net: a Part without a preceding next_part, or end of stream.
             Some(MpEvent::Part { .. }) | None => {
                 state.ended = true;
                 Ok(None)
@@ -172,12 +172,12 @@ impl BodyIo {
     }
 }
 
-/// Ошибка отклонения multipart, кодирующая HTTP-статус (JS маппит в HttpError).
+/// Multipart rejection error encoding an HTTP status (JS maps it to HttpError).
 fn mp_reject(status: u16, message: &str) -> napi::Error {
     napi::Error::from_reason(format!("MULTIPART_REJECT:{status}:{message}"))
 }
 
-/// hyper-`Body`, тянущий чанки из канала (наполняется из `BodyIo::write`).
+/// A hyper `Body` pulling chunks from a channel (fed by `BodyIo::write`).
 pub struct ChannelBody {
     rx: Receiver<Bytes>,
 }

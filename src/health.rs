@@ -1,15 +1,15 @@
-//! Пробы и состояние готовности (§11).
+//! Probes and readiness state (§11).
 //!
-//! `/healthz` — жив ли процесс (liveness): отвечает всегда, пока рантайм крутится.
-//! `/readyz` — готов ли принимать трафик (readiness): выключается на shutdown,
-//! при перегрузке и по флагу из JS (`app.setReady`, периодический readinessCheck).
+//! `/healthz` — is the process alive (liveness): always answers while the runtime runs.
+//! `/readyz` — is it ready to take traffic (readiness): turns off on shutdown, under
+//! overload, and via a flag from JS (`app.setReady`, the periodic readinessCheck).
 //!
-//! Обе пробы обслуживаются целиком в Rust: k8s дёргает их раз в секунду, будить
-//! ради этого JS-хендлер незачем.
+//! Both probes are served entirely in Rust: k8s hits them once a second, and waking
+//! a JS handler for that is pointless.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Пути проб и метрик. Пустая строка = ручка выключена.
+/// Probe and metrics paths. An empty string disables the endpoint.
 pub struct HealthPaths {
     pub health: String,
     pub ready: String,
@@ -26,14 +26,14 @@ impl Default for HealthPaths {
     }
 }
 
-/// Состояние готовности. Складывается из трёх независимых причин «не готов».
+/// Readiness state. Composed of three independent "not ready" reasons.
 #[derive(Default)]
 pub struct Readiness {
-    /// Идёт graceful shutdown — снимаемся с эндпоинтов до окончания drain'а.
+    /// Graceful shutdown in progress — leave the endpoints before the drain finishes.
     draining: AtomicBool,
-    /// Флаг из JS: `app.setReady(false)` либо провалившийся readinessCheck.
+    /// Flag from JS: `app.setReady(false)` or a failed readinessCheck.
     js_not_ready: AtomicBool,
-    /// Устойчивая перегрузка (выставляется слоем C5; пока всегда false).
+    /// Sustained overload (set by the C5 layer).
     overloaded: AtomicBool,
 }
 
@@ -44,20 +44,20 @@ impl Readiness {
     pub fn set_js_ready(&self, ready: bool) {
         self.js_not_ready.store(!ready, Ordering::Relaxed);
     }
-    /// Подключается слоем перегрузки (C5, M10b); поле уже участвует в `is_ready`.
+    /// Wired up by the overload layer (C5, M10b); the field already feeds `is_ready`.
     #[allow(dead_code)]
     pub fn set_overloaded(&self, v: bool) {
         self.overloaded.store(v, Ordering::Relaxed);
     }
 
-    /// Готов ли под принимать новый трафик.
+    /// Whether the pod is ready to accept new traffic.
     pub fn is_ready(&self) -> bool {
         !self.draining.load(Ordering::Relaxed)
             && !self.js_not_ready.load(Ordering::Relaxed)
             && !self.overloaded.load(Ordering::Relaxed)
     }
 
-    /// Причина отказа — уходит в тело `/readyz`, чтобы `kubectl describe` был читаемым.
+    /// Refusal reason — goes into the `/readyz` body so `kubectl describe` stays readable.
     pub fn reason(&self) -> &'static str {
         if self.draining.load(Ordering::Relaxed) {
             "draining"
@@ -88,7 +88,7 @@ mod tests {
         r.set_js_ready(true);
         r.set_draining(true);
         assert!(!r.is_ready());
-        // Drain важнее прочих причин: под уже уходит.
+        // Drain outranks the other reasons: the pod is already going away.
         assert_eq!(r.reason(), "draining");
     }
 }

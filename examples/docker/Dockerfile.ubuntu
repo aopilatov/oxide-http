@@ -1,5 +1,5 @@
-# Проверка, что prebuild-аддон подхватывается в чистой Ubuntu без Rust-тулчейна.
-# Собирается из корня репозитория: docker build -f examples/docker/Dockerfile.ubuntu .
+# Verifies that the prebuilt addon loads on a clean Ubuntu without a Rust toolchain.
+# Build from the repository root: docker build -f examples/docker/Dockerfile.ubuntu .
 FROM ubuntu:22.04
 
 RUN apt-get update -qq \
@@ -15,5 +15,5 @@ COPY dist ./dist
 COPY *.node ./
 COPY scripts ./scripts
 
-# Rust здесь нет намеренно: если аддон не подхватился, сборка упадёт.
+# Rust is deliberately absent: if the addon fails to load, the build fails.
 RUN node scripts/smoke.cjs

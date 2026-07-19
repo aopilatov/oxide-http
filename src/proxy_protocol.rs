@@ -1,13 +1,13 @@
 //! PROXY protocol v1/v2 (§6c A4).
 //!
-//! За L4-балансировщиком (AWS NLB, HAProxy в tcp-режиме) TCP-соединение приходит от
-//! самого LB, и реальный адрес клиента передаётся префиксом перед данными. Разбираем
-//! его до TLS/HTTP и подставляем в peer-IP; дальше цепочка `customIpHeaders` работает
-//! как обычно (§7: сначала снимаем PROXY, потом смотрим заголовки).
+//! Behind an L4 load balancer (AWS NLB, HAProxy in tcp mode) the TCP connection comes
+//! from the LB itself, and the real client address is carried in a prefix ahead of the
+//! data. We parse it before TLS/HTTP and use it as the peer IP; the `customIpHeaders`
+//! chain then works as usual (§7: strip PROXY first, then look at headers).
 //!
-//! Режим строгий: если `proxyProtocol` включён, соединение **обязано** нести префикс —
-//! иначе оно закрывается. Иначе клиент, подключившийся в обход LB, мог бы подделать
-//! собственный адрес, просто не отправив префикс.
+//! The mode is strict: when `proxyProtocol` is on, a connection **must** carry the
+//! prefix or it is closed. Otherwise a client connecting around the LB could forge its
+//! own address simply by omitting the prefix.
 
 use std::io;
 use std::pin::Pin;
@@ -15,24 +15,24 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
-/// Сигнатура v2: 12 байт перед бинарной шапкой.
+/// v2 signature: 12 bytes before the binary header.
 const SIG_V2: [u8; 12] = [
     0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 ];
-/// Текстовый префикс v1.
+/// v1 text prefix.
 const SIG_V1: &[u8] = b"PROXY ";
-/// Максимальная длина строки v1 по спецификации (с учётом CRLF).
+/// Maximum v1 line length per the specification (including CRLF).
 const MAX_V1: usize = 107;
 
-/// Результат разбора: адрес источника, если он был передан.
-/// `None` — валидный префикс без адреса (`LOCAL` в v2 / `UNKNOWN` в v1): обычно это
-/// health-check самого балансировщика, адрес берём из сокета.
+/// Parse result: the source address, if one was supplied.
+/// `None` — a valid prefix without an address (`LOCAL` in v2 / `UNKNOWN` in v1): usually
+/// the balancer's own health check, so we keep the socket address.
 type ParsedAddr = Option<String>;
 
-/// Сколько байт шапки уже прочитано, но ещё не отдано наверх.
+/// Bytes of the header already read but not yet handed upstream.
 pub struct PrefixedIo<S> {
     inner: S,
-    /// Остаток буфера, вычитанного при разборе префикса (обычно начало TLS/HTTP).
+    /// Leftover of the buffer consumed while parsing the prefix (usually the start of TLS/HTTP).
     prefix: Vec<u8>,
     pos: usize,
 }
@@ -54,7 +54,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedIo<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
-        // Сначала отдаём «переваренный» остаток, потом переключаемся на сокет.
+        // Replay the already-consumed leftover first, then switch to the socket.
         if me.pos < me.prefix.len() {
             let rest = &me.prefix[me.pos..];
             let n = rest.len().min(buf.remaining());
@@ -92,14 +92,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedIo<S> {
     }
 }
 
-/// Прочитать и разобрать PROXY-префикс. Возвращает обёрнутый поток и адрес клиента
-/// (`None` → адрес остаётся сокетным). `Err(())` — префикса нет или он битый.
+/// Read and parse the PROXY prefix. Returns the wrapped stream and the client address
+/// (`None` → keep the socket address). `Err(())` — no prefix or a malformed one.
 pub async fn read_header<S: AsyncRead + Unpin>(
     mut stream: S,
 ) -> Result<(PrefixedIo<S>, ParsedAddr), ()> {
     let mut buf = Vec::with_capacity(256);
 
-    // Минимум для распознавания версии: 12 байт сигнатуры v2 либо 6 байт "PROXY ".
+    // Minimum needed to tell the version apart: 12 bytes of the v2 signature or 6 of "PROXY ".
     read_at_least(&mut stream, &mut buf, 12).await?;
 
     if buf[..12] == SIG_V2 {
@@ -111,7 +111,7 @@ pub async fn read_header<S: AsyncRead + Unpin>(
     Err(())
 }
 
-/// Дочитать до `want` байт (или ошибка, если поток кончился раньше).
+/// Read up to `want` bytes (error if the stream ends first).
 async fn read_at_least<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,
@@ -121,19 +121,19 @@ async fn read_at_least<S: AsyncRead + Unpin>(
         let mut chunk = [0u8; 256];
         let n = stream.read(&mut chunk).await.map_err(|_| ())?;
         if n == 0 {
-            return Err(()); // EOF до конца шапки
+            return Err(()); // EOF before the header ended
         }
         buf.extend_from_slice(&chunk[..n]);
     }
     Ok(())
 }
 
-/// v1: текстовая строка `PROXY TCP4 src dst sport dport\r\n`.
+/// v1: the text line `PROXY TCP4 src dst sport dport\r\n`.
 async fn parse_v1<S: AsyncRead + Unpin>(
     mut stream: S,
     mut buf: Vec<u8>,
 ) -> Result<(PrefixedIo<S>, ParsedAddr), ()> {
-    // Дочитываем до CRLF, но не больше лимита спецификации.
+    // Read up to CRLF, but no further than the spec's limit.
     let end = loop {
         if let Some(i) = find_crlf(&buf) {
             break i;
@@ -152,16 +152,16 @@ async fn parse_v1<S: AsyncRead + Unpin>(
     }
     let addr = match parts.next() {
         Some("TCP4") | Some("TCP6") => parts.next().map(|s| s.to_string()),
-        // UNKNOWN: префикс валиден, но адреса нет — остаёмся на сокетном.
+        // UNKNOWN: the prefix is valid but carries no address — keep the socket one.
         Some("UNKNOWN") => None,
         _ => return Err(()),
     };
 
-    let rest = buf.split_off(end + 2); // всё после CRLF — уже данные протокола
+    let rest = buf.split_off(end + 2); // everything after CRLF is already protocol data
     Ok((PrefixedIo::new(stream, rest), addr))
 }
 
-/// v2: бинарная шапка (16 байт) + адресный блок переменной длины.
+/// v2: a binary header (16 bytes) plus a variable-length address block.
 async fn parse_v2<S: AsyncRead + Unpin>(
     mut stream: S,
     mut buf: Vec<u8>,
@@ -170,9 +170,9 @@ async fn parse_v2<S: AsyncRead + Unpin>(
 
     let ver_cmd = buf[12];
     if ver_cmd >> 4 != 2 {
-        return Err(()); // версия не 2
+        return Err(()); // version is not 2
     }
-    let is_proxy = ver_cmd & 0x0F == 1; // 0 = LOCAL (адреса нет), 1 = PROXY
+    let is_proxy = ver_cmd & 0x0F == 1; // 0 = LOCAL (no address), 1 = PROXY
     let family = buf[13] >> 4; // 1 = AF_INET, 2 = AF_INET6
     let len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
 
@@ -194,7 +194,7 @@ async fn parse_v2<S: AsyncRead + Unpin>(
                 }
                 Some(std::net::Ipv6Addr::from(segments).to_string())
             }
-            // AF_UNIX или неизвестное семейство — адреса не берём, но префикс валиден.
+            // AF_UNIX or an unknown family — no address taken, but the prefix is valid.
             _ => None,
         }
     };
@@ -211,7 +211,7 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// Прогнать разбор поверх фиктивного потока и вернуть (адрес, остаток данных).
+    /// Run the parser over a fake stream and return (address, leftover data).
     async fn run(input: &[u8]) -> Result<(Option<String>, Vec<u8>), ()> {
         let (mut io, addr) = read_header(std::io::Cursor::new(input.to_vec())).await?;
         let mut rest = Vec::new();
@@ -240,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn v2_ipv4() {
         let mut h = SIG_V2.to_vec();
-        h.push(0x21); // версия 2, команда PROXY
+        h.push(0x21); // version 2, PROXY command
         h.push(0x11); // AF_INET / STREAM
         h.extend_from_slice(&12u16.to_be_bytes());
         h.extend_from_slice(&[10, 1, 2, 3]); // src
@@ -257,7 +257,7 @@ mod tests {
     #[tokio::test]
     async fn v2_local_has_no_addr() {
         let mut h = SIG_V2.to_vec();
-        h.push(0x20); // версия 2, команда LOCAL
+        h.push(0x20); // version 2, LOCAL command
         h.push(0x00);
         h.extend_from_slice(&0u16.to_be_bytes());
         h.extend_from_slice(b"X");

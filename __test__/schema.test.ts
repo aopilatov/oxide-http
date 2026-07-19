@@ -15,7 +15,7 @@ async function up(build) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-test('M7: невалидное тело → 400 без пробуждения JS', async () => {
+test('M7: invalid body → 400 without waking JS', async () => {
   let handlerCalled = false;
   const CreateUser = v.object({
     name: v.pipe(v.string(), v.minLength(2)),
@@ -32,10 +32,10 @@ test('M7: невалидное тело → 400 без пробуждения JS
     const res = await fetch(`${s.base}/users`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'x', age: -5 }), // name слишком короткий, age < 0
+      body: JSON.stringify({ name: 'x', age: -5 }), // name too short, age < 0
     });
     assert.equal(res.status, 400);
-    assert.equal(handlerCalled, false, 'хендлер не должен просыпаться на невалидном теле');
+    assert.equal(handlerCalled, false, 'the handler must not wake up on an invalid body');
     const body = await res.json();
     assert.equal(body.error, 'validation');
     assert.ok(Array.isArray(body.issues) && body.issues.length > 0);
@@ -45,7 +45,7 @@ test('M7: невалидное тело → 400 без пробуждения JS
   }
 });
 
-test('M7: валидное тело проходит; c.req.valid("body")', async () => {
+test('M7: a valid body passes; c.req.valid("body")', async () => {
   const CreateUser = v.object({ name: v.string(), age: v.number() });
   const s = await up({
     routes: (app) =>
@@ -64,7 +64,7 @@ test('M7: валидное тело проходит; c.req.valid("body")', asyn
   }
 });
 
-test('M7: коэрция query (?age=42 → number)', async () => {
+test('M7: query coercion (?age=42 → number)', async () => {
   const Query = v.object({ age: v.number(), ref: v.optional(v.string()) });
   const s = await up({
     routes: (app) =>
@@ -76,7 +76,7 @@ test('M7: коэрция query (?age=42 → number)', async () => {
   try {
     const res = await fetch(`${s.base}/q?age=42`);
     assert.deepEqual(await res.json(), { age: 42, isNumber: true });
-    // невалидный тип → 400
+    // invalid type → 400
     const bad = await fetch(`${s.base}/q?age=notnum`);
     assert.equal(bad.status, 400);
   } finally {
@@ -84,7 +84,7 @@ test('M7: коэрция query (?age=42 → number)', async () => {
   }
 });
 
-test('M7: valibot transform применяется (preValidation)', async () => {
+test('M7: the valibot transform is applied (preValidation)', async () => {
   const Body = v.object({
     name: v.pipe(v.string(), v.transform((s) => s.toUpperCase())),
   });
@@ -98,7 +98,7 @@ test('M7: valibot transform применяется (preValidation)', async () =>
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'bob' }),
     });
-    assert.deepEqual(await res.json(), { name: 'BOB' }); // transform сработал
+    assert.deepEqual(await res.json(), { name: 'BOB' }); // the transform ran
   } finally {
     s.close();
   }
@@ -125,7 +125,7 @@ test('M7: valibot refine (check) → 400', async () => {
   }
 });
 
-test('M7: response стрип — лишние поля не утекают', async () => {
+test('M7: response stripping — extra fields do not leak', async () => {
   const UserOut = v.object({ id: v.number(), name: v.string() });
   const s = await up({
     routes: (app) =>
@@ -136,13 +136,13 @@ test('M7: response стрип — лишние поля не утекают', as
   try {
     const res = await fetch(`${s.base}/me`);
     const body = await res.json();
-    assert.deepEqual(body, { id: 1, name: 'Bob' }); // password/ssn отсечены
+    assert.deepEqual(body, { id: 1, name: 'Bob' }); // password/ssn stripped
   } finally {
     s.close();
   }
 });
 
-test('M7: сырой JSON Schema тоже работает', async () => {
+test('M7: raw JSON Schema works too', async () => {
   const schema = {
     type: 'object',
     properties: { email: { type: 'string' } },
@@ -170,7 +170,7 @@ test('M7: сырой JSON Schema тоже работает', async () => {
   }
 });
 
-test('M7: params-валидация', async () => {
+test('M7: params validation', async () => {
   const Params = v.object({ id: v.pipe(v.number(), v.integer()) });
   const s = await up({
     routes: (app) =>

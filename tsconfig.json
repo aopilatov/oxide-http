@@ -1,19 +1,19 @@
 {
   "compilerOptions": {
-    // Node 18+ (engines) — ES2022 покрывается везде, где мы поддерживаемся.
+    // Node 18+ (engines) — ES2022 is available everywhere we support.
     "target": "ES2022",
     "lib": ["ES2023", "DOM"],
-    // Публикуем CJS: обёртка и сейчас CJS, потребителей не ломаем.
+    // We publish CJS: the wrapper is CJS today, so consumers are not broken.
     "module": "node18",
     "moduleResolution": "node16",
 
-    "rootDir": "js",   // src/ занят Rust-кодом, TS-исходники живут в js/
+    "rootDir": "js",   // src/ holds the Rust code, so the TS sources live in js/
     "outDir": "dist",
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
 
-    // Максимальная строгость (по договорённости).
+    // Maximum strictness (as agreed).
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -25,17 +25,17 @@
     "useUnknownInCatchVariables": true,
     "forceConsistentCasingInFileNames": true,
 
-    // Синтаксис должен быть «стираемым»: в разработке файлы .ts исполняются
-    // Node напрямую (type stripping), без шага сборки. Значит никаких enum,
-    // namespace и parameter properties — компилятор это проверит.
+    // The syntax must be "erasable": during development Node executes the .ts files
+    // directly (type stripping) with no build step. That rules out enum, namespace and
+    // parameter properties — the compiler enforces it.
     //
-    // verbatimModuleSyntax НЕ включаем: он требует, чтобы синтаксис совпадал с
-    // форматом вывода, а мы пишем ESM-синтаксис и компилируем его в CJS.
+    // verbatimModuleSyntax is NOT enabled: it demands the syntax match the output
+    // format, while we write ESM syntax and compile it to CJS.
     "erasableSyntaxOnly": true,
     "isolatedModules": true,
 
-    // В исходниках импорты пишутся с расширением .ts (так Node исполняет их
-    // напрямую), а tsc переписывает их в .js при сборке.
+    // Sources import with the .ts extension (so Node can execute them directly), and
+    // tsc rewrites those to .js during the build.
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true,
 

@@ -1,6 +1,6 @@
-# Манифест для @oxide/http. Ключевое — согласование таймаутов остановки:
+# Manifest for @oxide-ts/http. The key part is aligning the shutdown timeouts:
 # terminationGracePeriodSeconds > preShutdownDelay + shutdownTimeout,
-# иначе k8s убьёт под посреди drain'а.
+# otherwise k8s kills the pod mid-drain.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,7 +13,7 @@ spec:
     metadata:
       labels: { app: api }
     spec:
-      # preShutdownDelay 10s + shutdownTimeout 15s = 25s, берём с запасом.
+      # preShutdownDelay 10s + shutdownTimeout 15s = 25s, with headroom.
       terminationGracePeriodSeconds: 40
       containers:
         - name: api
@@ -25,11 +25,11 @@ spec:
           resources:
             requests: { cpu: "1", memory: 256Mi }
             limits:   { cpu: "1", memory: 512Mi }
-            # workerThreads: 'auto' прочитает именно эту квоту (1 vCPU),
-            # а не число ядер ноды — иначе tokio поднял бы воркеров по числу ядер.
+            # workerThreads: 'auto' reads exactly this quota (1 vCPU) rather than the
+            # node's core count — otherwise tokio would spawn a worker per core.
 
-          # Пробы на admin-порту: они отвечают из Rust и работают даже когда
-          # event loop занят или сервер перегружен.
+          # Probes on the admin port: they answer from Rust and keep working even when
+          # the event loop is busy or the server is overloaded.
           startupProbe:
             httpGet: { path: /healthz, port: admin }
             failureThreshold: 30
@@ -40,8 +40,8 @@ spec:
           readinessProbe:
             httpGet: { path: /readyz, port: admin }
             periodSeconds: 2
-            # readyz отдаёт 503 при: shutdown (draining), устойчивой перегрузке
-            # (overloaded) и по app.setReady(false) / setReadinessCheck.
+            # readyz returns 503 on: shutdown (draining), sustained overload
+            # (overloaded), and via app.setReady(false) / setReadinessCheck.
 
           env:
             - { name: NODE_ENV, value: production }
@@ -54,7 +54,7 @@ spec:
   selector: { app: api }
   ports:
     - { name: http, port: 80, targetPort: http }
-    # admin-порт наружу НЕ публикуем: /metrics не должен светиться из интернета.
+    # The admin port is NOT published: /metrics must not be reachable from the internet.
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

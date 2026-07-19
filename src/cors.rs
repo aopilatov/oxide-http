@@ -1,20 +1,20 @@
-//! Нативный CORS (§6a, §10-набор). Работает на краях в Rust: preflight `OPTIONS`
-//! отвечается без пробуждения JS; `Access-Control-*` навешиваются на ответ.
+//! Native CORS (§6a, §10 set). Runs at the edge in Rust: preflight `OPTIONS`
+//! is answered without waking JS; `Access-Control-*` are attached to the response.
 //!
-//! `origin` поддерживает `*` (любой) и список строк. Origin-функция не нативна
-//! (это JS) — для неё пишется обычный JS-middleware.
+//! `origin` supports `*` (any) and a list of strings. An origin function is not
+//! native (that's JS) — write a regular JS middleware for it.
 
-/// Опции CORS с JS-стороны (нормализованы обёрткой).
+/// CORS options from the JS side (normalized by the wrapper).
 pub struct CorsOptions {
-    pub origins: Vec<String>, // ["*"] = любой
+    pub origins: Vec<String>, // ["*"] = any
     pub methods: Vec<String>,
-    pub allowed_headers: Option<Vec<String>>, // None = отражать запрошенные
+    pub allowed_headers: Option<Vec<String>>, // None = reflect the requested ones
     pub exposed_headers: Option<Vec<String>>,
     pub credentials: bool,
-    pub max_age: Option<i64>, // секунды
+    pub max_age: Option<i64>, // seconds
 }
 
-/// Скомпилированная CORS-политика.
+/// Compiled CORS policy.
 pub struct Cors {
     any_origin: bool,
     origins: Vec<String>,
@@ -39,8 +39,8 @@ impl Cors {
         }
     }
 
-    /// Значение для `Access-Control-Allow-Origin`, если origin разрешён.
-    /// С credentials `*` недопустим — отражаем конкретный origin.
+    /// Value for `Access-Control-Allow-Origin` if the origin is allowed.
+    /// With credentials `*` is not permitted — reflect the concrete origin.
     fn resolve_origin(&self, origin: Option<&str>) -> Option<String> {
         if self.any_origin {
             return if self.credentials {
@@ -55,7 +55,7 @@ impl Cors {
         }
     }
 
-    /// Заголовки preflight-ответа. `None` → origin запрещён (отклонить `403`).
+    /// Preflight response headers. `None` → origin rejected (respond `403`).
     pub fn preflight(
         &self,
         origin: Option<&str>,
@@ -66,7 +66,7 @@ impl Cors {
             ("access-control-allow-origin".into(), acao),
             ("access-control-allow-methods".into(), self.methods.clone()),
         ];
-        // allowedHeaders задан → он; иначе отражаем запрошенные.
+        // allowedHeaders set → use it; otherwise reflect the requested ones.
         let ah = self
             .allowed_headers
             .clone()
@@ -86,7 +86,7 @@ impl Cors {
         Some(h)
     }
 
-    /// Заголовки для обычного (не preflight) ответа. Пусто, если origin не разрешён.
+    /// Headers for a regular (non-preflight) response. Empty if the origin is not allowed.
     pub fn actual(&self, origin: Option<&str>) -> Vec<(String, String)> {
         let Some(acao) = self.resolve_origin(origin) else {
             return vec![];

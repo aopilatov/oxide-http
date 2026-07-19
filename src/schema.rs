@@ -1,8 +1,8 @@
-//! Нативная валидация по JSON Schema (§6b). Компиляция валидаторов на `listen()`,
-//! структурная проверка body/query/params **вне event loop** → `400` без JS.
+//! Native JSON Schema validation (§6b). Validators are compiled on `listen()`, and
+//! structural checks of body/query/params run **off the event loop** → `400` without JS.
 //!
-//! Источник схем — valibot (конвертируется в JSON Schema обёрткой) либо сырой
-//! JSON Schema. Коэрция query/params (всегда строки) по типам из схемы.
+//! Schemas come either from valibot (converted to JSON Schema by the wrapper) or as raw
+//! JSON Schema. query/params (always strings) are coerced by the types in the schema.
 
 use std::collections::HashMap;
 
@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 
 use crate::bridge::KvPair;
 
-/// Схемы одного маршрута (скомпилированы). Любое поле может отсутствовать.
+/// Compiled schemas of one route. Any field may be absent.
 #[derive(Default)]
 pub struct LeafSchema {
     body: Option<Validator>,
@@ -19,13 +19,13 @@ pub struct LeafSchema {
     params: Option<Compiled>,
 }
 
-/// Валидатор + исходная схема (схема нужна для коэрции строк по типам).
+/// Validator plus the source schema (needed to coerce strings by type).
 struct Compiled {
     validator: Validator,
     schema: Value,
 }
 
-/// Ошибка валидации для машиночитаемого ответа `400`.
+/// A validation error for the machine-readable `400` response.
 #[derive(Debug)]
 pub struct Issue {
     pub location: &'static str, // "body" | "query" | "params"
@@ -34,14 +34,14 @@ pub struct Issue {
     pub code: String,
 }
 
-/// Определение схем маршрута из JS (JSON Schema как строки).
+/// Route schema definition from JS (JSON Schema as strings).
 pub struct SchemaDef {
     pub body: Option<String>,
     pub query: Option<String>,
     pub params: Option<String>,
 }
 
-/// Результат успешной валидации: коэрцированные/провалидированные значения (JSON-строки для JS).
+/// Successful validation result: coerced/validated values (JSON strings for JS).
 #[derive(Default, Debug)]
 pub struct Validated {
     pub body: Option<String>,
@@ -52,8 +52,8 @@ pub struct Validated {
 fn compile(src: Option<String>) -> Result<Option<Compiled>, String> {
     let Some(s) = src else { return Ok(None) };
     let schema: Value =
-        serde_json::from_str(&s).map_err(|e| format!("невалидная JSON Schema: {e}"))?;
-    let validator = validator_for(&schema).map_err(|e| format!("компиляция схемы: {e}"))?;
+        serde_json::from_str(&s).map_err(|e| format!("invalid JSON Schema: {e}"))?;
+    let validator = validator_for(&schema).map_err(|e| format!("schema compilation: {e}"))?;
     Ok(Some(Compiled { validator, schema }))
 }
 
@@ -74,8 +74,8 @@ impl LeafSchema {
         self.body.is_some()
     }
 
-    /// Коэрция + валидация query/params и (если задано тело) валидация body.
-    /// `Ok(Validated)` — всё валидно; `Err(issues)` — список ошибок для `400`.
+    /// Coercion plus validation of query/params and (when a body is given) of the body.
+    /// `Ok(Validated)` — everything is valid; `Err(issues)` — the error list for `400`.
     pub fn validate(
         &self,
         query: &[KvPair],
@@ -107,14 +107,14 @@ impl LeafSchema {
                     Err(e) => issues.push(Issue {
                         location: "body",
                         path: String::new(),
-                        message: format!("невалидный JSON: {e}"),
+                        message: format!("invalid JSON: {e}"),
                         code: "invalid_json".into(),
                     }),
                 },
                 None => issues.push(Issue {
                     location: "body",
                     path: String::new(),
-                    message: "тело обязательно".into(),
+                    message: "body is required".into(),
                     code: "required".into(),
                 }),
             }
@@ -144,7 +144,7 @@ fn pointer_to_path(ptr: &str) -> String {
     ptr.trim_start_matches('/').replace('/', ".")
 }
 
-/// Короткий код ошибки из Debug-имени варианта kind ("Type {..}" → "type").
+/// Short error code derived from the kind variant's Debug name ("Type {..}" → "type").
 fn kind_code(dbg: &str) -> String {
     dbg.split([' ', '(', '{'])
         .next()
@@ -155,7 +155,7 @@ fn kind_code(dbg: &str) -> String {
 fn coerce_query(pairs: &[KvPair], schema: &Value) -> Value {
     let props = schema.get("properties");
     let mut map = Map::new();
-    // last-wins (как c.req.query)
+    // last-wins (same as c.req.query)
     for kv in pairs {
         let prop = props.and_then(|p| p.get(&kv.key));
         map.insert(kv.key.clone(), coerce_scalar(&kv.value, prop));
@@ -173,8 +173,8 @@ fn coerce_params(params: &HashMap<String, String>, schema: &Value) -> Value {
     Value::Object(map)
 }
 
-/// Строку → number/integer/boolean по типу из схемы. Не распарсилось → оставляем
-/// строку (валидатор затем отметит несоответствие типа).
+/// String → number/integer/boolean according to the schema type. If parsing fails we
+/// keep the string (the validator then reports the type mismatch).
 fn coerce_scalar(raw: &str, prop_schema: Option<&Value>) -> Value {
     let ty = prop_schema
         .and_then(|s| s.get("type"))
@@ -197,7 +197,7 @@ fn coerce_scalar(raw: &str, prop_schema: Option<&Value>) -> Value {
     }
 }
 
-/// Собрать тело ответа `400` из списка issues (машиночитаемо).
+/// Build the `400` response body from the issue list (machine-readable).
 pub fn errors_body(issues: &[Issue]) -> String {
     let arr: Vec<Value> = issues
         .iter()
@@ -238,7 +238,7 @@ mod tests {
         let out = s
             .validate(&kv(&[("age", "42")]), &HashMap::new(), None)
             .unwrap();
-        assert_eq!(out.query.unwrap(), r#"{"age":42}"#); // строка → число
+        assert_eq!(out.query.unwrap(), r#"{"age":42}"#); // string → number
     }
 
     #[test]

@@ -1,73 +1,86 @@
 # Changelog
 
-Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
-версионирование — [SemVer](https://semver.org/lang/ru/).
+Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+versioning follows [SemVer](https://semver.org/).
+
+## [0.1.1] — 2026-07-19
+
+Documentation only — no code changes, the published binaries are identical to `0.1.0`.
+
+### Changed
+
+- All documentation and source comments are now in English: `README.md`, `DESIGN.md`,
+  `CHANGELOG.md`, `BENCHMARKS.md`, the Rust and TypeScript sources, the tests, the examples
+  and the CI workflow.
+- Removed `IMPLEMENTATION.md` — the milestone plan it tracked is complete, and the
+  architecture it duplicated lives in [DESIGN.md](DESIGN.md).
 
 ## [0.1.0] — 2026-07-19
 
-Первый публичный релиз.
+First public release.
 
-Версия `0.x` выбрана намеренно: API ещё не обкатан реальной эксплуатацией, и
-ломающие изменения в минорных версиях допустимы. До `1.0.0` дойдём, когда
-появится обратная связь.
+The `0.x` line is deliberate: the API has not been shaped by real-world use yet, so
+breaking changes in minor versions are allowed. `1.0.0` will come once there is feedback
+from actual deployments.
 
-### Добавлено
+### Added
 
-**Ядро и мост**
-- Сервер на hyper + tokio с собственным рантаймом, отдельным от libuv;
-  один переход границы napi на запрос (ThreadsafeFunction ↔ `Promise`).
-- Роутинг на matchit в Rust: `404`, `405` + `Allow`, авто-`HEAD`, авто-`OPTIONS`
-  и парсинг query — без пробуждения JS.
-- Контекст `c` (§7): заголовки, params, query, cookies, `c.req.ip`/`ips`/`country`,
-  UUIDv7 `requestId`, структурный логгер `c.log`.
+**Core and bridge**
+- A server on hyper + tokio with its own runtime, separate from libuv; one napi boundary
+  crossing per request (ThreadsafeFunction ↔ `Promise`).
+- matchit-based routing in Rust: `404`, `405` + `Allow`, auto-`HEAD`, auto-`OPTIONS` and
+  query parsing all happen without waking JS.
+- The context `c` (§7): headers, params, query, cookies, `c.req.ip`/`ips`/`country`,
+  a UUIDv7 `requestId`, and the structured logger `c.log`.
 
-**Тело и стриминг**
-- Чтение и запись тела через мост с backpressure в обе стороны.
-- `bodyLimit` авторитетен в Rust: считаются фактические байты, `Content-Length`
-  не в доверии, обойти из хендлера нельзя.
-- Входящая декомпрессия gzip/deflate/br с лимитом по распакованному размеру.
-- Multipart (§9a): парсинг в Rust потоково, лимиты и типы файлов проверяются
-  до передачи части в JS.
+**Bodies and streaming**
+- Reading and writing bodies across the bridge with backpressure in both directions.
+- `bodyLimit` is authoritative in Rust: actual bytes are counted, `Content-Length` is not
+  trusted, and the limit cannot be bypassed from a handler.
+- Inbound gzip/deflate/br decompression with the limit applied to the decompressed size.
+- Multipart (§9a): streaming parsing in Rust, with limits and file types checked before a
+  part reaches JS.
 
-**Композиция**
-- Луковица middleware + хуки жизненного цикла Fastify-стиля; цепочки
-  предкомпилируются на `listen()`.
-- `onError`, `onTimeout`, `c.req.signal` (AbortSignal), инвариант «процесс не падает».
+**Composition**
+- A middleware onion plus Fastify-style lifecycle hooks; chains are precompiled on
+  `listen()`.
+- `onError`, `onTimeout`, `c.req.signal` (AbortSignal), and the "process stays up" invariant.
 
-**Схемы**
-- valibot либо сырой JSON Schema; структурная валидация и коэрция — в Rust,
-  `transform`/`check` доигрывает valibot в JS.
-- Отсечение полей ответа по response-схеме.
+**Schemas**
+- valibot or raw JSON Schema; structural validation and coercion happen in Rust, while
+  valibot applies `transform`/`check` in JS.
+- Response field stripping by the response schema.
 
-**Протоколы**
-- TLS через rustls, ALPN согласует h2/http1.1; h2c prior-knowledge.
-- Настройки HTTP/2, включая лимит Rapid Reset (CVE-2023-44487).
-- Read-таймауты против Slowloris; `maxHeaderSize` → `431`, `bodyReadTimeout` → `408`.
+**Protocols**
+- TLS via rustls with ALPN negotiating h2/http1.1; h2c prior-knowledge.
+- HTTP/2 settings, including the Rapid Reset limit (CVE-2023-44487).
+- Read timeouts against Slowloris; `maxHeaderSize` → `431`, `bodyReadTimeout` → `408`.
 
-**Жизненный цикл и эксплуатация**
-- Многостадийный graceful shutdown: readiness снимается → listener ещё принимает
-  `preShutdownDelay` → приём прекращается, h2 получает `GOAWAY` → drain до
+**Lifecycle and operations**
+- Multi-stage graceful shutdown: readiness drops → the listener keeps accepting for
+  `preShutdownDelay` → accepting stops, h2 receives `GOAWAY` → drain until
   `shutdownTimeout`. SIGTERM/SIGINT → `exit 0`.
-- Server-события `listening`/`error`/`close`/`shutdown`, `await close()`.
-- Unix-сокет, socket-опции (`backlog`, `SO_REUSEPORT`, `TCP_NODELAY`,
-  `maxConnections`), PROXY protocol v1/v2, `workerThreads: 'auto'` по cgroup-квоте.
-- Защита от перегрузки: лимит одновременных запросов, очередь, `503` + `Retry-After`,
-  `GOAWAY` для h2, снятие readiness при устойчивой перегрузке.
-- `/healthz`, `/readyz`, `/metrics` (Prometheus) — целиком в Rust, опционально на
-  отдельном порту; JSON access-log.
+- Server events `listening`/`error`/`close`/`shutdown`, and `await close()`.
+- Unix sockets, socket options (`backlog`, `SO_REUSEPORT`, `TCP_NODELAY`,
+  `maxConnections`), PROXY protocol v1/v2, `workerThreads: 'auto'` from the cgroup quota.
+- Overload protection: a concurrent request limit, a queue, `503` + `Retry-After`,
+  `GOAWAY` for h2, and readiness shedding under sustained overload.
+- `/healthz`, `/readyz`, `/metrics` (Prometheus) answered entirely in Rust, optionally on
+  a separate port; a JSON access log.
 
-**Разработка**
-- `app.inject()` — тест-харнесс без сокета через тот же конвейер.
-- JS-слой на TypeScript; типы публичного API и границы с Rust.
+**Development**
+- `app.inject()` — a socket-free test harness running the very same pipeline.
+- The JS layer is written in TypeScript, with types for the public API and the Rust boundary.
 
-### Известные ограничения
+### Known limitations
 
-- На маршрутах с JS-хендлером сервер **медленнее** `node:http` (~40k против ~69k RPS):
-  переход границы napi стоит ~17 мкс главного потока против ~14.5 мкс на весь запрос
-  у `node:http`. Выигрыш — только там, где JS не будится. См. [BENCHMARKS.md](BENCHMARKS.md).
-- Один параметр на сегмент пути (`/{id}.{ext}` не поддерживается).
-- WebSocket не поддерживается и не планируется.
-- Динамическая origin-функция в нативном CORS отсутствует — пишется JS-middleware.
-- В метриках статус — класс (`2xx`/`4xx`), а не точный код.
-- Hot-reload TLS-сертификатов, нативный сериализатор ответа, рекурсивное отсечение
-  вложенных полей — фаза 2.
+- On routes handled in JS the server is **slower** than `node:http` (~40k vs ~69k RPS):
+  crossing the napi boundary costs ~17 µs of main-thread time against ~14.5 µs for an
+  entire request in `node:http`. The win only exists where JS never wakes. See
+  [BENCHMARKS.md](BENCHMARKS.md).
+- One parameter per path segment (`/{id}.{ext}` is not supported).
+- WebSocket is not supported and not planned.
+- No dynamic origin function in the native CORS — write a JS middleware instead.
+- In metrics the status is a class (`2xx`/`4xx`), not the exact code.
+- TLS certificate hot-reload, a native response serializer and recursive stripping of
+  nested fields are phase two.

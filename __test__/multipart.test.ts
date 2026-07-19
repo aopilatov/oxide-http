@@ -14,7 +14,8 @@ async function up(build) {
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
 
-/** Собрать multipart/form-data вручную (fetch с FormData тоже можно, но так контролируем точнее). */
+/** Build multipart/form-data by hand (fetch with FormData works too, but this gives
+ *  exact control over the bytes). */
 function multipart(parts) {
   const boundary = '----oxidetest' + Math.floor(performance.now());
   const chunks: any[] = [];
@@ -35,7 +36,7 @@ function multipart(parts) {
   };
 }
 
-test('M8: потоковая загрузка — c.req.parts(), файлы и поля', async () => {
+test('M8: streaming upload — c.req.parts(), files and fields', async () => {
   const s = await up({
     routes: (app) =>
       app.post('/upload', { multipart: true }, async (c) => {
@@ -71,7 +72,7 @@ test('M8: потоковая загрузка — c.req.parts(), файлы и �
   }
 });
 
-test('M8: большой файл стримится без буферизации всего в память', async () => {
+test('M8: a large file streams without buffering everything in memory', async () => {
   const s = await up({
     routes: (app) =>
       app.post('/big', { multipart: { maxFileSize: '20mb' } }, async (c) => {
@@ -98,7 +99,7 @@ test('M8: большой файл стримится без буферизаци
   }
 });
 
-test('M8: maxFileSize превышен → 413', async () => {
+test('M8: maxFileSize exceeded → 413', async () => {
   const s = await up({
     routes: (app) =>
       app.post('/u', { multipart: { maxFileSize: '1kb' } }, async (c) => {
@@ -123,7 +124,7 @@ test('M8: maxFileSize превышен → 413', async () => {
   }
 });
 
-test('M8: неверный MIME-тип → 415', async () => {
+test('M8: wrong MIME type → 415', async () => {
   const s = await up({
     routes: (app) =>
       app.post('/img', { multipart: { allowedMimeTypes: ['image/*'] } }, async (c) => {
@@ -148,7 +149,7 @@ test('M8: неверный MIME-тип → 415', async () => {
   }
 });
 
-test('M8: неверное расширение → 415', async () => {
+test('M8: wrong extension → 415', async () => {
   const s = await up({
     routes: (app) =>
       app.post('/e', { multipart: { allowedExtensions: ['.png', '.jpg'] } }, async (c) => {
@@ -173,7 +174,7 @@ test('M8: неверное расширение → 415', async () => {
   }
 });
 
-test('M8: не multipart Content-Type при флаге → 415', async () => {
+test('M8: non-multipart Content-Type with the flag on → 415', async () => {
   const s = await up({
     routes: (app) => app.post('/u', { multipart: true }, (c) => c.text('ok')),
   });
@@ -189,7 +190,7 @@ test('M8: не multipart Content-Type при флаге → 415', async () => {
   }
 });
 
-test('M8: c.req.formData() сахар', async () => {
+test('M8: c.req.formData() sugar', async () => {
   const s = await up({
     routes: (app) =>
       app.post('/f', { multipart: true }, async (c) => {

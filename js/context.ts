@@ -1,27 +1,27 @@
-// Контекст `c` (§7) и финализация ответа. Заголовки — lowercase; `Set-Cookie`
-// отдаётся отдельными строками; возврат значения из хендлера — сахар над c.json.
-// Тело запроса/ответа — стриминг через BodyIo с backpressure (§9).
+// The context `c` (§7) and response finalization. Headers are lowercase; `Set-Cookie`
+// is emitted as separate lines; a value returned from a handler is sugar over c.json.
+// Request/response bodies stream through BodyIo with backpressure (§9).
 
 import zlib from 'node:zlib';
 
 import type { SchemaSource } from './schema.ts';
 
-// --- типы нативной границы (см. src/bridge.rs, src/stream.rs) ---
+// --- native boundary types (see src/bridge.rs, src/stream.rs) ---
 
-/** Пара ключ-значение на границе с Rust. */
+/** Key-value pair on the Rust boundary. */
 export interface KvPair {
   key: string;
   value: string;
 }
 
-/** Метаданные части multipart из Rust. */
+/** Multipart part metadata coming from Rust. */
 export interface PartMeta {
   name?: string | null;
   filename?: string | null;
   contentType?: string | null;
 }
 
-/** Мост тел запроса/ответа (napi-класс `BodyIo`). */
+/** Request/response body bridge (the napi `BodyIo` class). */
 export interface BodyIo {
   read(): Promise<Buffer | null>;
   write(chunk: Buffer): Promise<void>;
@@ -30,7 +30,7 @@ export interface BodyIo {
   readPart(): Promise<Buffer | null>;
 }
 
-/** Сматченный запрос, пришедший из Rust. */
+/** A matched request received from Rust. */
 export interface NativeRequest {
   leafId: number;
   method: string;
@@ -48,7 +48,7 @@ export interface NativeRequest {
   validParams?: string | null;
 }
 
-/** Ответ, возвращаемый в Rust. */
+/** The response returned to Rust. */
 export interface NativeResponse {
   status: number;
   headers: KvPair[];
@@ -56,12 +56,12 @@ export interface NativeResponse {
   streamed?: boolean;
 }
 
-// --- публичные типы контекста ---
+// --- public context types ---
 
-/** Источник тела ответа для `c.body()`. */
+/** Response body source for `c.body()`. */
 export type BodySource = Buffer | Uint8Array | ReadableStream<Uint8Array> | AsyncIterable<unknown>;
 
-/** Опции `Set-Cookie` (§6d B1). */
+/** `Set-Cookie` options (§6d B1). */
 export interface CookieOptions {
   maxAge?: number;
   domain?: string;
@@ -72,7 +72,7 @@ export interface CookieOptions {
   sameSite?: 'strict' | 'lax' | 'none' | 'Strict' | 'Lax' | 'None';
 }
 
-/** Часть multipart-запроса (§9a). */
+/** A part of a multipart request (§9a). */
 export interface MultipartPart {
   name: string | undefined;
   filename: string | undefined;
@@ -82,7 +82,7 @@ export interface MultipartPart {
   text(): Promise<string>;
 }
 
-/** Контекстный логгер (§6d B3). */
+/** Contextual logger (§6d B3). */
 export interface Logger {
   debug(msg: string, extra?: Record<string, unknown>): void;
   info(msg: string, extra?: Record<string, unknown>): void;
@@ -90,10 +90,10 @@ export interface Logger {
   error(msg: string, extra?: Record<string, unknown>): void;
 }
 
-/** Где искать провалидированные значения. */
+/** Where to look for validated values. */
 export type ValidLocation = 'body' | 'query' | 'params';
 
-/** Запрос внутри контекста (§7). */
+/** The request inside the context (§7). */
 export interface ContextRequest {
   readonly method: string;
   readonly path: string;
@@ -108,7 +108,7 @@ export interface ContextRequest {
   readonly ips: string[];
   readonly country: string | undefined;
   readonly id: string;
-  /** AbortSignal запроса (таймаут/дисконнект) — проставляется диспетчером. */
+  /** The request's AbortSignal (timeout/disconnect) — set by the dispatcher. */
   signal: AbortSignal | undefined;
   cookie(name: string): string | undefined;
   readonly stream: ReadableStream<Uint8Array>;
@@ -119,20 +119,20 @@ export interface ContextRequest {
   parts(): AsyncGenerator<MultipartPart, void, void>;
   formData(): Promise<FormData>;
   valid<T = unknown>(loc: ValidLocation): T;
-  /** @internal значения из нативной валидации */
+  /** @internal values from native validation */
   _rustValid: Record<ValidLocation, unknown>;
-  /** @internal результат valibot-transform поверх нативных */
+  /** @internal valibot transform result layered on the native values */
   _valid: Record<string, unknown>;
 }
 
-/** Мутируемая часть ответа. */
+/** The mutable part of the response. */
 export interface ContextResponse {
   status: number | undefined;
   headers: ResHeaders;
   sent: boolean;
 }
 
-/** Контекст запроса `c` (§7). */
+/** The request context `c` (§7). */
 export interface Context {
   readonly req: ContextRequest;
   readonly res: ContextResponse;
@@ -162,10 +162,10 @@ export interface Context {
   /** @internal */ _store: Map<string, unknown>;
 }
 
-/** Карта «статус → набор разрешённых полей» для стрипа ответа по схеме (§6b). */
+/** Map of "status → allowed field set" for schema-based response stripping (§6b). */
 export type ResponseStrip = Record<string | number, Set<string>>;
 
-/** Опции построения контекста. */
+/** Context construction options. */
 export interface BuildContextOptions {
   baseUrl?: string;
   requestIdHeader?: string;
@@ -173,7 +173,7 @@ export interface BuildContextOptions {
   responseStrip?: ResponseStrip | null;
 }
 
-/** Схемы маршрута (§6b). */
+/** Route schemas (§6b). */
 export interface RouteSchema {
   body?: SchemaSource;
   query?: SchemaSource;
@@ -181,7 +181,7 @@ export interface RouteSchema {
   response?: Record<string | number, SchemaSource>;
 }
 
-/** Ошибка с HTTP-статусом (перехватывается диспетчером → отдаётся клиенту). */
+/** An error carrying an HTTP status (caught by the dispatcher → sent to the client). */
 export class HttpError extends Error {
   readonly status: number;
 
@@ -198,13 +198,13 @@ const toBuffer = (chunk: unknown): Buffer => {
   return Buffer.from(chunk as Uint8Array);
 };
 
-/** Маркеры обрыва тела, приходящие из нативного read() (см. src/stream.rs). */
+/** Body-abort markers coming from the native read() (see src/stream.rs). */
 const messageOf = (e: unknown): string =>
   e != null && typeof e === 'object' && 'message' in e ? String((e as Error).message) : String(e);
 const isLimitError = (e: unknown): boolean => e != null && /BODY_LIMIT_EXCEEDED/.test(messageOf(e));
 const isReadTimeout = (e: unknown): boolean => e != null && /BODY_READ_TIMEOUT/.test(messageOf(e));
 
-/** Прочитать чанк, маппя нативные маркеры в HttpError (413 / 408). */
+/** Read a chunk, mapping the native markers to HttpError (413 / 408). */
 async function readChunk(bodyIo: BodyIo): Promise<Buffer | null> {
   try {
     return await bodyIo.read();
@@ -215,8 +215,8 @@ async function readChunk(bodyIo: BodyIo): Promise<Buffer | null> {
   }
 }
 
-/** Прочитать всё тело запроса из BodyIo (backpressure per-chunk). Лимит — в Rust;
- *  здесь дублирующая проверка на случай, если нативный лимит выключен. */
+/** Read the entire request body from BodyIo (per-chunk backpressure). The limit is
+ *  enforced in Rust; this is a duplicate check in case the native limit is off. */
 async function collectRaw(bodyIo: BodyIo, limit: number | undefined): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -230,7 +230,8 @@ async function collectRaw(bodyIo: BodyIo, limit: number | undefined): Promise<Bu
   return Buffer.concat(chunks);
 }
 
-/** Распаковать тело по Content-Encoding (§B5), лимит — на распакованный размер. */
+/** Decompress the body per Content-Encoding (§B5); the limit applies to the
+ *  decompressed size. */
 function decompress(buf: Buffer, encoding: string | undefined, limit: number | undefined): Buffer {
   const enc = (encoding ?? '').trim().toLowerCase();
   if (!enc || enc === 'identity') return buf;
@@ -239,7 +240,7 @@ function decompress(buf: Buffer, encoding: string | undefined, limit: number | u
     if (enc === 'gzip') return zlib.gunzipSync(buf, opts);
     if (enc === 'deflate') return zlib.inflateSync(buf, opts);
     if (enc === 'br') return zlib.brotliDecompressSync(buf, opts);
-    return buf; // неизвестная кодировка — не трогаем
+    return buf; // unknown encoding — leave it alone
   } catch (e) {
     const code = e != null && typeof e === 'object' && 'code' in e ? String(e.code) : '';
     if (code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength|too large/i.test(messageOf(e))) {
@@ -249,8 +250,9 @@ function decompress(buf: Buffer, encoding: string | undefined, limit: number | u
   }
 }
 
-/** Web ReadableStream над телом запроса (pull → bodyIo.read). Превышение лимита
- *  (в Rust) → ошибка стрима с HttpError(413), которую поймает for-await хендлера. */
+/** A Web ReadableStream over the request body (pull → bodyIo.read). Exceeding the
+ *  limit (in Rust) errors the stream with HttpError(413), caught by the handler's
+ *  for-await. */
 function makeReqStream(bodyIo: BodyIo): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -265,7 +267,7 @@ function makeReqStream(bodyIo: BodyIo): ReadableStream<Uint8Array> {
   });
 }
 
-/** Прокачать источник (Buffer|ReadableStream|AsyncIterable) в BodyIo с backpressure. */
+/** Pump a source (Buffer|ReadableStream|AsyncIterable) into BodyIo with backpressure. */
 function startResponsePump(bodyIo: BodyIo, source: BodySource): void {
   void (async () => {
     try {
@@ -284,7 +286,7 @@ function startResponsePump(bodyIo: BodyIo, source: BodySource): void {
         }
       }
     } catch {
-      // producer/соединение оборвались — просто закрываем тело.
+      // the producer/connection died — just close the body.
     } finally {
       bodyIo.endWrite();
     }
@@ -298,9 +300,9 @@ const isStreamSource = (v: unknown): v is BodySource => {
   return typeof o['getReader'] === 'function' || o[Symbol.asyncIterator] != null;
 };
 
-// --- multipart (§9a): парсинг в Rust, здесь — итератор частей ---
+// --- multipart (§9a): parsing happens in Rust; here we expose a part iterator ---
 
-/** Отклонение из Rust ("MULTIPART_REJECT:<status>:<msg>") → HttpError. */
+/** A rejection from Rust ("MULTIPART_REJECT:<status>:<msg>") → HttpError. */
 function mpMapError(e: unknown): unknown {
   const m = /^MULTIPART_REJECT:(\d+):(.*)$/s.exec(messageOf(e));
   return m && m[1] !== undefined ? new HttpError(Number(m[1]), m[2]) : e;
@@ -321,7 +323,7 @@ async function mpReadPart(bodyIo: BodyIo): Promise<Buffer | null> {
   }
 }
 
-/** Собрать объект-часть с потоком/буферизацией. */
+/** Build a part object with streaming/buffering access. */
 function makePart(bodyIo: BodyIo, meta: PartMeta): MultipartPart {
   const collect = async (): Promise<Buffer> => {
     const chunks: Buffer[] = [];
@@ -359,7 +361,7 @@ function makePart(bodyIo: BodyIo, meta: PartMeta): MultipartPart {
   };
 }
 
-/** Async-итератор частей multipart (потоково, §9a). */
+/** Async iterator over multipart parts (streaming, §9a). */
 async function* partsIterator(bodyIo: BodyIo): AsyncGenerator<MultipartPart, void, void> {
   for (;;) {
     const meta = await mpNextPart(bodyIo);
@@ -368,7 +370,7 @@ async function* partsIterator(bodyIo: BodyIo): AsyncGenerator<MultipartPart, voi
   }
 }
 
-/** Заголовки ответа: lowercase, set/append, несколько значений (set-cookie). */
+/** Response headers: lowercase, set/append, multiple values (set-cookie). */
 export class ResHeaders {
   readonly #map = new Map<string, string[]>();
 
@@ -393,7 +395,7 @@ export class ResHeaders {
     this.#map.delete(name.toLowerCase());
     return this;
   }
-  /** Плоский список пар (с повторами) для нативного слоя. */
+  /** Flat list of pairs (duplicates allowed) for the native layer. */
   toPairs(): KvPair[] {
     const out: KvPair[] = [];
     for (const [key, arr] of this.#map) for (const value of arr) out.push({ key, value });
@@ -401,7 +403,7 @@ export class ResHeaders {
   }
 }
 
-/** Разобрать заголовки запроса (Vec<KvPair>, уже lowercase) в map с join дублей. */
+/** Parse request headers (Vec<KvPair>, already lowercase) into a map, joining duplicates. */
 function buildReqHeaders(pairs: KvPair[]): Map<string, string> {
   const map = new Map<string, string>();
   for (const { key, value } of pairs) {
@@ -411,7 +413,7 @@ function buildReqHeaders(pairs: KvPair[]): Map<string, string> {
   return map;
 }
 
-/** Разобрать заголовок Cookie в объект `{ name: value }`. */
+/** Parse the Cookie header into a `{ name: value }` object. */
 export function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   const out: Record<string, string> = Object.create(null) as Record<string, string>;
   if (!cookieHeader) return out;
@@ -425,7 +427,7 @@ export function parseCookies(cookieHeader: string | undefined): Record<string, s
   return out;
 }
 
-/** Сериализовать Set-Cookie (§6d B1). */
+/** Serialize Set-Cookie (§6d B1). */
 export function serializeCookie(name: string, value: string, opts: CookieOptions = {}): string {
   let s = `${name}=${encodeURIComponent(value)}`;
   if (opts.maxAge != null) s += `; Max-Age=${Math.floor(opts.maxAge)}`;
@@ -441,7 +443,7 @@ export function serializeCookie(name: string, value: string, opts: CookieOptions
   return s;
 }
 
-/** Контекстный логгер: структурный JSON в stdout с requestId (§6d B3). */
+/** Contextual logger: structured JSON to stdout carrying requestId (§6d B3). */
 function makeLogger(requestId: string): Logger {
   const emit = (level: string, msg: string, extra?: Record<string, unknown>): void => {
     process.stdout.write(
@@ -459,7 +461,7 @@ function makeLogger(requestId: string): Logger {
 const CT_JSON = 'application/json; charset=utf-8';
 const CT_TEXT = 'text/plain; charset=utf-8';
 
-/** Построить контекст `c` из нативного запроса. */
+/** Build the context `c` from a native request. */
 export function buildContext(
   nreq: NativeRequest,
   bodyIo: BodyIo,
@@ -472,7 +474,7 @@ export function buildContext(
 ): Context {
   const reqHeaders = buildReqHeaders(nreq.headers);
 
-  // Провалидированные в Rust значения (JSON-строки) → объекты для c.req.valid().
+  // Values validated in Rust (JSON strings) → objects for c.req.valid().
   const rustValid: Record<ValidLocation, unknown> = {
     body: nreq.validBody != null ? JSON.parse(nreq.validBody) : undefined,
     query: nreq.validQuery != null ? JSON.parse(nreq.validQuery) : undefined,
@@ -493,10 +495,10 @@ export function buildContext(
 
   let cookies: Record<string, string> | undefined;
 
-  // --- тело запроса (стриминг + буферизация с лимитом/декомпрессией) ---
+  // --- request body (streaming plus buffering with limit/decompression) ---
   let bodyUsed = false;
   const useBody = (): void => {
-    if (bodyUsed) throw new Error('тело запроса уже прочитано');
+    if (bodyUsed) throw new Error('request body has already been read');
     bodyUsed = true;
   };
   const readBuffered = async (): Promise<Buffer> => {
@@ -513,7 +515,7 @@ export function buildContext(
     Object.fromEntries(new URLSearchParams(await text()));
 
   const res: ContextResponse = { status: undefined, headers: new ResHeaders(), sent: false };
-  // request-id пробрасываем в ответ по умолчанию (§6d B2).
+  // request-id is echoed into the response by default (§6d B2).
   res.headers.set(requestIdHeader, nreq.id);
 
   const c: Context = {
@@ -533,9 +535,9 @@ export function buildContext(
       ips: nreq.ips,
       country: nreq.country ?? undefined,
       id: nreq.id,
-      signal: undefined, // AbortSignal (таймаут/дисконнект) — ставит диспетчер
+      signal: undefined, // AbortSignal (timeout/disconnect) — set by the dispatcher
       cookie: (name: string) => (cookies ??= parseCookies(reqHeaders.get('cookie')))[name],
-      // тело
+      // body
       get stream(): ReadableStream<Uint8Array> {
         useBody();
         return makeReqStream(bodyIo);
@@ -544,7 +546,7 @@ export function buildContext(
       text,
       json: async <T = unknown,>(): Promise<T> => JSON.parse(await text()) as T,
       parseBody,
-      // multipart: потоковый итератор частей (§9a)
+      // multipart: streaming iterator over parts (§9a)
       parts(): AsyncGenerator<MultipartPart, void, void> {
         useBody();
         return partsIterator(bodyIo);
@@ -568,7 +570,7 @@ export function buildContext(
         }
         return fd;
       },
-      // валидация (§6b): valibot-transform (_valid) поверх Rust-коэрции (_rustValid)
+      // validation (§6b): the valibot transform (_valid) layered on Rust coercion (_rustValid)
       _rustValid: rustValid,
       _valid: Object.create(null) as Record<string, unknown>,
       valid<T = unknown>(this: ContextRequest, loc: ValidLocation): T {
@@ -577,16 +579,16 @@ export function buildContext(
     },
     res,
     _responseStrip: responseStrip,
-    aborted: false, // true при дисконнекте/таймауте
-    error: undefined, // последняя ошибка (для onError и «после»-хуков)
+    aborted: false, // true on disconnect/timeout
+    error: undefined, // the last error (for onError and the "after" hooks)
     _bodyIo: bodyIo,
     _body: undefined,
     _stream: undefined,
     _finalized: false,
-    _settled: false, // ответ уже зафиксирован → мутаторы игнорируются
+    _settled: false, // the response is already fixed → mutators are ignored
     log: makeLogger(nreq.id),
 
-    // store между middleware/хендлером
+    // store shared between middleware and the handler
     _store: new Map<string, unknown>(),
     set(k: string, v: unknown): Context {
       this._store.set(k, v);
@@ -596,7 +598,7 @@ export function buildContext(
       return this._store.get(k) as T | undefined;
     },
 
-    // мутаторы ответа (после фиксации ответа — no-op: защита от гонки таймаута)
+    // response mutators (no-ops once the response is fixed: guards the timeout race)
     status(n: number): Context {
       if (!this._settled) res.status = n;
       return this;
@@ -610,7 +612,7 @@ export function buildContext(
       return this;
     },
 
-    // финализирующие хелперы
+    // finalizing helpers
     json(v: unknown, status?: number): Context {
       if (this._settled) return this;
       res.headers.set('content-type', CT_JSON);
@@ -633,7 +635,7 @@ export function buildContext(
       if (this._settled) return this;
       if (status != null) res.status = status;
       if (isStreamSource(data)) {
-        this._stream = data; // Buffer/ReadableStream/AsyncIterable → стрим ответа
+        this._stream = data; // Buffer/ReadableStream/AsyncIterable → streamed response
         this._body = undefined;
       } else {
         this._body = data == null ? undefined : String(data);
@@ -653,7 +655,7 @@ export function buildContext(
   return c;
 }
 
-/** Применить возврат-значение хендлера как сахар (string→text, stream→body, else json). */
+/** Apply the handler's return value as sugar (string→text, stream→body, else json). */
 export function applyReturnValue(c: Context, returnValue: unknown): void {
   if (!c._finalized && returnValue != null && returnValue !== c) {
     if (typeof returnValue === 'string') c.text(returnValue);
@@ -662,7 +664,7 @@ export function applyReturnValue(c: Context, returnValue: unknown): void {
   }
 }
 
-/** Свести контекст к нативному JsResponse (запускает pump для стрим-тела). */
+/** Reduce the context to a native JsResponse (starts the pump for a streamed body). */
 export function buildNativeResponse(c: Context): NativeResponse {
   c._settled = true;
   c.res.sent = true;
@@ -671,16 +673,16 @@ export function buildNativeResponse(c: Context): NativeResponse {
     startResponsePump(c._bodyIo, c._stream);
     return { status, headers: c.res.headers.toPairs(), streamed: true };
   }
-  // Стрип ответа по response-схеме: не утечёт то, чего нет в схеме (§6b).
+  // Response stripping by the response schema: nothing outside the schema leaks (§6b).
   const body = stripResponse(c, status);
-  // Ключ `body` ставим только когда тело есть: у нативного типа поле
-  // опциональное, и явный undefined в него не пройдёт (exactOptionalPropertyTypes).
+  // The `body` key is set only when a body exists: the native type declares it optional
+  // and an explicit undefined would not pass (exactOptionalPropertyTypes).
   const out: NativeResponse = { status, headers: c.res.headers.toPairs() };
   if (body !== undefined) out.body = body;
   return out;
 }
 
-/** Отсечь поля верхнего уровня, которых нет в response-схеме для статуса. */
+/** Strip top-level fields absent from the response schema for this status. */
 function stripResponse(c: Context, status: number): string | undefined {
   const strip = c._responseStrip;
   if (!strip || c._body == null) return c._body;

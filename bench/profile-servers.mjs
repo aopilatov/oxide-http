@@ -1,12 +1,13 @@
-// Разбор цены перехода границы по слоям (§17). Каждый вариант — свой процесс.
+// Layer-by-layer breakdown of the boundary-crossing cost (§17). Each variant runs in
+// its own process.
 //
-//   native  — ответ целиком в Rust, JS не будится вообще (базовая линия)
-//   bridge  — RustServer напрямую, колбэк возвращает константу: чистая цена
-//             TSFN + Promise + сборки MatchedRequest, без нашей обёртки
-//   ctx     — bridge + buildContext (контекст `c` собирается, но луковицы нет)
-//   full    — публичный Server со всей обёрткой
+//   native  — answered entirely in Rust, JS never wakes (baseline)
+//   bridge  — RustServer directly, the callback returns a constant: the pure cost of
+//             TSFN + Promise + MatchedRequest construction, without our wrapper
+//   ctx     — bridge + buildContext (the context `c` is built, but there is no onion)
+//   full    — the public Server with the whole wrapper
 //
-// Разности между соседями и дают раскладку.
+// The differences between neighbours give the breakdown.
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -20,7 +21,7 @@ const port = Number(process.argv[3]);
 const PAYLOAD = { hello: 'world', ok: true, n: 42 };
 const BODY = JSON.stringify(PAYLOAD);
 
-/** Минимальные опции для сырого RustServer (обёртка обычно заполняет их сама). */
+/** Minimal options for a raw RustServer (the wrapper normally fills these in). */
 const baseOptions = {
   customIpHeaders: [],
   customCountryHeaders: [],
@@ -30,20 +31,20 @@ const baseOptions = {
 
 const JSON_HEADERS = [{ key: 'content-type', value: 'application/json' }];
 
-// Держим ссылки на серверы: без этого V8 соберёт объект, нативный Drop погасит
-// рантайм и сервер молча умрёт под нагрузкой. Публичный `Server` от этого защищён
-// (колбэк диспетчера захватывает `this`), а сырой `RustServer` — нет.
+// Keep references to the servers: without them V8 collects the object, the native Drop
+// shuts the runtime down and the server dies silently under load. The public `Server` is
+// protected from this (the dispatcher callback captures `this`); a raw `RustServer` is not.
 const alive = [];
 
 const variants = {
-  // JS не будится: путь обслуживается нативной ручкой (§11).
+  // JS never wakes: the path is served by a native endpoint (§11).
   async native() {
     const app = new Server({ health: { path: '/json' } });
     alive.push(app);
     await app.listen({ port, host: '127.0.0.1' });
   },
 
-  // Граница есть, обёртки нет: колбэк сразу отдаёт готовый ответ.
+  // The boundary is there but the wrapper is not: the callback returns a ready response.
   async bridge() {
     const native = new RustServer();
     alive.push(native);
@@ -57,8 +58,8 @@ const variants = {
     );
   },
 
-  // Только ЧТЕНИЕ полей napi-объекта, без всякой логики: отделяет цену доступа
-  // к данным через границу от цены нашего JS-кода.
+  // ONLY reads the napi object's fields, with no logic: separates the cost of accessing
+  // data across the boundary from the cost of our JS code.
   async touch() {
     const native = new RustServer();
     alive.push(native);
@@ -74,13 +75,13 @@ const variants = {
         for (const { key, value } of req.query) sink += key.length + value.length;
         sink += req.method.length + req.path.length + req.ip.length + req.id.length;
         sink += req.ips.length + (req.country ? 1 : 0) + (req.validBody ? 1 : 0);
-        if (sink < 0) throw new Error('недостижимо');
+        if (sink < 0) throw new Error('unreachable');
         return Promise.resolve({ status: 200, headers: JSON_HEADERS, body: BODY });
       },
     );
   },
 
-  // Граница + сборка контекста `c`, но без цепочки middleware/хуков.
+  // The boundary plus building the context `c`, but without the middleware/hook chain.
   async ctx() {
     const native = new RustServer();
     alive.push(native);
@@ -103,7 +104,7 @@ const variants = {
     );
   },
 
-  // Полный публичный путь.
+  // The full public path.
   async full() {
     const app = new Server();
     alive.push(app);
@@ -114,13 +115,13 @@ const variants = {
 
 const start = variants[variant];
 if (!start) {
-  console.error(`неизвестный вариант: ${variant}`);
+  console.error(`unknown variant: ${variant}`);
   process.exit(2);
 }
 await start();
 
-// Загрузка главного потока: показывает, упирается ли вариант в event loop.
-// native должен давать ~0 (JS не будится), путь с JS — приближаться к 1.0.
+// Main-thread utilization: shows whether a variant is bound by the event loop.
+// native should read ~0 (JS never wakes); a JS path should approach 1.0.
 if (process.env.OXIDE_BENCH_ELU) {
   const { performance } = await import('node:perf_hooks');
   let last = performance.eventLoopUtilization();

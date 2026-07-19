@@ -1,43 +1,44 @@
-//! Защита от перегрузки (§6c C5).
+//! Overload protection (§6c C5).
 //!
-//! Лимит одновременно обрабатываемых запросов. Сверх лимита — короткая очередь
-//! (всплеск подождёт слот), а дальше `503 + Retry-After`. При устойчивой перегрузке
-//! дополнительно снимаем readiness: k8s уберёт под из эндпоинтов, и новые соединения
-//! пойдут на другие реплики.
+//! A limit on concurrently handled requests. Above the limit there is a short queue
+//! (a burst waits for a slot), and beyond that `503 + Retry-After`. Under sustained
+//! overload we additionally drop readiness: k8s removes the pod from the endpoints and
+//! new connections go to other replicas.
 //!
-//! Зачем два слоя: обычный Service (kube-proxy) не умеет «отдать запрос другому поду»,
-//! поэтому слой 1 (`503`) нужен всегда — за retry-способным ingress/mesh запрос
-//! переедет без ошибки у клиента. Слой 2 (readiness) действует только на **новые**
-//! соединения, а уже открытое h2-соединение продолжит слать стримы на тот же под —
-//! поэтому для h2 важнее `503` + закрытие соединения (`GOAWAY`).
+//! Why two layers: a plain Service (kube-proxy) cannot "hand the request to another
+//! pod", so layer 1 (`503`) is always needed — behind a retry-capable ingress/mesh the
+//! request moves over without the client seeing an error. Layer 2 (readiness) affects
+//! only **new** connections, while an already open h2 connection keeps sending streams
+//! to the same pod — which is why for h2 the `503` plus closing the connection
+//! (`GOAWAY`) matters more.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, TryAcquireError};
 
-/// Исход попытки занять слот.
+/// Outcome of an attempt to take a slot.
 pub enum Slot {
-    /// Слот получен; пока permit жив, запрос считается «в обработке».
+    /// Slot acquired; while the permit lives the request counts as in flight.
     Acquired(tokio::sync::OwnedSemaphorePermit),
-    /// Мест нет — отдаём `503` и просим повторить через `Retry-After` секунд.
+    /// No room — respond `503` and ask to retry after `Retry-After` seconds.
     Rejected { retry_after: u64 },
 }
 
-/// Ограничитель одновременных запросов.
+/// Concurrent request limiter.
 pub struct Limiter {
     sem: std::sync::Arc<Semaphore>,
-    /// Сколько запросов может ждать слот сверх лимита. 0 = очереди нет.
+    /// How many requests may wait for a slot beyond the limit. 0 = no queue.
     max_queue: usize,
-    /// Сколько ждать в очереди, прежде чем сдаться.
+    /// How long to wait in the queue before giving up.
     queue_timeout: Duration,
-    /// Текущая длина очереди (Semaphore не отдаёт число ожидающих).
+    /// Current queue depth (Semaphore does not expose the number of waiters).
     queued: AtomicU64,
-    /// Значение `Retry-After` в секундах.
+    /// `Retry-After` value in seconds.
     retry_after: u64,
-    /// Насколько долгая непрерывная перегрузка снимает readiness. None = не снимать.
+    /// How long continuous overload must last before readiness drops. None = never.
     shed_after: Option<Duration>,
-    /// Начало текущей полосы перегрузки, мс от `base`. 0 = перегрузки нет.
+    /// Start of the current overload streak, ms since `base`. 0 = no overload.
     saturated_since_ms: AtomicU64,
     base: Instant,
 }
@@ -62,9 +63,9 @@ impl Limiter {
         }
     }
 
-    /// Занять слот: сразу, через очередь либо отказ.
+    /// Take a slot: immediately, via the queue, or refuse.
     pub async fn acquire(&self) -> Slot {
-        // Быстрый путь: слот свободен — заодно сбрасываем полосу перегрузки.
+        // Fast path: a slot is free — this also clears the overload streak.
         match self.sem.clone().try_acquire_owned() {
             Ok(permit) => {
                 self.clear_saturation();
@@ -86,8 +87,8 @@ impl Limiter {
             };
         }
 
-        // Очередь ограничена: иначе под перегрузкой она вырастет в неограниченный
-        // буфер, и клиенты будут ждать ответа, который уже никому не нужен.
+        // The queue is bounded: otherwise under load it grows into an unbounded buffer
+        // and clients wait for a response nobody needs anymore.
         let depth = self.queued.fetch_add(1, Ordering::Relaxed);
         if depth as usize >= self.max_queue {
             self.queued.fetch_sub(1, Ordering::Relaxed);
@@ -108,7 +109,7 @@ impl Limiter {
         }
     }
 
-    /// Держится ли перегрузка достаточно долго, чтобы снимать readiness.
+    /// Whether overload has lasted long enough to drop readiness.
     pub fn should_shed(&self) -> bool {
         let Some(threshold) = self.shed_after else {
             return false;
@@ -121,11 +122,11 @@ impl Limiter {
         Duration::from_millis(now.saturating_sub(since)) >= threshold
     }
 
-    /// Отметить начало полосы перегрузки (если она ещё не идёт).
+    /// Mark the start of an overload streak (if one is not running already).
     fn mark_saturated(&self) {
         let now = self.base.elapsed().as_millis() as u64;
-        // Только первый отказ в полосе задаёт точку отсчёта; max(1) — чтобы
-        // не спутать «началось на нулевой миллисекунде» с «перегрузки нет».
+        // Only the first refusal in a streak sets the origin; max(1) avoids confusing
+        // "started at millisecond zero" with "no overload".
         let _ = self.saturated_since_ms.compare_exchange(
             0,
             now.max(1),
@@ -134,7 +135,7 @@ impl Limiter {
         );
     }
 
-    /// Слот нашёлся сразу — перегрузка кончилась.
+    /// A slot was free right away — the overload is over.
     fn clear_saturation(&self) {
         self.saturated_since_ms.store(0, Ordering::Relaxed);
     }
@@ -150,7 +151,7 @@ mod tests {
         let l = Limiter::new(1, 0, Duration::from_millis(50), 1, None);
         let first = l.acquire().await;
         assert!(matches!(first, Slot::Acquired(_)));
-        // Слот занят, очереди нет → отказ сразу.
+        // Slot taken, no queue → refuse immediately.
         assert!(matches!(l.acquire().await, Slot::Rejected { .. }));
         drop(first);
         assert!(matches!(l.acquire().await, Slot::Acquired(_)));
@@ -164,7 +165,7 @@ mod tests {
         let l2 = l.clone();
         let waiter = tokio::spawn(async move { l2.acquire().await });
 
-        // Освобождаем слот — ожидающий должен его получить, а не получить отказ.
+        // Free the slot — the waiter should get it instead of a refusal.
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(held);
         assert!(matches!(waiter.await.unwrap(), Slot::Acquired(_)));
@@ -176,7 +177,7 @@ mod tests {
         let _held = l.acquire().await;
         match l.acquire().await {
             Slot::Rejected { retry_after } => assert_eq!(retry_after, 3),
-            Slot::Acquired(_) => panic!("ожидался отказ по таймауту очереди"),
+            Slot::Acquired(_) => panic!("expected refusal on queue timeout"),
         }
     }
 
@@ -192,16 +193,13 @@ mod tests {
         let held = l.acquire().await;
 
         assert!(matches!(l.acquire().await, Slot::Rejected { .. }));
-        assert!(
-            !l.should_shed(),
-            "мгновенный всплеск не должен снимать readiness"
-        );
+        assert!(!l.should_shed(), "an instant burst must not drop readiness");
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(matches!(l.acquire().await, Slot::Rejected { .. }));
-        assert!(l.should_shed(), "устойчивая перегрузка снимает readiness");
+        assert!(l.should_shed(), "sustained overload drops readiness");
 
-        // Освободился слот — полоса перегрузки закончилась.
+        // A slot freed up — the overload streak has ended.
         drop(held);
         assert!(matches!(l.acquire().await, Slot::Acquired(_)));
         assert!(!l.should_shed());

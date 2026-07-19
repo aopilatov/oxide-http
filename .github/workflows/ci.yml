@@ -1,9 +1,9 @@
-# Сборка, проверки и публикация prebuild-артефактов (M13).
+# Build, checks and publication of prebuilt artifacts.
 #
-# build  — .node под каждую платформу, кладётся артефактом;
-# test   — JS-тесты на всех LTS Node поверх собранного бинарника;
-# images — установка в чистые образы (Ubuntu/UBI/Alpine) без Rust-тулчейна;
-# publish — platform-пакеты и npm-релиз по git-тегу.
+# build   — a .node per platform, uploaded as an artifact;
+# test    — JS tests on every LTS Node against the built binary;
+# images  — installation into clean images (Ubuntu/UBI/Alpine) without a Rust toolchain;
+# publish — platform packages and the npm release on a git tag.
 name: CI
 
 on:
@@ -21,7 +21,7 @@ env:
 
 jobs:
   lint:
-    name: Проверки (clippy, fmt, типы)
+    name: Checks (clippy, fmt, types)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,44 +38,44 @@ jobs:
         run: cargo clippy -- -D warnings
       - name: cargo test
         run: cargo test
-      - name: Типы (библиотека и тесты)
+      - name: Types (library and tests)
         run: npm run typecheck
 
   build:
-    name: Сборка ${{ matrix.target }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # glibc-сборки идут в docker-образе napi-rs с baseline glibc 2.17
-          # (manylinux2014): бинарник заводится и на старых дистрибутивах.
+          # glibc builds run in the napi-rs docker image with a glibc 2.17 baseline
+          # (manylinux2014): the binary then also loads on older distributions.
           - target: x86_64-unknown-linux-gnu
             host: ubuntu-latest
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
-          # Образ lts-debian существует ТОЛЬКО под amd64, поэтому arm64-цель
-          # собираем кросс-компиляцией на amd64-раннере в специальном образе
-          # lts-debian-aarch64 (он сам x86_64, но несёт rust-таргет aarch64).
-          # Запуск lts-debian на arm-раннере даёт `exec format error`.
+          # The lts-debian image exists ONLY for amd64, so the arm64 target is
+          # cross-compiled on an amd64 runner inside the dedicated lts-debian-aarch64
+          # image (itself x86_64, but carrying the aarch64 rust target).
+          # Running lts-debian on an arm runner yields `exec format error`.
           - target: aarch64-unknown-linux-gnu
             host: ubuntu-latest
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64
-          # musl — отдельные бинарники: libc аддона обязана совпадать с libc Node.
+          # musl needs separate binaries: the addon's libc must match Node's libc.
           - target: x86_64-unknown-linux-musl
             host: ubuntu-latest
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
             artifact: oxide-http.linux-x64-musl.node
-          # А вот lts-alpine мультиархитектурный (amd64 + arm64), поэтому
-          # arm64-musl собирается нативно на arm-раннере.
+          # lts-alpine, in contrast, is multi-arch (amd64 + arm64), so arm64-musl is
+          # built natively on an arm runner.
           - target: aarch64-unknown-linux-musl
             host: ubuntu-24.04-arm
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
             artifact: oxide-http.linux-arm64-musl.node
           - target: aarch64-apple-darwin
             host: macos-latest
-          # Раннеров macos-13 (Intel) у GitHub больше нет — x64-бинарник
-          # кросс-компилируем с arm64-раннера: Apple-тулчейн поддерживает
-          # обе цели одним SDK.
+          # GitHub no longer offers macos-13 (Intel) runners — the x64 binary is
+          # cross-compiled from an arm64 runner: the Apple toolchain supports both
+          # targets with a single SDK.
           - target: x86_64-apple-darwin
             host: macos-latest
 
@@ -92,44 +92,44 @@ jobs:
 
       - run: npm ci
 
-      - name: Сборка (docker, glibc)
+      - name: Build (docker, glibc)
         if: ${{ matrix.docker && !contains(matrix.target, 'musl') }}
         run: |
-          # rustup target add обязателен: в образе таргет установлен для его
-          # дефолтного toolchain, а наш rust-toolchain.toml пинит конкретную
-          # версию — rustup переключается на неё, и таргета там уже нет
+          # rustup target add is mandatory: the image installs the target for its
+          # default toolchain, while our rust-toolchain.toml pins a specific version —
+          # rustup switches to it and that toolchain lacks the target
           # (error[E0463]: can't find crate for `core`).
           docker run --rm -v "$PWD":/build -w /build ${{ matrix.docker }} \
             bash -lc "rustup target add ${{ matrix.target }} \
               && npm ci --no-audit --no-fund \
               && npx napi build --platform --release --target ${{ matrix.target }}"
 
-      # musl-образ napi-rs несёт Node 18, а napi CLI 3.x требует Node 20+
-      # (@inquirer/core тянет styleText из node:util). Обходим CLI и зовём cargo
-      # напрямую: в этом образе musl и так нативная цель, остаётся переименовать
-      # артефакт по конвенции napi. index.js/index.d.ts уже сгенерированы.
-      - name: Сборка (docker, musl)
+      # The napi-rs musl image ships Node 18 while napi CLI 3.x requires Node 20+
+      # (@inquirer/core pulls styleText from node:util). We bypass the CLI and call cargo
+      # directly: musl is the native target in that image anyway, so all that remains is
+      # renaming the artifact per napi's convention. index.js/index.d.ts already exist.
+      - name: Build (docker, musl)
         if: ${{ matrix.docker && contains(matrix.target, 'musl') }}
         run: |
           docker run --rm -v "$PWD":/build -w /build ${{ matrix.docker }} \
             sh -lc "cargo build --release && cp target/release/liboxide_http.so ${{ matrix.artifact }}"
 
-      - name: Сборка (нативно)
+      - name: Build (native)
         if: ${{ !matrix.docker }}
         run: |
-          # Явный target add — по той же причине, что и в docker-сборке:
-          # rust-toolchain.toml пинит версию, и таргет, добавленный экшеном
-          # для stable, в ней отсутствует. Для хостового таргета это no-op.
+          # An explicit target add for the same reason as in the docker build:
+          # rust-toolchain.toml pins a version, and the target the action installed for
+          # stable is missing there. For the host target this is a no-op.
           rustup target add ${{ matrix.target }}
           npx napi build --platform --release --target ${{ matrix.target }}
 
-      # index.js/index.d.ts лежат в репозитории (их нужно иметь без сборки).
-      # Здесь убеждаемся, что закоммиченные версии не разошлись с Rust-исходниками.
-      - name: Сгенерированные index.js/index.d.ts не устарели
+      # index.js/index.d.ts live in the repository (they must be available without a
+      # build). Here we make sure the committed versions match the Rust sources.
+      - name: Generated index.js/index.d.ts are up to date
         if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
         run: |
           git diff --exit-code -- index.js index.d.ts || {
-            echo '::error::index.js/index.d.ts разошлись с Rust-исходниками — пересоберите (npm run build) и закоммитьте'
+            echo '::error::index.js/index.d.ts drifted from the Rust sources — rebuild (npm run build) and commit'
             exit 1
           }
 
@@ -140,7 +140,7 @@ jobs:
           if-no-files-found: error
 
   test:
-    name: Тесты Node ${{ matrix.node }}
+    name: Tests on Node ${{ matrix.node }}
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -155,20 +155,20 @@ jobs:
         with: { name: bindings-x86_64-unknown-linux-gnu, path: . }
       - run: npm ci
 
-      # Полный набор гоняется там, где Node исполняет .ts напрямую (22+).
-      - name: Полный набор тестов
+      # The full suite runs where Node executes .ts directly (22+).
+      - name: Full test suite
         if: ${{ matrix.node >= 22 }}
         run: npm test
 
-      # На 18/20 проверяем главное — что опубликованный артефакт (CJS + .node)
-      # работает на этой версии ABI. Набор на .ts там не запустится.
-      - name: Smoke собранного пакета
+      # On 18/20 we check the essential part — that the published artifact (CJS + .node)
+      # works on that ABI version. The .ts suite cannot run there.
+      - name: Smoke test of the built package
         run: |
           npm run build:ts
           node scripts/smoke.cjs
 
   images:
-    name: Установка в ${{ matrix.image }}
+    name: Install into ${{ matrix.image }}
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -187,11 +187,11 @@ jobs:
         with: { name: 'bindings-x86_64-unknown-linux-${{ matrix.libc }}', path: . }
       - run: npm ci && npm run build:ts
 
-      - name: Загрузка аддона без Rust-тулчейна
+      - name: Load the addon without a Rust toolchain
         run: docker build -f ${{ matrix.dockerfile }} -t oxide-smoke:${{ matrix.libc }} .
 
   publish:
-    name: Публикация
+    name: Publish
     needs: [lint, build, test, images]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -207,38 +207,38 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { path: artifacts }
 
-      - name: Разложить бинарники по platform-пакетам
+      - name: Distribute binaries into the platform packages
         run: |
           find artifacts -name '*.node' -exec mv {} . \;
           ls -la *.node
           npx napi create-npm-dirs
           npx napi artifacts
 
-      - name: Собрать TypeScript
+      - name: Build TypeScript
         run: npm run build:ts
 
-      # Проверки — строго ДО первой публикации: npm-релиз необратим,
-      # неверную версию уже не отозвать (можно только deprecate).
-      - name: Тег должен совпадать с версией в package.json
+      # Checks run strictly BEFORE the first publish: an npm release is irreversible,
+      # a wrong version cannot be recalled (only deprecated).
+      - name: The tag must match the version in package.json
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           PKG=$(node -p "require('./package.json').version")
-          test "$TAG" = "$PKG" || { echo "тег $TAG ≠ версия $PKG"; exit 1; }
+          test "$TAG" = "$PKG" || { echo "tag $TAG != version $PKG"; exit 1; }
 
-      - name: Smoke перед публикацией
+      - name: Smoke test before publishing
         run: node scripts/smoke.cjs
 
-      - name: Публикация platform-пакетов
+      - name: Publish the platform packages
         run: |
-          # Каждый platform-пакет публикуется отдельно; корневой тянет их через
-          # optionalDependencies, поэтому они обязаны быть в реестре раньше него.
+          # Every platform package is published separately; the root package pulls them
+          # via optionalDependencies, so they must reach the registry first.
           for dir in npm/*/; do
             npm publish "$dir" --access public --provenance
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Публикация корневого пакета
+      - name: Publish the root package
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
