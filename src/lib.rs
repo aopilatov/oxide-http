@@ -6,8 +6,10 @@
 mod bridge;
 mod cors;
 mod cpu;
+mod health;
 mod idle;
 mod listener;
+mod metrics;
 mod multipart;
 mod proxy_protocol;
 mod router;
@@ -113,6 +115,9 @@ pub struct ListenOptions {
     pub max_header_size: Option<i64>,
     /// Дедлайн graceful shutdown в мс (§10). По умолчанию 10с.
     pub shutdown_timeout: Option<i64>,
+    /// Пауза между снятием readiness и закрытием listener'а в мс (§10 + §11).
+    /// Даёт балансировщику убрать под из эндпоинтов до отказа в соединениях.
+    pub pre_shutdown_delay: Option<i64>,
     /// Путь Unix-сокета (§6c B9). Задан → слушаем его, `port`/`host` игнорируются.
     pub unix_path: Option<String>,
     /// Глубина accept-очереди (§6c B9). По умолчанию 1024.
@@ -127,6 +132,16 @@ pub struct ListenOptions {
     pub proxy_protocol: Option<bool>,
     /// Число tokio-воркеров; `0`/отсутствие = авто по cgroup-квоте (§6c A3).
     pub worker_threads: Option<i64>,
+    /// Путь liveness-пробы (§11). Пустая строка = выключить.
+    pub health_path: Option<String>,
+    /// Путь readiness-пробы (§11). Пустая строка = выключить.
+    pub ready_path: Option<String>,
+    /// Путь метрик Prometheus (§11). Пустая строка = выключить.
+    pub metrics_path: Option<String>,
+    /// Отдельный порт для проб/метрик (§11); задан → на основном порту их нет.
+    pub admin_port: Option<u16>,
+    /// JSON access-log в stdout (§11).
+    pub access_log: Option<bool>,
     pub http2: Option<Http2Options>,
 }
 
@@ -141,11 +156,15 @@ struct Running {
     runtime: Runtime,
     /// Broadcast сигнала остановки: его слушают и accept-цикл, и каждое соединение
     /// (`watch`, а не `Notify`: нужно разбудить всех, включая ещё не подписавшихся).
-    shutdown: watch::Sender<bool>,
+    shutdown: watch::Sender<u8>,
     /// Сигнал «drain завершён» от accept-цикла.
     done: Arc<Notify>,
+    /// Общее состояние — нужно, чтобы JS мог менять readiness на лету (§11).
+    shared: Arc<Shared>,
     /// Дедлайн drain'а + запас: страховка, если сигнал `done` не придёт вовсе.
     close_deadline: std::time::Duration,
+    /// Пауза между снятием readiness и закрытием listener'а (§10 + §11).
+    pre_shutdown_delay: std::time::Duration,
 }
 
 /// Низкоуровневый сервер. Оборачивается JS-классом `Server`.
@@ -244,6 +263,16 @@ impl RustServer {
                 .filter(|&n| n > 0)
                 .map(|n| n as usize),
             proxy_protocol: options.proxy_protocol.unwrap_or(false),
+            health_paths: {
+                let d = crate::health::HealthPaths::default();
+                crate::health::HealthPaths {
+                    health: options.health_path.unwrap_or(d.health),
+                    ready: options.ready_path.unwrap_or(d.ready),
+                    metrics: options.metrics_path.unwrap_or(d.metrics),
+                }
+            },
+            admin_port: options.admin_port,
+            access_log: options.access_log.unwrap_or(false),
             h2c: options.h2c.unwrap_or(false),
             header_read_timeout: ms(options.header_read_timeout),
             body_read_timeout: ms(options.body_read_timeout),
@@ -287,6 +316,16 @@ impl RustServer {
             ),
         };
 
+        // Admin-порт (§11) биндим тоже синхронно: занятый порт метрик должен
+        // валить listen(), а не всплывать позже молчаливым отсутствием проб.
+        let admin_target = match tuning.admin_port {
+            Some(p) => Some(
+                listener::bind_tcp(&host, p, &tuning.socket)
+                    .map_err(|e| napi::Error::from_reason(format!("bind admin {host}:{p}: {e}")))?,
+            ),
+            None => None,
+        };
+
         // Воркеры: явное число, иначе авто по cgroup-квоте (§6c A3) — в контейнере
         // число ядер ноды сильно больше реального лимита пода.
         let workers = match options.worker_threads.filter(|&n| n > 0) {
@@ -322,10 +361,26 @@ impl RustServer {
             schemas,
             multipart: mp_slots,
             tuning,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            readiness: crate::health::Readiness::default(),
         });
-        let (shutdown, shutdown_rx) = watch::channel(false);
+        let pre_shutdown_delay = ms(options.pre_shutdown_delay).unwrap_or_default();
+        let (shutdown, shutdown_rx) = watch::channel(crate::server::RUNNING);
         let done = Arc::new(Notify::new());
         let done_srv = done.clone();
+
+        // Readiness держим и на JS-стороне (setReady/setReadinessCheck).
+        let readiness_handle = shared.clone();
+
+        if let Some(admin) = admin_target {
+            let admin_shared = shared.clone();
+            let admin_shutdown = shutdown.subscribe();
+            runtime.spawn(async move {
+                if let Ok(l) = tokio::net::TcpListener::from_std(admin) {
+                    crate::server::serve_admin(l, admin_shared, admin_shutdown).await;
+                }
+            });
+        }
         // Регистрация сокета в реакторе — уже внутри рантайма (from_std требует его).
         runtime.spawn(async move {
             let bound = match listen_target {
@@ -343,8 +398,21 @@ impl RustServer {
             runtime,
             shutdown,
             done,
+            shared: readiness_handle,
             close_deadline: shutdown_timeout + std::time::Duration::from_secs(1),
+            pre_shutdown_delay,
         });
+        Ok(())
+    }
+
+    /// Выставить readiness из JS (§11): `app.setReady(false)` снимает под с эндпоинтов,
+    /// не трогая liveness. Периодический `readinessCheck` пушит сюда же свой результат.
+    /// До `listen()` — no-op (состояния ещё нет).
+    #[napi]
+    pub fn set_ready(&self, ready: bool) -> Result<()> {
+        if let Some(running) = self.state.lock().unwrap().as_ref() {
+            running.shared.readiness.set_js_ready(ready);
+        }
         Ok(())
     }
 
@@ -364,8 +432,18 @@ impl RustServer {
         let Some(running) = self.state.lock().unwrap().take() else {
             return Ok(());
         };
+        // Стадия 1: снимаем readiness, но продолжаем принимать. Балансировщику нужно
+        // время заметить `/readyz` 503 и увести трафик; закрой мы listener сразу —
+        // запросы, уже направленные на этот под, получили бы connection refused.
+        running.shared.readiness.set_draining(true);
+        if !running.pre_shutdown_delay.is_zero() {
+            let _ = running.shutdown.send(crate::server::PRE_SHUTDOWN);
+            tokio::time::sleep(running.pre_shutdown_delay).await;
+        }
+
+        // Стадия 2: перестаём принимать и просим соединения закрыться.
         // Ошибку send игнорируем: получателей может уже не быть (accept-цикл упал).
-        let _ = running.shutdown.send(true);
+        let _ = running.shutdown.send(crate::server::CLOSING);
 
         // Ждём drain. Свой дедлайн — на случай, если сигнал `done` не придёт вовсе
         // (паника в accept-цикле): close() не должен зависнуть навсегда.

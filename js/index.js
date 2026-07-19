@@ -98,6 +98,8 @@ class Server {
   #closing = null; // Promise текущего close() — делает close() идемпотентным
   #signalCleanup = null;
   #handleSignals;
+  #ready = true;
+  #readinessTimer = null;
 
   constructor(config = {}) {
     this.#baseUrl = normalizeBase(config.baseUrl);
@@ -131,6 +133,11 @@ class Server {
     if (config.shutdownTimeout != null) {
       this.#options.shutdownTimeout = parseDuration(config.shutdownTimeout);
     }
+    // Пауза «readiness снят, но ещё принимаем» — под k8s ставить 5–15с, чтобы
+    // балансировщик успел увести трафик до отказа в соединениях (§10 + §11).
+    if (config.preShutdownDelay != null) {
+      this.#options.preShutdownDelay = parseDuration(config.preShutdownDelay);
+    }
     // Socket-опции (§6c B9) и PROXY protocol (A4).
     if (config.backlog != null) this.#options.backlog = config.backlog;
     if (config.reusePort != null) this.#options.reusePort = !!config.reusePort;
@@ -143,6 +150,15 @@ class Server {
     } else if (config.workerThreads != null && config.workerThreads !== 'auto') {
       throw new TypeError("workerThreads: число либо 'auto'");
     }
+    // Пробы, метрики, access-log (§11). Пустая строка в пути = ручка выключена.
+    if (config.health) {
+      const h = config.health;
+      if (h.path != null) this.#options.healthPath = h.path;
+      if (h.readyPath != null) this.#options.readyPath = h.readyPath;
+      if (h.metricsPath != null) this.#options.metricsPath = h.metricsPath;
+      if (h.port != null) this.#options.adminPort = h.port;
+    }
+    if (config.accessLog != null) this.#options.accessLog = !!config.accessLog;
     // SIGTERM/SIGINT → graceful shutdown (§10). Выключается { handleSignals: false }
     // — например когда процессом уже управляет внешний супервизор.
     this.#handleSignals = config.handleSignals !== false;
@@ -333,6 +349,9 @@ class Server {
     if (this.#closing) return this.#closing;
     this.#closing = (async () => {
       this.#events.emit('shutdown');
+      // Readiness снимается в Rust в начале drain'а; здесь гасим свой таймер,
+      // чтобы он не перевыставил флаг обратно посреди остановки.
+      this.#stopReadinessCheck();
       await this.#native.close();
       this.#listening = false;
       this.#removeSignalHandlers();
@@ -343,6 +362,50 @@ class Server {
 
   get listening() {
     return this.#listening;
+  }
+
+  /** Ручной readiness (§11): `false` → `/readyz` отдаёт 503, liveness не трогаем. */
+  setReady(ready) {
+    this.#ready = !!ready;
+    this.#native.setReady(this.#ready);
+    return this;
+  }
+
+  /** Периодическая проверка готовности (§11): БД, очередь, прогрев кеша.
+   *
+   *  Колбэк крутится по таймеру на JS-стороне и пушит результат в Rust, а `/readyz`
+   *  отвечает мгновенно из атомика. Иначе каждая проба k8s (раз в секунду на под)
+   *  будила бы event loop — ровно то, чего пробы в Rust и должны избегать.
+   *  Ошибка/таймаут колбэка трактуются как «не готов». */
+  setReadinessCheck(fn, { interval = 2000, timeout = 1000 } = {}) {
+    if (typeof fn !== 'function') throw new TypeError('setReadinessCheck: нужна функция');
+    this.#stopReadinessCheck();
+
+    const tick = async () => {
+      let ok = false;
+      try {
+        const verdict = await Promise.race([
+          Promise.resolve(fn()),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), timeout)),
+        ]);
+        ok = verdict !== false; // undefined/любое не-false = готов
+      } catch {
+        ok = false; // упал или не уложился — считаем неготовым
+      }
+      if (this.#readinessTimer) this.setReady(ok);
+    };
+
+    this.#readinessTimer = setInterval(tick, interval);
+    // Таймер не должен держать процесс живым сам по себе.
+    this.#readinessTimer.unref?.();
+    void tick(); // первый прогон сразу, не ждём интервал
+    return this;
+  }
+
+  #stopReadinessCheck() {
+    if (!this.#readinessTimer) return;
+    clearInterval(this.#readinessTimer);
+    this.#readinessTimer = null;
   }
 
   /** SIGTERM/SIGINT → graceful shutdown → exit 0 (k8s: §10). */

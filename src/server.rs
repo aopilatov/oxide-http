@@ -27,8 +27,10 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
 use crate::cors::Cors;
+use crate::health::{HealthPaths, Readiness};
 use crate::idle::{watch_idle, Activity, ActivityIo};
 use crate::listener::{Bound, SocketOptions};
+use crate::metrics::Metrics;
 use crate::proxy_protocol;
 use crate::router::Routes;
 use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
@@ -50,6 +52,12 @@ pub struct Tuning {
     pub max_connections: Option<usize>,
     /// Ждать PROXY-префикс на каждом соединении (§6c A4).
     pub proxy_protocol: bool,
+    /// Пути проб и метрик (§11); пустая строка = ручка выключена.
+    pub health_paths: HealthPaths,
+    /// Отдельный порт для проб/метрик (§11). Some → на основном порту их нет.
+    pub admin_port: Option<u16>,
+    /// Печатать access-log в stdout строкой JSON (§11).
+    pub access_log: bool,
     pub handshake_timeout: Duration,
     pub max_headers: Option<usize>,
     /// Предел размера блока заголовков; превышение → 431 (§6c B10).
@@ -83,6 +91,10 @@ pub struct Shared {
     pub multipart: Vec<Option<crate::multipart::MultipartConfig>>,
     /// Протокол/TLS/таймауты.
     pub tuning: Tuning,
+    /// Счётчики Prometheus (§11). Arc — задачам чтения тела нужен 'static-клон.
+    pub metrics: Arc<Metrics>,
+    /// Состояние готовности (§11): shutdown/перегрузка/флаг из JS.
+    pub readiness: Readiness,
 }
 
 /// Auto-билдер (h1 + h2 через ALPN/preface) с настройками таймаутов и h2.
@@ -136,15 +148,34 @@ fn build_h1(t: &Tuning) -> http1::Builder {
     b
 }
 
+/// Стадии остановки (§10 + §11). Соединения реагируют только на `CLOSING`.
+pub const RUNNING: u8 = 0;
+/// Readiness снят, но listener ещё принимает: ждём, пока балансировщик уберёт под.
+pub const PRE_SHUTDOWN: u8 = 1;
+/// Перестаём принимать и просим соединения закрыться.
+pub const CLOSING: u8 = 2;
+
+/// Дождаться стадии `CLOSING` (промежуточный `PRE_SHUTDOWN` игнорируем).
+async fn wait_closing(rx: &mut watch::Receiver<u8>) {
+    loop {
+        if *rx.borrow_and_update() >= CLOSING {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return; // отправитель ушёл — считаем это командой закрыться
+        }
+    }
+}
+
 /// Обслужить соединение до конца, реагируя на idle-таймаут и graceful shutdown.
 ///
 /// - истёк idle → future дропается, сокет закрывается;
-/// - пришёл shutdown → `graceful_shutdown()` (для h2 это `GOAWAY`, для h1 — дожать
+/// - пришёл `CLOSING` → `graceful_shutdown()` (для h2 это `GOAWAY`, для h1 — дожать
 ///   текущий запрос и не брать следующий по keep-alive), затем ждём завершения.
 async fn drive<C: GracefulConnection>(
     conn: C,
     idle: Option<(Activity, Duration)>,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<u8>,
 ) {
     tokio::pin!(conn);
     let idle_wait = async {
@@ -159,7 +190,7 @@ async fn drive<C: GracefulConnection>(
     tokio::select! {
         _ = conn.as_mut() => return,
         _ = &mut idle_wait => return,
-        _ = shutdown.changed() => {}
+        _ = wait_closing(&mut shutdown) => {}
     }
 
     // Фаза graceful: просим соединение закрыться и даём ему дожать текущий запрос.
@@ -179,7 +210,7 @@ async fn drive<C: GracefulConnection>(
 pub async fn serve(
     listener: Bound,
     shared: Arc<Shared>,
-    shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<u8>,
     done: Arc<Notify>,
 ) {
     // Билдеры собираем один раз, шарим в задачи через Arc (serve_connection(&self)).
@@ -195,8 +226,10 @@ pub async fn serve(
 
     loop {
         // accept для обоих типов сокета: Unix-пир анонимен, адрес берём условный.
+        // PRE_SHUTDOWN не прерывает приём: в этом окне readiness уже снят, но под
+        // ещё обслуживает трафик, который балансировщик не успел перенаправить.
         let accepted = tokio::select! {
-            _ = shutdown_acc.changed() => break,
+            _ = wait_closing(&mut shutdown_acc) => break,
             a = accept_any(&listener) => a,
         };
         let (stream, peer_ip) = match accepted {
@@ -282,7 +315,7 @@ struct ConnCtx {
     shared: Arc<Shared>,
     auto_builder: Arc<auto::Builder<TokioExecutor>>,
     h1_builder: Arc<http1::Builder>,
-    shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<u8>,
     live: Arc<AtomicUsize>,
 }
 
@@ -294,6 +327,8 @@ where
     // Счётчик живых соединений отпускаем в любом случае (в т.ч. при раннем return).
     let _live = LiveGuard(ctx.live);
     let shared = ctx.shared;
+    shared.metrics.conn_opened();
+    let _conn_metric = ConnMetricGuard(shared.clone());
     let tuning = &shared.tuning;
 
     // PROXY protocol (§6c A4) — строго до TLS: префикс идёт «сырым» перед хендшейком.
@@ -372,6 +407,50 @@ impl Drop for LiveGuard {
     }
 }
 
+/// Снимает соединение с гейджа метрик на Drop.
+struct ConnMetricGuard(Arc<Shared>);
+
+impl Drop for ConnMetricGuard {
+    fn drop(&mut self) {
+        self.0.metrics.conn_closed();
+    }
+}
+
+/// Отдельный порт для проб и метрик (§11): только h1, только admin-пути.
+///
+/// Смысл разделения — не светить `/metrics` наружу: основной порт публикуется через
+/// Service/Ingress, admin-порт остаётся внутри кластера для Prometheus и kubelet.
+pub async fn serve_admin(
+    listener: tokio::net::TcpListener,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<u8>,
+) {
+    let builder = Arc::new(http1::Builder::new());
+    loop {
+        let accepted = tokio::select! {
+            _ = wait_closing(&mut shutdown) => break,
+            a = listener.accept() => a,
+        };
+        let Ok((stream, _)) = accepted else { continue };
+        let shared = shared.clone();
+        let builder = builder.clone();
+        tokio::spawn(async move {
+            let service = service_fn(move |req: Request<Incoming>| {
+                let shared = shared.clone();
+                async move {
+                    let method = req.method().as_str().to_uppercase();
+                    let res = admin_response(&shared, &method, req.uri().path())
+                        .unwrap_or_else(|| status_text(404, "Not Found"));
+                    Ok::<_, Infallible>(res)
+                }
+            });
+            let _ = builder
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
 /// Общие для запроса данные (вычислены один раз, затем перемещаются в диспетч).
 struct ReqData {
     method: String,
@@ -384,9 +463,117 @@ struct ReqData {
 /// Один запрос. Края в Rust (CORS preflight, body-limit) → роутинг/диспетч →
 /// навешивание CORS-заголовков на итоговый ответ.
 async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) -> Response<ResBody> {
+    let started = std::time::Instant::now();
+    let method_for_metrics = req.method().as_str().to_uppercase();
+    let path_for_log = req.uri().path().to_string();
+
+    shared.metrics.request_started();
+    let response = handle_inner(req, &shared, peer_ip).await;
+
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+    shared
+        .metrics
+        .request_finished(&method_for_metrics, status, elapsed);
+    if shared.tuning.access_log {
+        access_log(&method_for_metrics, &path_for_log, status, elapsed);
+    }
+    response
+}
+
+/// Пробы и метрики (§11). `None` — путь не наш, обрабатываем как обычный запрос.
+///
+/// Отвечаем целиком в Rust: k8s дёргает пробы раз в секунду, будить ради этого JS
+/// незачем. `/readyz` отдаёт 503 при drain'е/перегрузке — k8s снимает под с эндпоинтов.
+fn admin_response(shared: &Shared, method: &str, path: &str) -> Option<Response<ResBody>> {
+    if method != "GET" && method != "HEAD" {
+        return None;
+    }
+    let p = &shared.tuning.health_paths;
+
+    if !p.health.is_empty() && path == p.health {
+        return Some(builder_or_500(
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("cache-control", "no-store"),
+            full("ok"),
+        ));
+    }
+
+    if !p.ready.is_empty() && path == p.ready {
+        let ready = shared.readiness.is_ready();
+        return Some(builder_or_500(
+            Response::builder()
+                .status(if ready { 200 } else { 503 })
+                .header("content-type", "text/plain; charset=utf-8")
+                .header("cache-control", "no-store"),
+            full(shared.readiness.reason()),
+        ));
+    }
+
+    if !p.metrics.is_empty() && path == p.metrics {
+        return Some(builder_or_500(
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                .header("cache-control", "no-store"),
+            full_owned(shared.metrics.encode()),
+        ));
+    }
+
+    None
+}
+
+/// Строка access-log в stdout: одна JSON-строка на запрос (§11).
+///
+/// Пишем из Rust, чтобы не будить JS ради лога. Поля вручную, без serde:
+/// экранировать нужно только путь (метод и числа безопасны по построению).
+fn access_log(method: &str, path: &str, status: u16, elapsed: std::time::Duration) {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    println!(
+        r#"{{"level":"info","msg":"request","method":"{}","path":"{}","status":{},"durationMs":{:.3}}}"#,
+        method,
+        escape_json(path),
+        status,
+        ms
+    );
+}
+
+/// Минимальное экранирование строки для JSON-лога.
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Тело обработки запроса (без метрик/лога — их навешивает `handle`).
+async fn handle_inner(
+    req: Request<Incoming>,
+    shared: &Arc<Shared>,
+    peer_ip: String,
+) -> Response<ResBody> {
     let (parts, incoming) = req.into_parts();
     let method = parts.method.as_str().to_uppercase();
     let origin = header_str(&parts.headers, "origin");
+
+    // Пробы и метрики (§11) — целиком в Rust, до роутинга и до пробуждения JS.
+    // При отдельном admin-порту на основном порту их нет (не светим наружу).
+    if shared.tuning.admin_port.is_none() {
+        if let Some(res) = admin_response(shared, &method, parts.uri.path()) {
+            return res;
+        }
+    }
 
     // CORS preflight на краю: OPTIONS + Access-Control-Request-Method →
     // отвечаем в Rust, НЕ будя JS (§6a). Запрещённый origin → 403.
@@ -408,7 +595,7 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
     if let (Some(limit), Some(cl)) = (shared.body_limit, content_length(&parts.headers)) {
         if cl > limit {
             return apply_cors(
-                &shared,
+                shared,
                 origin.as_deref(),
                 status_text(413, "Payload Too Large"),
             );
@@ -426,8 +613,8 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
         query_string,
     };
 
-    let response = route_and_dispatch(&shared, &peer_ip, data, incoming, has_body).await;
-    apply_cors(&shared, origin.as_deref(), response)
+    let response = route_and_dispatch(shared, &peer_ip, data, incoming, has_body).await;
+    apply_cors(shared, origin.as_deref(), response)
 }
 
 /// Роутинг + диспетч в JS (без CORS — им оборачивает `handle`).
@@ -640,6 +827,7 @@ async fn dispatch(
             tx,
             shared.body_limit,
             shared.tuning.body_read_timeout,
+            shared.metrics.clone(),
         ));
         Some(rx)
     } else {
@@ -669,7 +857,7 @@ async fn dispatch(
 
     match shared.tsfn.call_async((req, body_io)).await {
         Ok(promise) => match promise.await {
-            Ok(res) => build_response(res, head, resp_rx),
+            Ok(res) => build_response(res, head, resp_rx, &shared.metrics),
             Err(_) => status_text(500, "Internal Server Error"),
         },
         Err(_) => status_text(500, "Internal Server Error"),
@@ -685,6 +873,7 @@ async fn read_body_task(
     tx: Sender<BodyMsg>,
     limit: Option<u64>,
     read_timeout: Option<Duration>,
+    metrics: Arc<Metrics>,
 ) {
     let mut total: u64 = 0;
     loop {
@@ -703,6 +892,7 @@ async fn read_body_task(
         let Some(Ok(frame)) = next else { break };
         if let Ok(data) = frame.into_data() {
             total = total.saturating_add(data.len() as u64);
+            metrics.add_request_bytes(data.len() as u64);
             if limit.is_some_and(|lim| total > lim) {
                 let _ = tx.send(BodyMsg::Overflow).await;
                 return; // прекращаем читать тело (защита от DoS)
@@ -864,7 +1054,12 @@ fn parse_query(q: Option<&str>) -> Vec<KvPair> {
     }
 }
 
-fn build_response(res: JsResponse, head: bool, resp_rx: Receiver<Bytes>) -> Response<ResBody> {
+fn build_response(
+    res: JsResponse,
+    head: bool,
+    resp_rx: Receiver<Bytes>,
+    metrics: &Metrics,
+) -> Response<ResBody> {
     let mut builder = Response::builder().status(res.status.unwrap_or(200));
     if let Some(headers) = res.headers {
         for kv in headers {
@@ -893,11 +1088,17 @@ fn build_response(res: JsResponse, head: bool, resp_rx: Receiver<Bytes>) -> Resp
     }
 
     let bytes = Bytes::from(res.body.unwrap_or_default());
+    metrics.add_response_bytes(bytes.len() as u64);
     builder_or_500(builder, Full::new(bytes).boxed())
 }
 
 fn full(text: &'static str) -> ResBody {
     Full::new(Bytes::from_static(text.as_bytes())).boxed()
+}
+
+/// Тело из владеемой строки (метрики собираются на лету, статикой не обойтись).
+fn full_owned(text: String) -> ResBody {
+    Full::new(Bytes::from(text)).boxed()
 }
 
 fn empty() -> ResBody {
