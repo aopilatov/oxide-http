@@ -73,8 +73,11 @@ jobs:
             artifact: oxide-http.linux-arm64-musl.node
           - target: aarch64-apple-darwin
             host: macos-latest
+          # Раннеров macos-13 (Intel) у GitHub больше нет — x64-бинарник
+          # кросс-компилируем с arm64-раннера: Apple-тулчейн поддерживает
+          # обе цели одним SDK.
           - target: x86_64-apple-darwin
-            host: macos-13
+            host: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -92,8 +95,14 @@ jobs:
       - name: Сборка (docker, glibc)
         if: ${{ matrix.docker && !contains(matrix.target, 'musl') }}
         run: |
+          # rustup target add обязателен: в образе таргет установлен для его
+          # дефолтного toolchain, а наш rust-toolchain.toml пинит конкретную
+          # версию — rustup переключается на неё, и таргета там уже нет
+          # (error[E0463]: can't find crate for `core`).
           docker run --rm -v "$PWD":/build -w /build ${{ matrix.docker }} \
-            bash -lc "npm ci --no-audit --no-fund && npx napi build --platform --release --target ${{ matrix.target }}"
+            bash -lc "rustup target add ${{ matrix.target }} \
+              && npm ci --no-audit --no-fund \
+              && npx napi build --platform --release --target ${{ matrix.target }}"
 
       # musl-образ napi-rs несёт Node 18, а napi CLI 3.x требует Node 20+
       # (@inquirer/core тянет styleText из node:util). Обходим CLI и зовём cargo
@@ -107,7 +116,12 @@ jobs:
 
       - name: Сборка (нативно)
         if: ${{ !matrix.docker }}
-        run: npx napi build --platform --release --target ${{ matrix.target }}
+        run: |
+          # Явный target add — по той же причине, что и в docker-сборке:
+          # rust-toolchain.toml пинит версию, и таргет, добавленный экшеном
+          # для stable, в ней отсутствует. Для хостового таргета это no-op.
+          rustup target add ${{ matrix.target }}
+          npx napi build --platform --release --target ${{ matrix.target }}
 
       # index.js/index.d.ts лежат в репозитории (их нужно иметь без сборки).
       # Здесь убеждаемся, что закоммиченные версии не разошлись с Rust-исходниками.
