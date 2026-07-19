@@ -171,11 +171,16 @@ impl RustServer {
 
         // TLS-акцептор (парсинг PEM может упасть → ранняя ошибка до bind).
         let tls = match options.tls {
-            Some(t) => Some(tls::build_acceptor(&t.cert, &t.key).map_err(napi::Error::from_reason)?),
+            Some(t) => {
+                Some(tls::build_acceptor(&t.cert, &t.key).map_err(napi::Error::from_reason)?)
+            }
             None => None,
         };
         let http2 = options.http2;
-        let ms = |v: Option<i64>| v.filter(|&n| n >= 0).map(|n| std::time::Duration::from_millis(n as u64));
+        let ms = |v: Option<i64>| {
+            v.filter(|&n| n >= 0)
+                .map(|n| std::time::Duration::from_millis(n as u64))
+        };
         let tuning = Tuning {
             tls,
             h2c: options.h2c.unwrap_or(false),
@@ -246,13 +251,25 @@ impl RustServer {
         Ok(())
     }
 
-    /// Остановить сервер: разбудить accept-цикл и завершить рантайм в фоне
-    /// (не блокируя JS-поток). Идемпотентно.
+    /// Остановить сервер: разбудить accept-цикл и уничтожить рантайм. Идемпотентно.
+    ///
+    /// Рантайм гасим в отдельном системном потоке через `shutdown_timeout`, а не
+    /// `shutdown_background`: последний возвращается сразу и **может не уничтожить
+    /// рантайм вообще** (док tokio). Тогда не дропается `Arc<Shared>`, а вместе с ним
+    /// живут listener (порт занят) и `ThreadsafeFunction` (держит ref на event loop) —
+    /// процесс Node не завершается. `shutdown_timeout` гарантирует Drop рантайма;
+    /// отдельный поток нужен, чтобы не блокировать JS-поток.
     #[napi]
     pub fn close(&self) -> Result<()> {
         if let Some(running) = self.state.lock().unwrap().take() {
-            running.shutdown.notify_waiters();
-            running.runtime.shutdown_background();
+            // notify_one, а не notify_waiters: сохраняет permit, если accept-цикл
+            // в этот момент не ждёт на notified() (иначе сигнал терялся бы).
+            running.shutdown.notify_one();
+            std::thread::spawn(move || {
+                running
+                    .runtime
+                    .shutdown_timeout(std::time::Duration::from_secs(1));
+            });
         }
         Ok(())
     }

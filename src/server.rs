@@ -106,7 +106,11 @@ fn build_h1(t: &Tuning) -> http1::Builder {
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
-pub async fn serve(std_listener: std::net::TcpListener, shared: Arc<Shared>, shutdown: Arc<Notify>) {
+pub async fn serve(
+    std_listener: std::net::TcpListener,
+    shared: Arc<Shared>,
+    shutdown: Arc<Notify>,
+) {
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
         Err(_) => return,
