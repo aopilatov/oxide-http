@@ -25,11 +25,16 @@ pub const BODY_CHANNEL_CAP: usize = 1;
 /// Маркер превышения body-limit, передаётся в JS через `read()` (→ 413).
 pub const BODY_LIMIT_EXCEEDED: &str = "BODY_LIMIT_EXCEEDED";
 
-/// Сообщение канала тела запроса: данные либо превышение лимита.
+/// Маркер истёкшего `bodyReadTimeout` (→ 408).
+pub const BODY_READ_TIMEOUT: &str = "BODY_READ_TIMEOUT";
+
+/// Сообщение канала тела запроса: данные либо причина обрыва.
 pub enum BodyMsg {
     Data(Bytes),
     /// Тело превысило body-limit — читать сокет прекратили (защита от DoS).
     Overflow,
+    /// Клиент молчал дольше `bodyReadTimeout` — чтение оборвано (§6c A2).
+    Timeout,
 }
 
 /// Метаданные части multipart для JS.
@@ -83,6 +88,8 @@ impl BodyIo {
                 Some(BodyMsg::Data(b)) => Ok(Some(b.to_vec().into())),
                 // Превышение лимита → ошибка в JS (маппится в 413). Читать больше нельзя.
                 Some(BodyMsg::Overflow) => Err(napi::Error::from_reason(BODY_LIMIT_EXCEEDED)),
+                // Молчание клиента дольше bodyReadTimeout → 408.
+                Some(BodyMsg::Timeout) => Err(napi::Error::from_reason(BODY_READ_TIMEOUT)),
                 None => Ok(None),
             },
             None => Ok(None),

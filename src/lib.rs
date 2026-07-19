@@ -5,6 +5,7 @@
 
 mod bridge;
 mod cors;
+mod idle;
 mod multipart;
 mod router;
 mod schema;
@@ -89,13 +90,23 @@ pub struct ListenOptions {
     /// TLS (§12). null/отсутствие = plaintext.
     pub tls: Option<TlsOptions>,
     /// h2c prior-knowledge на plaintext-порту (§19).
+    ///
+    /// `js_name` обязателен: автоконвертация napi даёт `h2C` (буква после цифры
+    /// поднимается в верхний регистр), обёртка шлёт `h2c` — поле молча терялось.
+    #[napi(js_name = "h2c")]
     pub h2c: Option<bool>,
     /// Таймаут чтения заголовков в мс (Slowloris, §6c A2).
     pub header_read_timeout: Option<i64>,
+    /// Таймаут ожидания чанка тела запроса в мс (§6c A2) → 408.
+    pub body_read_timeout: Option<i64>,
+    /// Простой соединения без чтения/записи в мс (§6c A2) → закрытие.
+    pub idle_timeout: Option<i64>,
     /// Таймаут TLS-хендшейка в мс.
     pub handshake_timeout: Option<i64>,
     /// Лимит числа заголовков.
     pub max_headers: Option<i64>,
+    /// Предел размера блока заголовков в байтах (§6c B10) → 431.
+    pub max_header_size: Option<i64>,
     pub http2: Option<Http2Options>,
 }
 
@@ -185,9 +196,15 @@ impl RustServer {
             tls,
             h2c: options.h2c.unwrap_or(false),
             header_read_timeout: ms(options.header_read_timeout),
+            body_read_timeout: ms(options.body_read_timeout),
+            idle_timeout: ms(options.idle_timeout),
             handshake_timeout: ms(options.handshake_timeout)
                 .unwrap_or_else(|| std::time::Duration::from_secs(10)),
             max_headers: options.max_headers.filter(|&n| n > 0).map(|n| n as usize),
+            max_header_size: options
+                .max_header_size
+                .filter(|&n| n > 0)
+                .map(|n| n as usize),
             max_concurrent_streams: http2
                 .as_ref()
                 .and_then(|h| h.max_concurrent_streams)

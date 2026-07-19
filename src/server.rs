@@ -25,6 +25,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
 use crate::cors::Cors;
+use crate::idle::{watch_idle, Activity, ActivityIo};
 use crate::router::Routes;
 use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
 
@@ -33,12 +34,21 @@ pub struct Tuning {
     pub tls: Option<TlsAcceptor>,
     pub h2c: bool,
     pub header_read_timeout: Option<Duration>,
+    /// Таймаут ожидания следующего чанка тела запроса (§6c A2) → 408.
+    pub body_read_timeout: Option<Duration>,
+    /// Простой соединения без чтения/записи (§6c A2). Покрывает и h1 keep-alive.
+    pub idle_timeout: Option<Duration>,
     pub handshake_timeout: Duration,
     pub max_headers: Option<usize>,
+    /// Предел размера блока заголовков; превышение → 431 (§6c B10).
+    pub max_header_size: Option<usize>,
     pub max_concurrent_streams: Option<u32>,
     pub initial_window_size: Option<u32>,
     pub max_reset_streams: Option<usize>,
 }
+
+/// Нижняя граница буфера чтения в hyper: меньше — паника внутри `max_buf_size`.
+const MIN_HEADER_BUF: usize = 8192;
 
 /// Единый тип тела ответа: буфер (`Full`) либо стрим (`ChannelBody`).
 type ResBody = BoxBody<Bytes, Infallible>;
@@ -75,10 +85,16 @@ fn build_auto(t: &Tuning) -> auto::Builder<TokioExecutor> {
         if let Some(m) = t.max_headers {
             h1.max_headers(m);
         }
+        if let Some(sz) = t.max_header_size {
+            h1.max_buf_size(sz.max(MIN_HEADER_BUF));
+        }
     }
     {
         let mut h2 = b.http2();
         h2.timer(TokioTimer::new());
+        if let Some(sz) = t.max_header_size {
+            h2.max_header_list_size(sz as u32);
+        }
         if let Some(m) = t.max_concurrent_streams {
             h2.max_concurrent_streams(m);
         }
@@ -102,7 +118,25 @@ fn build_h1(t: &Tuning) -> http1::Builder {
     if let Some(m) = t.max_headers {
         b.max_headers(m);
     }
+    if let Some(sz) = t.max_header_size {
+        b.max_buf_size(sz.max(MIN_HEADER_BUF));
+    }
     b
+}
+
+/// Гонка соединения с idle-сторожем: истёк простой → future дропается, сокет закрыт.
+async fn drive<F: std::future::Future>(conn: F, idle: Option<(Activity, Duration)>) {
+    match idle {
+        Some((activity, dur)) => {
+            tokio::select! {
+                _ = conn => {}
+                _ = watch_idle(activity, dur) => {}
+            }
+        }
+        None => {
+            conn.await;
+        }
+    }
 }
 
 /// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
@@ -135,12 +169,26 @@ pub async fn serve(
                 let tls = shared.tuning.tls.clone();
                 let handshake_to = shared.tuning.handshake_timeout;
                 let h2c = shared.tuning.h2c;
+                let idle_to = shared.tuning.idle_timeout;
                 tokio::spawn(async move {
+                    // Трекер активности вешаем на TCP-сокет до TLS: хендшейк тоже
+                    // считается активностью, а idle одинаково работает для h1/h2/TLS.
+                    let activity = Activity::new();
+                    let svc_activity = activity.clone();
                     let service = service_fn(move |req: Request<Incoming>| {
                         let shared = shared.clone();
                         let peer_ip = peer_ip.clone();
-                        async move { Ok::<_, Infallible>(handle(req, shared, peer_ip).await) }
+                        // Guard держит соединение «занятым», пока считает хендлер:
+                        // долгая обработка не должна выглядеть как простой.
+                        let guard = svc_activity.request_guard();
+                        async move {
+                            let res = handle(req, shared, peer_ip).await;
+                            drop(guard);
+                            Ok::<_, Infallible>(res)
+                        }
                     });
+                    let idle = idle_to.map(|d| (activity.clone(), d));
+                    let stream = ActivityIo::new(stream, activity);
                     // Ошибки соединения глотаем: процесс не должен падать.
                     if let Some(acceptor) = tls {
                         // TLS: хендшейк с таймаутом → ALPN решает h2/h1.1.
@@ -148,16 +196,16 @@ pub async fn serve(
                             tokio::time::timeout(handshake_to, acceptor.accept(stream)).await
                         {
                             let io = TokioIo::new(tls_stream);
-                            let _ = auto_builder.serve_connection(io, service).await;
+                            drive(auto_builder.serve_connection(io, service), idle).await;
                         }
                     } else if h2c {
                         // plaintext + h2c prior-knowledge → auto (h1 + h2).
                         let io = TokioIo::new(stream);
-                        let _ = auto_builder.serve_connection(io, service).await;
+                        drive(auto_builder.serve_connection(io, service), idle).await;
                     } else {
                         // plaintext, только HTTP/1.1.
                         let io = TokioIo::new(stream);
-                        let _ = h1_builder.serve_connection(io, service).await;
+                        drive(h1_builder.serve_connection(io, service), idle).await;
                     }
                 });
             }
@@ -392,9 +440,16 @@ async fn dispatch(
 
     let mut buffered: Option<Bytes> = None;
     if buffer_for_schema {
-        match buffer_body(incoming.take().unwrap(), shared.body_limit).await {
+        match buffer_body(
+            incoming.take().unwrap(),
+            shared.body_limit,
+            shared.tuning.body_read_timeout,
+        )
+        .await
+        {
             Ok(b) => buffered = Some(b),
-            Err(()) => return status_text(413, "Payload Too Large"),
+            Err(BodyErr::TooLarge) => return status_text(413, "Payload Too Large"),
+            Err(BodyErr::Timeout) => return status_text(408, "Request Timeout"),
         }
     }
 
@@ -425,6 +480,7 @@ async fn dispatch(
             incoming.take().unwrap(),
             tx,
             shared.body_limit,
+            shared.tuning.body_read_timeout,
         ));
         Some(rx)
     } else {
@@ -465,9 +521,27 @@ async fn dispatch(
 ///
 /// Авторитетный body-limit: считаем **фактические** байты (не доверяя Content-Length).
 /// При превышении шлём `Overflow` и прекращаем читать сокет — обойти из JS нельзя.
-async fn read_body_task(mut body: Incoming, tx: Sender<BodyMsg>, limit: Option<u64>) {
+async fn read_body_task(
+    mut body: Incoming,
+    tx: Sender<BodyMsg>,
+    limit: Option<u64>,
+    read_timeout: Option<Duration>,
+) {
     let mut total: u64 = 0;
-    while let Some(Ok(frame)) = body.frame().await {
+    loop {
+        // Таймаут считаем на ожидание чанка, а не на всё тело: медленный, но
+        // живой аплоад проходит, а Slowloris с телом — обрывается (§6c A2).
+        let next = match read_timeout {
+            Some(to) => match tokio::time::timeout(to, body.frame()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = tx.send(BodyMsg::Timeout).await;
+                    return;
+                }
+            },
+            None => body.frame().await,
+        };
+        let Some(Ok(frame)) = next else { break };
         if let Ok(data) = frame.into_data() {
             total = total.saturating_add(data.len() as u64);
             if limit.is_some_and(|lim| total > lim) {
@@ -491,15 +565,31 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Буферизовать тело целиком (для нативной валидации), соблюдая лимит.
-/// `Err(())` — превышение лимита.
-async fn buffer_body(mut body: Incoming, limit: Option<u64>) -> Result<Bytes, ()> {
+/// Почему не удалось вычитать тело: превышен лимит (413) или молчание клиента (408).
+enum BodyErr {
+    TooLarge,
+    Timeout,
+}
+
+/// Буферизовать тело целиком (для нативной валидации), соблюдая лимит и read-таймаут.
+async fn buffer_body(
+    mut body: Incoming,
+    limit: Option<u64>,
+    read_timeout: Option<Duration>,
+) -> Result<Bytes, BodyErr> {
     let mut buf = BytesMut::new();
-    while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else { break };
+    loop {
+        let next = match read_timeout {
+            Some(to) => match tokio::time::timeout(to, body.frame()).await {
+                Ok(v) => v,
+                Err(_) => return Err(BodyErr::Timeout),
+            },
+            None => body.frame().await,
+        };
+        let Some(Ok(frame)) = next else { break };
         if let Ok(data) = frame.into_data() {
             if limit.is_some_and(|l| buf.len() as u64 + data.len() as u64 > l) {
-                return Err(());
+                return Err(BodyErr::TooLarge);
             }
             buf.extend_from_slice(&data);
         }

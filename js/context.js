@@ -18,15 +18,17 @@ class HttpError extends Error {
 const toBuffer = (chunk) =>
   Buffer.isBuffer(chunk) ? chunk : typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk);
 
-/** Ошибка превышения лимита тела, пришедшая из нативного read() (см. src/stream.rs). */
+/** Маркеры обрыва тела, приходящие из нативного read() (см. src/stream.rs). */
 const isLimitError = (e) => e != null && /BODY_LIMIT_EXCEEDED/.test(String(e.message));
+const isReadTimeout = (e) => e != null && /BODY_READ_TIMEOUT/.test(String(e.message));
 
-/** Прочитать чанк, маппя нативный маркер лимита в HttpError(413). */
+/** Прочитать чанк, маппя нативные маркеры в HttpError (413 / 408). */
 async function readChunk(bodyIo) {
   try {
     return await bodyIo.read();
   } catch (e) {
     if (isLimitError(e)) throw new HttpError(413, 'Payload Too Large');
+    if (isReadTimeout(e)) throw new HttpError(408, 'Request Timeout');
     throw e;
   }
 }

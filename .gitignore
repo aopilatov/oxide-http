@@ -4,10 +4,11 @@
 /target
 Cargo.lock
 
-# napi-rs build output
+# napi-rs build output (только корневые: без ведущего слэша паттерн ловил
+# и js/index.js — публичную обёртку, которая из-за этого не попадала в репозиторий)
 *.node
-index.js
-index.d.ts
+/index.js
+/index.d.ts
 
 # Node
 node_modules
