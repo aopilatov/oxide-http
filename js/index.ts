@@ -225,7 +225,7 @@ function installSafetyNet(): void {
       JSON.stringify({
         level: 'error',
         time: new Date().toISOString(),
-        msg: 'unhandledRejection (баг обёртки @oxide/http — процесс не падает)',
+        msg: 'unhandledRejection (баг обёртки @oxide-ts/http — процесс не падает)',
         reason: reason instanceof Error ? reason.stack : String(reason),
       }) + '\n',
     );

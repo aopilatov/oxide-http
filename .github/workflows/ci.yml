@@ -154,7 +154,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
       - uses: actions/download-artifact@v4
-        with: { name: bindings-x86_64-unknown-linux-${{ matrix.libc }}, path: . }
+        with: { name: 'bindings-x86_64-unknown-linux-${{ matrix.libc }}', path: . }
       - run: npm ci && npm run build:ts
 
       - name: Загрузка аддона без Rust-тулчейна

@@ -1,6 +1,6 @@
 #![deny(clippy::all)]
 
-//! `@oxide/http` — нативный аддон (napi-rs). Публичный JS-API живёт в обёртке
+//! `@oxide-ts/http` — нативный аддон (napi-rs). Публичный JS-API живёт в обёртке
 //! `js/index.js`; здесь — низкоуровневый `RustServer`. См. DESIGN.md / IMPLEMENTATION.md.
 
 mod bridge;

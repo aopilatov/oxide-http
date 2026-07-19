@@ -15,7 +15,7 @@
 
 | # | Решение | Выбор |
 |---|---|---|
-| 0 | Имя | Пакет **`@oxide/http`**, класс **`Server`** |
+| 0 | Имя | Пакет **`@oxide-ts/http`**, класс **`Server`** |
 | 1 | Интеграция с Node | Нативный аддон (**napi-rs**), `.node` в процессе Node |
 | 2 | Публичный API | Свой минималистичный (Hono-подобный), **не** drop-in `node:http` |
 | 3 | TLS | Терминируется в Rust (**rustls**), ALPN → h2 / http1.1 |
@@ -74,7 +74,7 @@
 ## 4. Публичный JS API (эскиз)
 
 ```js
-import { Server } from '@oxide/http';
+import { Server } from '@oxide-ts/http';
 
 const app = new Server({
   baseUrl: '/api/v1',               // глобальный префикс всех маршрутов приложения (health/metrics НЕ наследуют)
@@ -382,7 +382,7 @@ app.post('/upload', {
 | `x86_64-apple-darwin` | Mac Intel | опц. |
 | `x86_64-pc-windows-msvc` | Windows-разработка | опц. |
 
-- Доставка: prebuild в npm (основной `@oxide/http` + `@oxide/http-linux-x64-gnu` и т.д. в `optionalDependencies`).
+- Доставка: prebuild в npm (основной `@oxide-ts/http` + `@oxide-ts/http-linux-x64-gnu` и т.д. в `optionalDependencies`).
   В Docker-образ Rust-тулчейн не нужен — `npm ci` тянет готовый бинарник.
 
 ## 14. Предлагаемая структура проекта
@@ -449,7 +449,7 @@ http-rust/
 
 ## 16. Открытые вопросы (все закрыты)
 
-- ~~Имя npm-пакета / scope~~ → `@oxide/http`, класс `Server`.
+- ~~Имя npm-пакета / scope~~ → `@oxide-ts/http`, класс `Server`.
 - ~~Query-string парсинг~~ → в **Rust** заранее; `c.req.query` = last-wins строки; `c.req.queries('k')` → массив всех значений.
 - ~~Представление заголовков~~ → lowercase везде; `c.req.header(name)` + `c.res.headers` (`set`/`append`); `Set-Cookie` отдельными строками; псевдо-заголовки h2 скрыты.
 - ~~Формат единиц в конфиге~~ → принимаем **и строку, и число** (`'10mb'`/`'30s'` или байты/мс), тип `string | number`.

@@ -2,7 +2,7 @@
 // Запуск: node examples/01-basic.ts
 //
 // В своём проекте импорт выглядит так:
-//   import { Server } from '@oxide/http';
+//   import { Server } from '@oxide-ts/http';
 import { Server } from '../js/index.ts';
 
 const app = new Server({ accessLog: true });

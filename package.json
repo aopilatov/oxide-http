@@ -1,6 +1,6 @@
 {
-  "name": "@oxide/http",
-  "version": "0.0.0",
+  "name": "@oxide-ts/http",
+  "version": "0.1.0",
   "description": "Быстрый HTTP/1.1 + HTTP/2 сервер для Node.js на Rust (napi-rs)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -10,7 +10,7 @@
   },
   "napi": {
     "binaryName": "oxide-http",
-    "packageName": "@oxide/http",
+    "packageName": "@oxide-ts/http",
     "targets": [
       "aarch64-apple-darwin",
       "x86_64-apple-darwin",
@@ -59,7 +59,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/saxik/oxide-http.git"
+    "url": "git+https://github.com/aopilatov/oxide-http.git"
   },
   "keywords": [
     "http",
@@ -72,11 +72,15 @@
     "fastify-alternative"
   ],
   "optionalDependencies": {
-    "@oxide/http-darwin-arm64": "0.0.0",
-    "@oxide/http-darwin-x64": "0.0.0",
-    "@oxide/http-linux-x64-gnu": "0.0.0",
-    "@oxide/http-linux-arm64-gnu": "0.0.0",
-    "@oxide/http-linux-x64-musl": "0.0.0",
-    "@oxide/http-linux-arm64-musl": "0.0.0"
-  }
+    "@oxide-ts/http-darwin-arm64": "0.1.0",
+    "@oxide-ts/http-darwin-x64": "0.1.0",
+    "@oxide-ts/http-linux-x64-gnu": "0.1.0",
+    "@oxide-ts/http-linux-arm64-gnu": "0.1.0",
+    "@oxide-ts/http-linux-x64-musl": "0.1.0",
+    "@oxide-ts/http-linux-arm64-musl": "0.1.0"
+  },
+  "bugs": {
+    "url": "https://github.com/aopilatov/oxide-http/issues"
+  },
+  "homepage": "https://github.com/aopilatov/oxide-http#readme"
 }

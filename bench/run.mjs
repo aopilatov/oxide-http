@@ -27,8 +27,8 @@ const CONNECTIONS = arg('connections', 64);
 const WARMUP_MS = 2000;
 
 const TARGETS = [
-  { id: 'oxide', name: '@oxide/http' },
-  { id: 'oxide-native', name: '@oxide/http (нативная ручка)' },
+  { id: 'oxide', name: '@oxide-ts/http' },
+  { id: 'oxide-native', name: '@oxide-ts/http (нативная ручка)' },
   { id: 'node-http', name: 'node:http' },
   { id: 'fastify', name: 'fastify' },
   { id: 'hono', name: 'hono (node-server)' },

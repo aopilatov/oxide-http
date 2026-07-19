@@ -1,10 +1,10 @@
-# `@oxide/http`
+# `@oxide-ts/http`
 
 HTTP/1.1 и HTTP/2 сервер для Node.js: сетевой слой, роутинг, валидация и лимиты —
 в Rust (hyper + tokio), прикладные хендлеры — на JS/TypeScript.
 
 ```ts
-import { Server } from '@oxide/http';
+import { Server } from '@oxide-ts/http';
 
 const app = new Server();
 
@@ -50,7 +50,7 @@ await app.listen({ port: 3000 });
 ## Установка
 
 ```bash
-npm i @oxide/http
+npm i @oxide-ts/http
 # схемы — опционально:
 npm i valibot @valibot/to-json-schema
 ```
@@ -279,7 +279,7 @@ MIT
 Если вашей платформы нет в списке, соберите сами — нужен Rust:
 
 ```bash
-git clone https://github.com/saxik/oxide-http && cd oxide-http
+git clone https://github.com/aopilatov/oxide-http && cd oxide-http
 npm ci
 npm run build:release   # .node под текущую платформу
 npm run build:ts        # dist/ (CJS + типы)
