@@ -11,6 +11,7 @@ mod idle;
 mod listener;
 mod metrics;
 mod multipart;
+mod overload;
 mod proxy_protocol;
 mod router;
 mod schema;
@@ -142,6 +143,17 @@ pub struct ListenOptions {
     pub admin_port: Option<u16>,
     /// JSON access-log в stdout (§11).
     pub access_log: Option<bool>,
+    /// Потолок одновременно обрабатываемых запросов (§6c C5). Сверх — 503.
+    pub max_concurrent_requests: Option<i64>,
+    /// Сколько запросов ждут слот сверх лимита (§6c C5). 0 = очереди нет.
+    pub max_queue: Option<i64>,
+    /// Сколько ждать в очереди, мс (§6c C5). По умолчанию 1с.
+    pub queue_timeout: Option<i64>,
+    /// Значение заголовка `Retry-After` в секундах при 503 (§6c C5).
+    pub retry_after: Option<i64>,
+    /// Длительность непрерывной перегрузки, после которой снимается readiness, мс
+    /// (§6c C5). Отсутствие/0 = readiness не трогать.
+    pub overload_shed_after: Option<i64>,
     pub http2: Option<Http2Options>,
 }
 
@@ -338,6 +350,11 @@ impl RustServer {
             .build()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
+        let max_concurrent = options
+            .max_concurrent_requests
+            .filter(|&n| n > 0)
+            .map(|n| n as usize);
+
         let shared = Arc::new(Shared {
             tsfn,
             routes,
@@ -363,6 +380,15 @@ impl RustServer {
             tuning,
             metrics: Arc::new(crate::metrics::Metrics::new()),
             readiness: crate::health::Readiness::default(),
+            overload: max_concurrent.map(|limit| {
+                crate::overload::Limiter::new(
+                    limit,
+                    options.max_queue.filter(|&n| n > 0).unwrap_or(0) as usize,
+                    ms(options.queue_timeout).unwrap_or_else(|| std::time::Duration::from_secs(1)),
+                    options.retry_after.filter(|&n| n > 0).unwrap_or(1) as u64,
+                    ms(options.overload_shed_after).filter(|d| !d.is_zero()),
+                )
+            }),
         });
         let pre_shutdown_delay = ms(options.pre_shutdown_delay).unwrap_or_default();
         let (shutdown, shutdown_rx) = watch::channel(crate::server::RUNNING);

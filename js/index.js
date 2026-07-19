@@ -159,6 +159,18 @@ class Server {
       if (h.port != null) this.#options.adminPort = h.port;
     }
     if (config.accessLog != null) this.#options.accessLog = !!config.accessLog;
+    // Защита от перегрузки (§6c C5).
+    if (config.maxConcurrentRequests != null) {
+      this.#options.maxConcurrentRequests = config.maxConcurrentRequests;
+    }
+    if (config.maxQueue != null) this.#options.maxQueue = config.maxQueue;
+    if (config.queueTimeout != null) {
+      this.#options.queueTimeout = parseDuration(config.queueTimeout);
+    }
+    if (config.retryAfter != null) this.#options.retryAfter = config.retryAfter;
+    if (config.overloadShedAfter != null) {
+      this.#options.overloadShedAfter = parseDuration(config.overloadShedAfter);
+    }
     // SIGTERM/SIGINT → graceful shutdown (§10). Выключается { handleSignals: false }
     // — например когда процессом уже управляет внешний супервизор.
     this.#handleSignals = config.handleSignals !== false;

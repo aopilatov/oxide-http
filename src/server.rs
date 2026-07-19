@@ -31,6 +31,7 @@ use crate::health::{HealthPaths, Readiness};
 use crate::idle::{watch_idle, Activity, ActivityIo};
 use crate::listener::{Bound, SocketOptions};
 use crate::metrics::Metrics;
+use crate::overload::{Limiter, Slot};
 use crate::proxy_protocol;
 use crate::router::Routes;
 use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
@@ -95,6 +96,8 @@ pub struct Shared {
     pub metrics: Arc<Metrics>,
     /// Состояние готовности (§11): shutdown/перегрузка/флаг из JS.
     pub readiness: Readiness,
+    /// Ограничитель одновременных запросов (§6c C5). None = без лимита.
+    pub overload: Option<Limiter>,
 }
 
 /// Auto-билдер (h1 + h2 через ALPN/preface) с настройками таймаутов и h2.
@@ -176,6 +179,7 @@ async fn drive<C: GracefulConnection>(
     conn: C,
     idle: Option<(Activity, Duration)>,
     mut shutdown: watch::Receiver<u8>,
+    shed: Arc<Notify>,
 ) {
     tokio::pin!(conn);
     let idle_wait = async {
@@ -191,6 +195,8 @@ async fn drive<C: GracefulConnection>(
         _ = conn.as_mut() => return,
         _ = &mut idle_wait => return,
         _ = wait_closing(&mut shutdown) => {}
+        // Перегрузка: ответ 503 уже формируется, соединение закрываем следом.
+        _ = shed.notified() => {}
     }
 
     // Фаза graceful: просим соединение закрыться и даём ему дожать текущий запрос.
@@ -347,14 +353,19 @@ where
     let activity = Activity::new();
     let svc_activity = activity.clone();
     let svc_shared = shared.clone();
+    // Сигнал «закрыть это соединение»: его шлёт обработчик при перегрузке,
+    // а ловит `drive` — там же, где обрабатывается общий shutdown (§6c C5).
+    let shed = Arc::new(Notify::new());
+    let svc_shed = shed.clone();
     let service = service_fn(move |req: Request<Incoming>| {
         let shared = svc_shared.clone();
         let peer_ip = peer_ip.clone();
+        let shed = svc_shed.clone();
         // Guard держит соединение «занятым», пока считает хендлер:
         // долгая обработка не должна выглядеть как простой.
         let guard = svc_activity.request_guard();
         async move {
-            let res = handle(req, shared, peer_ip).await;
+            let res = handle(req, shared, peer_ip, shed).await;
             drop(guard);
             Ok::<_, Infallible>(res)
         }
@@ -374,6 +385,7 @@ where
                 ctx.auto_builder.serve_connection(io, service),
                 idle,
                 ctx.shutdown,
+                shed,
             )
             .await;
         }
@@ -384,6 +396,7 @@ where
             ctx.auto_builder.serve_connection(io, service),
             idle,
             ctx.shutdown,
+            shed,
         )
         .await;
     } else {
@@ -393,6 +406,7 @@ where
             ctx.h1_builder.serve_connection(io, service),
             idle,
             ctx.shutdown,
+            shed,
         )
         .await;
     }
@@ -462,13 +476,50 @@ struct ReqData {
 
 /// Один запрос. Края в Rust (CORS preflight, body-limit) → роутинг/диспетч →
 /// навешивание CORS-заголовков на итоговый ответ.
-async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) -> Response<ResBody> {
+async fn handle(
+    req: Request<Incoming>,
+    shared: Arc<Shared>,
+    peer_ip: String,
+    shed: Arc<Notify>,
+) -> Response<ResBody> {
     let started = std::time::Instant::now();
     let method_for_metrics = req.method().as_str().to_uppercase();
     let path_for_log = req.uri().path().to_string();
 
     shared.metrics.request_started();
-    let response = handle_inner(req, &shared, peer_ip).await;
+
+    // Пробы и метрики (§11) — до лимитера: под перегрузкой `/readyz` обязан
+    // отвечать, иначе k8s не узнает, что под пора снимать с эндпоинтов.
+    let probe = if shared.tuning.admin_port.is_none() {
+        admin_response(&shared, &method_for_metrics, req.uri().path())
+    } else {
+        None
+    };
+
+    let response = match (probe, &shared.overload) {
+        (Some(res), _) => res,
+        // Лимит одновременных запросов (§6c C5). Permit держим на всё время
+        // обработки; сверх лимита и очереди — 503 + Retry-After.
+        (None, Some(limiter)) => match limiter.acquire().await {
+            Slot::Acquired(permit) => {
+                // Слот нашёлся → полоса перегрузки кончилась, readiness возвращаем.
+                shared.readiness.set_overloaded(false);
+                let res = handle_inner(req, &shared, peer_ip).await;
+                drop(permit);
+                res
+            }
+            Slot::Rejected { retry_after } => {
+                // Устойчивая перегрузка → снимаем readiness (слой 2, §6c C5).
+                shared.readiness.set_overloaded(limiter.should_shed());
+                // Просим соединение закрыться: для h2 это GOAWAY — клиент
+                // переоткроется, возможно уже на другой под. Для h1 — закрытие
+                // keep-alive после ответа, с тем же эффектом.
+                shed.notify_one();
+                overloaded_response(retry_after)
+            }
+        },
+        (None, None) => handle_inner(req, &shared, peer_ip).await,
+    };
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
@@ -479,6 +530,18 @@ async fn handle(req: Request<Incoming>, shared: Arc<Shared>, peer_ip: String) ->
         access_log(&method_for_metrics, &path_for_log, status, elapsed);
     }
     response
+}
+
+/// Ответ при перегрузке (§6c C5): 503 + Retry-After, чтобы retry-способный
+/// ingress/mesh увёл запрос на другую реплику, а клиент знал, когда повторять.
+fn overloaded_response(retry_after: u64) -> Response<ResBody> {
+    builder_or_500(
+        Response::builder()
+            .status(503)
+            .header("retry-after", retry_after.to_string())
+            .header("content-type", "text/plain; charset=utf-8"),
+        full("Service Unavailable"),
+    )
 }
 
 /// Пробы и метрики (§11). `None` — путь не наш, обрабатываем как обычный запрос.
@@ -566,14 +629,6 @@ async fn handle_inner(
     let (parts, incoming) = req.into_parts();
     let method = parts.method.as_str().to_uppercase();
     let origin = header_str(&parts.headers, "origin");
-
-    // Пробы и метрики (§11) — целиком в Rust, до роутинга и до пробуждения JS.
-    // При отдельном admin-порту на основном порту их нет (не светим наружу).
-    if shared.tuning.admin_port.is_none() {
-        if let Some(res) = admin_response(shared, &method, parts.uri.path()) {
-            return res;
-        }
-    }
 
     // CORS preflight на краю: OPTIONS + Access-Control-Request-Method →
     // отвечаем в Rust, НЕ будя JS (§6a). Запрещённый origin → 403.
