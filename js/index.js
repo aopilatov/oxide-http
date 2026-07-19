@@ -131,6 +131,18 @@ class Server {
     if (config.shutdownTimeout != null) {
       this.#options.shutdownTimeout = parseDuration(config.shutdownTimeout);
     }
+    // Socket-опции (§6c B9) и PROXY protocol (A4).
+    if (config.backlog != null) this.#options.backlog = config.backlog;
+    if (config.reusePort != null) this.#options.reusePort = !!config.reusePort;
+    if (config.noDelay != null) this.#options.noDelay = !!config.noDelay;
+    if (config.maxConnections != null) this.#options.maxConnections = config.maxConnections;
+    if (config.proxyProtocol != null) this.#options.proxyProtocol = !!config.proxyProtocol;
+    // workerThreads: число | 'auto' (по cgroup-квоте). 'auto' = не задавать явно.
+    if (typeof config.workerThreads === 'number') {
+      this.#options.workerThreads = config.workerThreads;
+    } else if (config.workerThreads != null && config.workerThreads !== 'auto') {
+      throw new TypeError("workerThreads: число либо 'auto'");
+    }
     // SIGTERM/SIGINT → graceful shutdown (§10). Выключается { handleSignals: false }
     // — например когда процессом уже управляет внешний супервизор.
     this.#handleSignals = config.handleSignals !== false;
@@ -243,8 +255,15 @@ class Server {
 
   // --- запуск ---
 
-  async listen({ port, host = '0.0.0.0' } = {}) {
-    if (typeof port !== 'number') throw new TypeError('listen: нужен числовой port');
+  /** Слушать TCP (`{ port, host }`) либо Unix-сокет (`{ path }`) — §6c B9. */
+  async listen({ port, host = '0.0.0.0', path } = {}) {
+    if (path != null) {
+      if (typeof path !== 'string') throw new TypeError('listen: path должен быть строкой');
+      this.#options.unixPath = path;
+      port = 0; // нативный слой игнорирует порт при заданном unixPath
+    } else if (typeof port !== 'number') {
+      throw new TypeError('listen: нужен числовой port либо path для Unix-сокета');
+    }
     installSafetyNet();
 
     // Схемы: конвертация в JSON Schema (для Rust) + инъекция valibot-preValidation.
@@ -294,7 +313,7 @@ class Server {
 
     this.#listening = true;
     if (this.#handleSignals) this.#installSignalHandlers();
-    this.#events.emit('listening', { port, host });
+    this.#events.emit('listening', path != null ? { path } : { port, host });
     return this;
   }
 

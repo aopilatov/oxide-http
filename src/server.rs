@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulConnection;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{watch, Notify};
 use tokio_rustls::TlsAcceptor;
@@ -27,6 +28,8 @@ use tokio_rustls::TlsAcceptor;
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
 use crate::cors::Cors;
 use crate::idle::{watch_idle, Activity, ActivityIo};
+use crate::listener::{Bound, SocketOptions};
+use crate::proxy_protocol;
 use crate::router::Routes;
 use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
 
@@ -41,6 +44,12 @@ pub struct Tuning {
     pub idle_timeout: Option<Duration>,
     /// Дедлайн drain'а при graceful shutdown (§10); истёк — рвём что осталось.
     pub shutdown_timeout: Duration,
+    /// Опции сокета (§6c B9); из них в accept-цикле нужен `nodelay`.
+    pub socket: SocketOptions,
+    /// Потолок одновременных соединений (§6c B9). None = без лимита.
+    pub max_connections: Option<usize>,
+    /// Ждать PROXY-префикс на каждом соединении (§6c A4).
+    pub proxy_protocol: bool,
     pub handshake_timeout: Duration,
     pub max_headers: Option<usize>,
     /// Предел размера блока заголовков; превышение → 431 (§6c B10).
@@ -168,19 +177,11 @@ async fn drive<C: GracefulConnection>(
 /// (порт свободен для нового пода), затем даём открытым соединениям дожать запросы
 /// до `shutdown_timeout`. Когда drain закончен (или дедлайн истёк) — сигналим `done`.
 pub async fn serve(
-    std_listener: std::net::TcpListener,
+    listener: Bound,
     shared: Arc<Shared>,
     shutdown: watch::Receiver<bool>,
     done: Arc<Notify>,
 ) {
-    let listener = match TcpListener::from_std(std_listener) {
-        Ok(l) => l,
-        Err(_) => {
-            done.notify_one();
-            return;
-        }
-    };
-
     // Билдеры собираем один раз, шарим в задачи через Arc (serve_connection(&self)).
     let auto_builder = Arc::new(build_auto(&shared.tuning));
     let h1_builder = Arc::new(build_h1(&shared.tuning));
@@ -189,74 +190,51 @@ pub async fn serve(
     // завершились, все клоны дропнуты и recv() отдаёт None — счётчики не нужны.
     let (drain_tx, mut drain_rx) = mpsc::channel::<()>(1);
     let mut shutdown_acc = shutdown.clone();
+    // Живые соединения — для maxConnections (§6c B9).
+    let live = Arc::new(AtomicUsize::new(0));
 
     loop {
-        tokio::select! {
+        // accept для обоих типов сокета: Unix-пир анонимен, адрес берём условный.
+        let accepted = tokio::select! {
             _ = shutdown_acc.changed() => break,
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Ok(v) => v,
-                    Err(_) => continue, // временная ошибка accept — пропускаем
-                };
-                let peer_ip = peer.ip().to_string();
-                let shared = shared.clone();
-                let auto_builder = auto_builder.clone();
-                let h1_builder = h1_builder.clone();
-                let tls = shared.tuning.tls.clone();
-                let handshake_to = shared.tuning.handshake_timeout;
-                let h2c = shared.tuning.h2c;
-                let idle_to = shared.tuning.idle_timeout;
-                let conn_shutdown = shutdown.clone();
-                // Клон живёт до конца задачи — по его дропу считается drain.
-                let drain = drain_tx.clone();
+            a = accept_any(&listener) => a,
+        };
+        let (stream, peer_ip) = match accepted {
+            Some(v) => v,
+            None => continue, // временная ошибка accept — пропускаем
+        };
+
+        // Лимит соединений: сверх него сразу закрываем, не тратя задачу и память.
+        if let Some(max) = shared.tuning.max_connections {
+            if live.load(Ordering::Relaxed) >= max {
+                drop(stream);
+                continue;
+            }
+        }
+        live.fetch_add(1, Ordering::Relaxed);
+
+        let ctx = ConnCtx {
+            shared: shared.clone(),
+            auto_builder: auto_builder.clone(),
+            h1_builder: h1_builder.clone(),
+            shutdown: shutdown.clone(),
+            live: live.clone(),
+        };
+        let drain = drain_tx.clone();
+        match stream {
+            AnyStream::Tcp(s) => {
+                if shared.tuning.socket.nodelay {
+                    let _ = s.set_nodelay(true);
+                }
                 tokio::spawn(async move {
                     let _drain = drain;
-                    // Трекер активности вешаем на TCP-сокет до TLS: хендшейк тоже
-                    // считается активностью, а idle одинаково работает для h1/h2/TLS.
-                    let activity = Activity::new();
-                    let svc_activity = activity.clone();
-                    let service = service_fn(move |req: Request<Incoming>| {
-                        let shared = shared.clone();
-                        let peer_ip = peer_ip.clone();
-                        // Guard держит соединение «занятым», пока считает хендлер:
-                        // долгая обработка не должна выглядеть как простой.
-                        let guard = svc_activity.request_guard();
-                        async move {
-                            let res = handle(req, shared, peer_ip).await;
-                            drop(guard);
-                            Ok::<_, Infallible>(res)
-                        }
-                    });
-                    let idle = idle_to.map(|d| (activity.clone(), d));
-                    let stream = ActivityIo::new(stream, activity);
-                    // Ошибки соединения глотаем: процесс не должен падать.
-                    if let Some(acceptor) = tls {
-                        // TLS: хендшейк с таймаутом → ALPN решает h2/h1.1.
-                        if let Ok(Ok(tls_stream)) =
-                            tokio::time::timeout(handshake_to, acceptor.accept(stream)).await
-                        {
-                            let io = TokioIo::new(tls_stream);
-                            drive(
-                                auto_builder.serve_connection(io, service),
-                                idle,
-                                conn_shutdown,
-                            )
-                            .await;
-                        }
-                    } else if h2c {
-                        // plaintext + h2c prior-knowledge → auto (h1 + h2).
-                        let io = TokioIo::new(stream);
-                        drive(
-                            auto_builder.serve_connection(io, service),
-                            idle,
-                            conn_shutdown,
-                        )
-                        .await;
-                    } else {
-                        // plaintext, только HTTP/1.1.
-                        let io = TokioIo::new(stream);
-                        drive(h1_builder.serve_connection(io, service), idle, conn_shutdown).await;
-                    }
+                    serve_conn(s, peer_ip, ctx).await;
+                });
+            }
+            AnyStream::Unix(s) => {
+                tokio::spawn(async move {
+                    let _drain = drain;
+                    serve_conn(s, peer_ip, ctx).await;
                 });
             }
         }
@@ -274,6 +252,124 @@ pub async fn serve(
         _ = tokio::time::sleep(deadline) => {}
     }
     done.notify_one();
+}
+
+/// Принятое соединение: TCP либо Unix.
+enum AnyStream {
+    Tcp(tokio::net::TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+
+/// Общий accept для обоих типов слушателя. `None` — временная ошибка.
+async fn accept_any(listener: &Bound) -> Option<(AnyStream, String)> {
+    match listener {
+        Bound::Tcp(l) => match l.accept().await {
+            Ok((s, peer)) => Some((AnyStream::Tcp(s), peer.ip().to_string())),
+            Err(_) => None,
+        },
+        Bound::Unix(l) => match l.accept().await {
+            // У Unix-сокета нет адреса пира: отдаём loopback, чтобы `c.req.ip`
+            // оставался непустым (инвариант §7), а реальный источник придёт
+            // из customIpHeaders — за unix-сокетом всегда стоит локальный прокси.
+            Ok((s, _)) => Some((AnyStream::Unix(s), "127.0.0.1".to_string())),
+            Err(_) => None,
+        },
+    }
+}
+
+/// Всё, что задаче соединения нужно от сервера (чтобы не тащить 6 аргументов).
+struct ConnCtx {
+    shared: Arc<Shared>,
+    auto_builder: Arc<auto::Builder<TokioExecutor>>,
+    h1_builder: Arc<http1::Builder>,
+    shutdown: watch::Receiver<bool>,
+    live: Arc<AtomicUsize>,
+}
+
+/// Обслужить одно соединение: PROXY-префикс → TLS/ALPN → h1/h2 → drain.
+async fn serve_conn<S>(stream: S, peer_ip: String, ctx: ConnCtx)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Счётчик живых соединений отпускаем в любом случае (в т.ч. при раннем return).
+    let _live = LiveGuard(ctx.live);
+    let shared = ctx.shared;
+    let tuning = &shared.tuning;
+
+    // PROXY protocol (§6c A4) — строго до TLS: префикс идёт «сырым» перед хендшейком.
+    let (stream, peer_ip) = if tuning.proxy_protocol {
+        match proxy_protocol::read_header(stream).await {
+            Ok((io, addr)) => (io, addr.unwrap_or(peer_ip)),
+            // Префикса нет или он битый — соединение не от нашего балансировщика.
+            Err(()) => return,
+        }
+    } else {
+        (proxy_protocol::PrefixedIo::new(stream, Vec::new()), peer_ip)
+    };
+
+    // Трекер активности вешаем до TLS: хендшейк тоже считается активностью,
+    // а idle одинаково работает для h1/h2/TLS.
+    let activity = Activity::new();
+    let svc_activity = activity.clone();
+    let svc_shared = shared.clone();
+    let service = service_fn(move |req: Request<Incoming>| {
+        let shared = svc_shared.clone();
+        let peer_ip = peer_ip.clone();
+        // Guard держит соединение «занятым», пока считает хендлер:
+        // долгая обработка не должна выглядеть как простой.
+        let guard = svc_activity.request_guard();
+        async move {
+            let res = handle(req, shared, peer_ip).await;
+            drop(guard);
+            Ok::<_, Infallible>(res)
+        }
+    });
+
+    let idle = tuning.idle_timeout.map(|d| (activity.clone(), d));
+    let stream = ActivityIo::new(stream, activity);
+
+    // Ошибки соединения глотаем: процесс не должен падать.
+    if let Some(acceptor) = tuning.tls.clone() {
+        // TLS: хендшейк с таймаутом → ALPN решает h2/h1.1.
+        if let Ok(Ok(tls_stream)) =
+            tokio::time::timeout(tuning.handshake_timeout, acceptor.accept(stream)).await
+        {
+            let io = TokioIo::new(tls_stream);
+            drive(
+                ctx.auto_builder.serve_connection(io, service),
+                idle,
+                ctx.shutdown,
+            )
+            .await;
+        }
+    } else if tuning.h2c {
+        // plaintext + h2c prior-knowledge → auto (h1 + h2).
+        let io = TokioIo::new(stream);
+        drive(
+            ctx.auto_builder.serve_connection(io, service),
+            idle,
+            ctx.shutdown,
+        )
+        .await;
+    } else {
+        // plaintext, только HTTP/1.1.
+        let io = TokioIo::new(stream);
+        drive(
+            ctx.h1_builder.serve_connection(io, service),
+            idle,
+            ctx.shutdown,
+        )
+        .await;
+    }
+}
+
+/// Уменьшает счётчик живых соединений на Drop (в т.ч. при панике задачи).
+struct LiveGuard(Arc<AtomicUsize>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Общие для запроса данные (вычислены один раз, затем перемещаются в диспетч).

@@ -5,8 +5,11 @@
 
 mod bridge;
 mod cors;
+mod cpu;
 mod idle;
+mod listener;
 mod multipart;
+mod proxy_protocol;
 mod router;
 mod schema;
 mod server;
@@ -23,6 +26,7 @@ use tokio::sync::{watch, Notify};
 
 use crate::bridge::{Handler, JsResponse, MatchedRequest};
 use crate::cors::{Cors, CorsOptions as RCorsOptions};
+use crate::listener::Bound;
 use crate::router::{RouteDef as RRouteDef, Routes};
 use crate::server::{serve, Shared, Tuning};
 use crate::stream::BodyIo;
@@ -109,7 +113,27 @@ pub struct ListenOptions {
     pub max_header_size: Option<i64>,
     /// Дедлайн graceful shutdown в мс (§10). По умолчанию 10с.
     pub shutdown_timeout: Option<i64>,
+    /// Путь Unix-сокета (§6c B9). Задан → слушаем его, `port`/`host` игнорируются.
+    pub unix_path: Option<String>,
+    /// Глубина accept-очереди (§6c B9). По умолчанию 1024.
+    pub backlog: Option<i64>,
+    /// `SO_REUSEPORT` — несколько процессов на одном порту (§6c B9).
+    pub reuse_port: Option<bool>,
+    /// `TCP_NODELAY` (§6c B9). По умолчанию включён.
+    pub no_delay: Option<bool>,
+    /// Потолок одновременных соединений (§6c B9).
+    pub max_connections: Option<i64>,
+    /// Ждать PROXY protocol v1/v2 на каждом соединении (§6c A4).
+    pub proxy_protocol: Option<bool>,
+    /// Число tokio-воркеров; `0`/отсутствие = авто по cgroup-квоте (§6c A3).
+    pub worker_threads: Option<i64>,
     pub http2: Option<Http2Options>,
+}
+
+/// Забинденный сокет до передачи в рантайм (регистрация в реакторе — уже там).
+enum ListenTarget {
+    Tcp(std::net::TcpListener),
+    Unix(std::os::unix::net::UnixListener),
 }
 
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
@@ -202,9 +226,24 @@ impl RustServer {
         };
         let shutdown_timeout =
             ms(options.shutdown_timeout).unwrap_or_else(|| std::time::Duration::from_secs(10));
+        let default_sock = crate::listener::SocketOptions::default();
+        let socket = crate::listener::SocketOptions {
+            backlog: options
+                .backlog
+                .filter(|&n| n > 0)
+                .map(|n| n as i32)
+                .unwrap_or(default_sock.backlog),
+            reuse_port: options.reuse_port.unwrap_or(default_sock.reuse_port),
+            nodelay: options.no_delay.unwrap_or(default_sock.nodelay),
+        };
         let tuning = Tuning {
             tls,
             shutdown_timeout,
+            max_connections: options
+                .max_connections
+                .filter(|&n| n > 0)
+                .map(|n| n as usize),
+            proxy_protocol: options.proxy_protocol.unwrap_or(false),
             h2c: options.h2c.unwrap_or(false),
             header_read_timeout: ms(options.header_read_timeout),
             body_read_timeout: ms(options.body_read_timeout),
@@ -231,16 +270,31 @@ impl RustServer {
                 .and_then(|h| h.max_reset_streams_per_sec)
                 .filter(|&n| n >= 0)
                 .map(|n| n as usize),
+            socket,
         };
 
-        // Слушаем сокет синхронно → ошибки bind (EADDRINUSE и т.п.) отдаём сразу.
-        let std_listener = std::net::TcpListener::bind((host.as_str(), port))
-            .map_err(|e| napi::Error::from_reason(format!("bind {host}:{port}: {e}")))?;
-        std_listener
-            .set_nonblocking(true)
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        // Биндим синхронно → ошибки (EADDRINUSE, нет прав на путь) отдаём сразу.
+        // Unix-сокет имеет приоритет над port/host, если путь задан.
+        let unix_path = options.unix_path.clone();
+        let listen_target: ListenTarget = match &unix_path {
+            Some(path) => ListenTarget::Unix(
+                listener::bind_unix(path)
+                    .map_err(|e| napi::Error::from_reason(format!("bind unix {path}: {e}")))?,
+            ),
+            None => ListenTarget::Tcp(
+                listener::bind_tcp(&host, port, &tuning.socket)
+                    .map_err(|e| napi::Error::from_reason(format!("bind {host}:{port}: {e}")))?,
+            ),
+        };
 
+        // Воркеры: явное число, иначе авто по cgroup-квоте (§6c A3) — в контейнере
+        // число ядер ноды сильно больше реального лимита пода.
+        let workers = match options.worker_threads.filter(|&n| n > 0) {
+            Some(n) => n as usize,
+            None => crate::cpu::worker_threads_auto(),
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
             .enable_all()
             .build()
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -272,8 +326,17 @@ impl RustServer {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let done = Arc::new(Notify::new());
         let done_srv = done.clone();
+        // Регистрация сокета в реакторе — уже внутри рантайма (from_std требует его).
         runtime.spawn(async move {
-            serve(std_listener, shared, shutdown_rx, done_srv).await;
+            let bound = match listen_target {
+                ListenTarget::Tcp(l) => tokio::net::TcpListener::from_std(l).map(Bound::Tcp),
+                ListenTarget::Unix(l) => tokio::net::UnixListener::from_std(l).map(Bound::Unix),
+            };
+            let Ok(bound) = bound else {
+                done_srv.notify_one();
+                return;
+            };
+            serve(bound, shared, shutdown_rx, done_srv).await;
         });
 
         *self.state.lock().unwrap() = Some(Running {

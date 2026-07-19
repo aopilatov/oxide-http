@@ -14,11 +14,14 @@ napi        = { version = "3", default-features = false, features = ["napi8", "t
 napi-derive = "3"
 
 # async-рантайм и HTTP-стек
-tokio          = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio          = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util", "time"] }
 hyper          = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util     = { version = "0.1", features = ["http1", "http2", "server-auto", "server-graceful", "tokio"] }
 http-body-util = "0.1"
 bytes          = "1"
+# socket-опции: backlog, SO_REUSEPORT (§6c B9)
+# feature "all" нужен для set_reuse_port (в socket2 он под этим флагом)
+socket2        = { version = "0.5", features = ["all"] }
 
 # роутинг + парсинг query
 matchit         = "0.8"
