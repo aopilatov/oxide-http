@@ -53,14 +53,20 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             host: ubuntu-latest
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+          # Образ lts-debian существует ТОЛЬКО под amd64, поэтому arm64-цель
+          # собираем кросс-компиляцией на amd64-раннере в специальном образе
+          # lts-debian-aarch64 (он сам x86_64, но несёт rust-таргет aarch64).
+          # Запуск lts-debian на arm-раннере даёт `exec format error`.
           - target: aarch64-unknown-linux-gnu
-            host: ubuntu-24.04-arm
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+            host: ubuntu-latest
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64
           # musl — отдельные бинарники: libc аддона обязана совпадать с libc Node.
           - target: x86_64-unknown-linux-musl
             host: ubuntu-latest
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
             artifact: oxide-http.linux-x64-musl.node
+          # А вот lts-alpine мультиархитектурный (amd64 + arm64), поэтому
+          # arm64-musl собирается нативно на arm-раннере.
           - target: aarch64-unknown-linux-musl
             host: ubuntu-24.04-arm
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
@@ -102,6 +108,16 @@ jobs:
       - name: Сборка (нативно)
         if: ${{ !matrix.docker }}
         run: npx napi build --platform --release --target ${{ matrix.target }}
+
+      # index.js/index.d.ts лежат в репозитории (их нужно иметь без сборки).
+      # Здесь убеждаемся, что закоммиченные версии не разошлись с Rust-исходниками.
+      - name: Сгенерированные index.js/index.d.ts не устарели
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          git diff --exit-code -- index.js index.d.ts || {
+            echo '::error::index.js/index.d.ts разошлись с Rust-исходниками — пересоберите (npm run build) и закоммитьте'
+            exit 1
+          }
 
       - uses: actions/upload-artifact@v4
         with:
