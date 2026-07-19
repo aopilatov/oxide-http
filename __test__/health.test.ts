@@ -1,12 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 const here = dirname(fileURLToPath(import.meta.url));
 
 let PORT = 39400;
@@ -66,15 +64,15 @@ test('M11: setReadinessCheck снимает готовность при пров
   const s = await up({ routes: (app) => app.get('/', (c) => c.text('ok')) });
   try {
     s.server.setReadinessCheck(() => healthy, { interval: 60 });
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise<void>((r) => setTimeout(r, 150));
     assert.equal((await get(s.port, '/readyz')).status, 200);
 
     healthy = false; // например, отвалилась БД
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise<void>((r) => setTimeout(r, 200));
     assert.equal((await get(s.port, '/readyz')).status, 503);
 
     healthy = true;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise<void>((r) => setTimeout(r, 200));
     assert.equal((await get(s.port, '/readyz')).status, 200);
   } finally {
     await s.close();
@@ -90,12 +88,12 @@ test('M11: упавший или зависший readinessCheck = не гото
       },
       { interval: 60 },
     );
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise<void>((r) => setTimeout(r, 200));
     assert.equal((await get(s.port, '/readyz')).status, 503, 'throw → не готов');
 
     // Зависший колбэк не должен держать readiness «готовым» вечно.
-    s.server.setReadinessCheck(() => new Promise(() => {}), { interval: 60, timeout: 80 });
-    await new Promise((r) => setTimeout(r, 300));
+    s.server.setReadinessCheck(() => new Promise<void>(() => {}), { interval: 60, timeout: 80 });
+    await new Promise<void>((r) => setTimeout(r, 300));
     assert.equal((await get(s.port, '/readyz')).status, 503, 'таймаут → не готов');
   } finally {
     await s.close();
@@ -116,7 +114,7 @@ test('M11: /metrics отдаёт формат Prometheus и считает за�
 
     const res = await get(s.port, '/metrics');
     assert.equal(res.status, 200);
-    assert.match(res.headers.get('content-type'), /text\/plain.*version=0\.0\.4/);
+    assert.match(res.headers.get('content-type')!, /text\/plain.*version=0\.0\.4/);
 
     assert.match(res.body, /# TYPE http_requests_total counter/);
     assert.match(res.body, /http_requests_total\{method="GET",status="2xx"\} 2/);
@@ -137,8 +135,8 @@ test('M11: метрики считают байты тел', async () => {
   try {
     await fetch(`http://127.0.0.1:${s.port}/echo`, { method: 'POST', body: 'x'.repeat(500) });
     const res = await get(s.port, '/metrics');
-    const req = Number(res.body.match(/http_request_body_bytes_total (\d+)/)[1]);
-    const resp = Number(res.body.match(/http_response_body_bytes_total (\d+)/)[1]);
+    const req = Number(res.body.match(/http_request_body_bytes_total (\d+)/)![1]);
+    const resp = Number(res.body.match(/http_response_body_bytes_total (\d+)/)![1]);
     assert.ok(req >= 500, `прочитано байт запроса: ${req}`);
     assert.ok(resp >= 500, `записано байт ответа: ${resp}`);
   } finally {
@@ -193,7 +191,7 @@ test('M11: preShutdownDelay — readyz уже 503, но сервер ещё пр
   });
 
   const closing = s.close();
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise<void>((r) => setTimeout(r, 200));
 
   const ready = await get(s.port, '/readyz');
   assert.equal(ready.status, 503, 'под должен сняться с эндпоинтов сразу');
@@ -214,15 +212,15 @@ test('M11: без preShutdownDelay listener закрывается сразу, i
   const s = await up({
     routes: (app) =>
       app.get('/slow', async (c) => {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise<void>((r) => setTimeout(r, 500));
         return c.text('done');
       }),
   });
 
   const inflight = fetch(`http://127.0.0.1:${s.port}/slow`);
-  await new Promise((r) => setTimeout(r, 100));
+  await new Promise<void>((r) => setTimeout(r, 100));
   const closing = s.close();
-  await new Promise((r) => setTimeout(r, 150));
+  await new Promise<void>((r) => setTimeout(r, 150));
 
   // Дефолт (0) — прежнее поведение: приём прекращён немедленно.
   await assert.rejects(() => fetch(`http://127.0.0.1:${s.port}/slow`));
@@ -233,19 +231,19 @@ test('M11: без preShutdownDelay listener закрывается сразу, i
 
 test('M11: accessLog печатает JSON-строку на запрос', async () => {
   const port = nextPort();
-  const child = spawn(process.execPath, [join(here, 'fixtures/access-log-server.mjs'), String(port)], {
+  const child = spawn(process.execPath, [join(here, 'fixtures/access-log-server.ts'), String(port)], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
     let out = '';
     child.stdout.on('data', (d) => (out += d));
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const wait = setInterval(() => (out.includes('ready') ? (clearInterval(wait), resolve()) : null), 50);
       setTimeout(() => (clearInterval(wait), reject(new Error('сервер не поднялся'))), 5000);
     });
 
     await fetch(`http://127.0.0.1:${port}/hello?q=1`);
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise<void>((r) => setTimeout(r, 200));
 
     const line = out
       .split('\n')

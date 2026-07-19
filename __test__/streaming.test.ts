@@ -1,10 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { gzipSync } from 'node:zlib';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 let PORT = 38300;
 const nextPort = () => PORT++;
@@ -113,7 +111,7 @@ test('M4: стриминг ответа (SSE-подобный) идёт чанк
           async start(controller) {
             for (let i = 0; i < 3; i++) {
               controller.enqueue(new TextEncoder().encode(`data: ${i}\n\n`));
-              await new Promise((r) => setTimeout(r, 5));
+              await new Promise<void>((r) => setTimeout(r, 5));
             }
             controller.close();
           },
@@ -123,7 +121,7 @@ test('M4: стриминг ответа (SSE-подобный) идёт чанк
   });
   try {
     const res = await fetch(`${s.base}/sse`);
-    assert.equal(res.headers.get('content-type'), 'text/event-stream');
+    assert.equal(res.headers.get('content-type')!, 'text/event-stream');
     assert.equal(await res.text(), 'data: 0\n\ndata: 1\n\ndata: 2\n\n');
   } finally {
     s.close();
@@ -160,10 +158,10 @@ test('M4: backpressure ответа — producer тормозит под мед�
   });
   try {
     const res = await fetch(`${s.base}/bp`);
-    const reader = res.body.getReader();
+    const reader = res.body!.getReader();
     // Читаем только первый чанк и ждём — producer не должен убежать далеко вперёд.
     await reader.read();
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise<void>((r) => setTimeout(r, 50));
     const producedEarly = produced;
     // Дочитываем.
     while (!(await reader.read()).done);

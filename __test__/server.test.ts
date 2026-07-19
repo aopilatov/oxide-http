@@ -1,9 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 // Фиксированные порты (автовыбор listen({port:0}) — на M10).
 let PORT = 38100;
@@ -64,7 +62,7 @@ test('M2: 404 (Rust) и 405 + Allow (Rust)', async () => {
     assert.equal((await fetch(`${s.base}/nope`)).status, 404);
     const res = await fetch(`${s.base}/users`, { method: 'DELETE' });
     assert.equal(res.status, 405);
-    const allow = res.headers.get('allow');
+    const allow = res.headers.get('allow')!;
     assert.ok(allow.includes('GET') && allow.includes('POST') && allow.includes('HEAD'));
   } finally {
     s.close();
@@ -83,7 +81,7 @@ test('M2: авто-HEAD и авто-OPTIONS', async () => {
 
     const opt = await fetch(`${s.base}/x`, { method: 'OPTIONS' });
     assert.equal(opt.status, 204);
-    assert.ok(opt.headers.get('allow').includes('GET'));
+    assert.ok(opt.headers.get('allow')!.includes('GET'));
   } finally {
     s.close();
   }
@@ -122,7 +120,7 @@ test('M3: c.json ставит статус и content-type', async () => {
   try {
     const res = await fetch(`${s.base}/j`);
     assert.equal(res.status, 201);
-    assert.equal(res.headers.get('content-type'), 'application/json; charset=utf-8');
+    assert.equal(res.headers.get('content-type')!, 'application/json; charset=utf-8');
     assert.deepEqual(await res.json(), { ok: true });
   } finally {
     s.close();
@@ -172,9 +170,9 @@ test('M3: Set-Cookie отдельными строками + c.req.cookie', asyn
     assert.equal(await res.text(), 'in=xyz');
     const setCookie = res.headers.getSetCookie();
     assert.equal(setCookie.length, 2);
-    assert.ok(setCookie[0].startsWith('a=1'));
-    assert.ok(setCookie[0].includes('HttpOnly'));
-    assert.ok(setCookie[1].includes('SameSite=Lax'));
+    assert.ok(setCookie[0]!.startsWith('a=1'));
+    assert.ok(setCookie[0]!.includes('HttpOnly'));
+    assert.ok(setCookie[1]!.includes('SameSite=Lax'));
   } finally {
     s.close();
   }
@@ -228,7 +226,7 @@ test('M3: request-id генерируется (UUIDv7) и уходит в отв
   try {
     const res = await fetch(`${s.base}/id`);
     assert.match(seen, /^[0-9a-f-]{36}$/);
-    assert.equal(res.headers.get('x-request-id'), seen);
+    assert.equal(res.headers.get('x-request-id')!, seen);
 
     // переданный x-request-id сохраняется
     const res2 = await fetch(`${s.base}/id`, { headers: { 'x-request-id': 'abc-123' } });
@@ -252,7 +250,7 @@ test('M3: c.set/get, c.status/header, c.req.path без baseUrl', async () => {
   try {
     const res = await fetch(`${s.base}/api/p/9`);
     assert.equal(res.status, 202);
-    assert.equal(res.headers.get('x-mark'), 'm');
+    assert.equal(res.headers.get('x-mark')!, 'm');
     assert.deepEqual(await res.json(), { path: '/p/9', rawPath: '/api/p/9', uid: '9' });
   } finally {
     s.close();

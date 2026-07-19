@@ -1,9 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 let PORT = 38800;
 const nextPort = () => PORT++;
@@ -19,7 +17,7 @@ async function up(build) {
 /** Собрать multipart/form-data вручную (fetch с FormData тоже можно, но так контролируем точнее). */
 function multipart(parts) {
   const boundary = '----oxidetest' + Math.floor(performance.now());
-  const chunks = [];
+  const chunks: any[] = [];
   for (const p of parts) {
     let head = `--${boundary}\r\nContent-Disposition: form-data; name="${p.name}"`;
     if (p.filename) head += `; filename="${p.filename}"`;
@@ -41,7 +39,7 @@ test('M8: потоковая загрузка — c.req.parts(), файлы и �
   const s = await up({
     routes: (app) =>
       app.post('/upload', { multipart: true }, async (c) => {
-        const result = { files: [], fields: {} };
+        const result: { files: unknown[]; fields: Record<string, unknown> } = { files: [], fields: {} };
         for await (const part of c.req.parts()) {
           if (part.filename) {
             let bytes = 0;

@@ -4,13 +4,12 @@
 // Идея: утечка даёт линейный рост (каждый блок +X МБ), а разовый прогрев аллокатора
 // и рост арен — выходят на плато. Поэтому первый блок после прогрева отбрасываем и
 // смотрим на прирост между установившимися блоками.
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const require = createRequire(import.meta.url);
+import { Server } from '../../js/index.ts';
+
 const here = dirname(fileURLToPath(import.meta.url));
-const { Server } = require(join(here, '../../js/index.js'));
 
 const port = Number(process.argv[2]);
 const blockSize = Number(process.argv[3] ?? 15000);
@@ -23,7 +22,7 @@ await app.listen({ port, host: '127.0.0.1' });
 
 const base = `http://127.0.0.1:${port}`;
 
-async function hammer(url, total, concurrency = 32, init) {
+async function hammer(url: string, total: number, concurrency = 32, init?: RequestInit) {
   let done = 0;
   const worker = async () => {
     while (done < total) {
@@ -36,9 +35,9 @@ async function hammer(url, total, concurrency = 32, init) {
 }
 
 async function settle() {
-  global.gc();
-  await new Promise((r) => setTimeout(r, 250));
-  global.gc();
+  global.gc?.();
+  await new Promise<void>((r) => setTimeout(r, 250));
+  global.gc?.();
 }
 
 const body = 'x'.repeat(8 * 1024);
@@ -50,7 +49,7 @@ const runBlock = async () => {
 await runBlock(); // прогрев: пулы, JIT, арены аллокатора
 await settle();
 
-const samples = [];
+const samples: Array<{ rss: number; heapUsed: number; external: number }> = [];
 for (let i = 0; i < blocks; i++) {
   await runBlock();
   await settle();

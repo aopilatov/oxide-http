@@ -1,14 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { existsSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 let PORT = 39200;
 const nextPort = () => PORT++;
@@ -25,7 +23,7 @@ async function up(build) {
 
 /** Сырой запрос по TCP: пишем байты как есть, собираем ответ до закрытия. */
 function raw(port, payload, waitMs = 2000) {
-  return new Promise((resolve, reject) => {
+  return new Promise<any>((resolve, reject) => {
     const sock = net.connect(port, '127.0.0.1');
     let data = '';
     let done = false;
@@ -40,7 +38,7 @@ function raw(port, payload, waitMs = 2000) {
     sock.on('close', finish);
     // ECONNRESET — законный исход: сервер закрыл соединение, не дочитав наш запрос
     // (лимит соединений, нет PROXY-префикса). Отдаём то, что успели получить.
-    sock.on('error', (e) => {
+    sock.on('error', (e: any) => {
       if (done) return;
       if (e.code === 'ECONNRESET') return finish();
       done = true;
@@ -59,7 +57,7 @@ test('M10c: сервер слушает Unix-сокет', async () => {
     routes: (app) => app.get('/hi', (c) => c.json({ via: 'unix' })),
   });
   try {
-    const body = await new Promise((resolve, reject) => {
+    const body = await new Promise<any>((resolve, reject) => {
       const req = http.request({ socketPath: path, path: '/hi' }, (res) => {
         let d = '';
         res.on('data', (chunk) => (d += chunk));
@@ -84,7 +82,7 @@ test('M10c: несвежий файл сокета не мешает старт�
 
   const second = await up({ listen: { path }, routes: (app) => app.get('/', (c) => c.text('2')) });
   try {
-    const body = await new Promise((resolve, reject) => {
+    const body = await new Promise<any>((resolve, reject) => {
       const req = http.request({ socketPath: path, path: '/' }, (res) => {
         let d = '';
         res.on('data', (c) => (d += c));
@@ -177,7 +175,7 @@ test('M10c: maxConnections отсекает лишние соединения', 
     config: { maxConnections: 2 },
     routes: (app) =>
       app.get('/slow', async (c) => {
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise<void>((r) => setTimeout(r, 400));
         return c.text('ok');
       }),
   });
@@ -185,14 +183,14 @@ test('M10c: maxConnections отсекает лишние соединения', 
     // Два соединения занимают лимит и держат его запросами.
     const busy = [1, 2].map(
       () =>
-        new Promise((resolve) => {
+        new Promise<any>((resolve) => {
           const sock = net.connect(s.port, '127.0.0.1');
           sock.on('connect', () => sock.write('GET /slow HTTP/1.1\r\nHost: x\r\n\r\n'));
           sock.on('data', () => resolve(sock));
           sock.on('error', () => resolve(sock));
         }),
     );
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise<void>((r) => setTimeout(r, 150));
 
     // Третье должно быть немедленно закрыто сервером без ответа.
     const third = await raw(s.port, 'GET /slow HTTP/1.1\r\nHost: x\r\n\r\n', 1200);
@@ -247,5 +245,6 @@ test("M10c: workerThreads:'auto' валиден, мусор — TypeError", asyn
   } finally {
     await s.close();
   }
+  // @ts-expect-error — намеренно неверное значение: проверяем рантайм-валидацию
   assert.throws(() => new Server({ workerThreads: 'many' }), TypeError);
 });

@@ -1,10 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import * as v from 'valibot';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 test('M12: inject без listen — поднимается сам, сокет не нужен', async () => {
   const app = new Server();
@@ -12,7 +10,7 @@ test('M12: inject без listen — поднимается сам, сокет н
   try {
     const res = await app.inject({ path: '/hello' });
     assert.equal(res.status, 200);
-    assert.deepEqual(res.json(), { hi: true });
+    assert.deepEqual(res.json<any>(), { hi: true });
   } finally {
     await app.close();
   }
@@ -33,7 +31,7 @@ test('M12: inject прогоняет params, query и заголовки', async
       query: { sort: 'desc' },
       headers: { 'user-agent': 'inject-test' },
     });
-    assert.deepEqual(res.json(), { id: '42', q: 'desc', ua: 'inject-test' });
+    assert.deepEqual(res.json<any>(), { id: '42', q: 'desc', ua: 'inject-test' });
   } finally {
     await app.close();
   }
@@ -45,7 +43,7 @@ test('M12: inject с телом — объект сериализуется в J
   try {
     const res = await app.inject({ method: 'POST', path: '/echo', body: { a: 1, b: 'два' } });
     assert.equal(res.status, 200);
-    assert.deepEqual(res.json(), { a: 1, b: 'два' });
+    assert.deepEqual(res.json<any>(), { a: 1, b: 'два' });
   } finally {
     await app.close();
   }
@@ -58,7 +56,7 @@ test('M12: inject видит 404 и 405 из Rust', async () => {
     assert.equal((await app.inject({ path: '/нет-такого' })).status, 404);
     const notAllowed = await app.inject({ method: 'DELETE', path: '/only-get' });
     assert.equal(notAllowed.status, 405);
-    assert.match(notAllowed.headers.allow, /GET/);
+    assert.match(notAllowed.headers.allow!, /GET/);
   } finally {
     await app.close();
   }
@@ -66,7 +64,7 @@ test('M12: inject видит 404 и 405 из Rust', async () => {
 
 test('M12: inject проходит через middleware, хуки и onError', async () => {
   const app = new Server();
-  const order = [];
+  const order: any[] = [];
   app.use(async (c, next) => {
     order.push('mw-in');
     try {
@@ -83,11 +81,11 @@ test('M12: inject проходит через middleware, хуки и onError', 
   app.get('/boom', () => {
     throw new Error('падение в хендлере');
   });
-  app.onError((err, c) => c.json({ handled: err.message }, 500));
+  app.onError((err: any, c) => c.json({ handled: err.message }, 500));
   try {
     const res = await app.inject({ path: '/boom' });
     assert.equal(res.status, 500);
-    assert.deepEqual(res.json(), { handled: 'падение в хендлере' });
+    assert.deepEqual(res.json<any>(), { handled: 'падение в хендлере' });
     assert.deepEqual(order, ['onRequest', 'mw-in', 'mw-caught']);
   } finally {
     await app.close();
@@ -102,7 +100,7 @@ test('M12: inject проходит нативную валидацию схем�
   try {
     const bad = await app.inject({ method: 'POST', path: '/users', body: { name: 'x' } });
     assert.equal(bad.status, 400);
-    assert.equal(bad.json().error, 'validation');
+    assert.equal(bad.json<any>().error, 'validation');
 
     const good = await app.inject({
       method: 'POST',
@@ -110,7 +108,7 @@ test('M12: inject проходит нативную валидацию схем�
       body: { name: 'Аня', age: 30 },
     });
     assert.equal(good.status, 200);
-    assert.deepEqual(good.json(), { ok: { name: 'Аня', age: 30 } });
+    assert.deepEqual(good.json<any>(), { ok: { name: 'Аня', age: 30 } });
   } finally {
     await app.close();
   }
@@ -127,8 +125,8 @@ test('M12: inject отдаёт несколько Set-Cookie отдельным�
     const res = await app.inject({ path: '/cookies' });
     const cookies = res.rawHeaders.filter((h) => h.key.toLowerCase() === 'set-cookie');
     assert.equal(cookies.length, 2, 'set-cookie не должен схлопываться');
-    assert.match(cookies[0].value, /^a=1/);
-    assert.match(cookies[1].value, /^b=2/);
+    assert.match(cookies[0]!.value, /^a=1/);
+    assert.match(cookies[1]!.value, /^b=2/);
   } finally {
     await app.close();
   }

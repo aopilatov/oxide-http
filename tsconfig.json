@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    // Node 18+ (engines) — ES2022 покрывается везде, где мы поддерживаемся.
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM"],
+    // Публикуем CJS: обёртка и сейчас CJS, потребителей не ломаем.
+    "module": "node18",
+    "moduleResolution": "node16",
+
+    "rootDir": "js",   // src/ занят Rust-кодом, TS-исходники живут в js/
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    // Максимальная строгость (по договорённости).
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "useUnknownInCatchVariables": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // Синтаксис должен быть «стираемым»: в разработке файлы .ts исполняются
+    // Node напрямую (type stripping), без шага сборки. Значит никаких enum,
+    // namespace и parameter properties — компилятор это проверит.
+    //
+    // verbatimModuleSyntax НЕ включаем: он требует, чтобы синтаксис совпадал с
+    // форматом вывода, а мы пишем ESM-синтаксис и компилируем его в CJS.
+    "erasableSyntaxOnly": true,
+    "isolatedModules": true,
+
+    // В исходниках импорты пишутся с расширением .ts (так Node исполняет их
+    // напрямую), а tsc переписывает их в .js при сборке.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["js/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

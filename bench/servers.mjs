@@ -3,12 +3,10 @@
 // у @oxide/http JS-хендлер дерётся за главный поток с самим клиентом.
 //
 // Запуск: node bench/servers.mjs <target> <port>
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import http from 'node:http';
 
-const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 
 const target = process.argv[2];
@@ -17,7 +15,7 @@ const PAYLOAD = { hello: 'world', ok: true, n: 42 };
 
 const starters = {
   async 'oxide'() {
-    const { Server } = require(join(here, '../js/index.js'));
+    const { Server } = await import(join(here, '../js/index.ts'));
     const app = new Server();
     app.get('/json', (c) => c.json(PAYLOAD));
     app.get('/text', (c) => c.text('ok'));
@@ -27,7 +25,7 @@ const starters = {
   // Нативная ручка: отвечает целиком в Rust, JS не будится. Показывает цену
   // самого моста — разницу между этой строкой и /json.
   async 'oxide-native'() {
-    const { Server } = require(join(here, '../js/index.js'));
+    const { Server } = await import(join(here, '../js/index.ts'));
     const app = new Server({ health: { path: '/json' } });
     app.get('/text', (c) => c.text('ok'));
     await app.listen({ port, host: '127.0.0.1' });

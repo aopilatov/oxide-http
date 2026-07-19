@@ -2,8 +2,8 @@
   "name": "@oxide/http",
   "version": "0.0.0",
   "description": "Быстрый HTTP/1.1 + HTTP/2 сервер для Node.js на Rust (napi-rs)",
-  "main": "js/index.js",
-  "types": "index.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "license": "MIT",
   "engines": {
     "node": ">=18"
@@ -24,19 +24,23 @@
     "build": "napi build --platform",
     "build:release": "napi build --platform --release",
     "artifacts": "napi artifacts",
-    "prepublishOnly": "napi prepublish -t npm",
+    "prepublishOnly": "tsc && napi prepublish -t npm",
     "format": "cargo fmt",
-    "lint": "cargo clippy -- -D warnings",
-    "test": "node --test \"__test__/**/*.test.mjs\""
+    "lint": "cargo clippy -- -D warnings && npm run typecheck",
+    "test": "node --test \"__test__/**/*.test.ts\"",
+    "build:ts": "tsc",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.7.2",
+    "@types/node": "^26.1.1",
     "@valibot/to-json-schema": "^1.7.1",
+    "typescript": "^7.0.2",
     "valibot": "^1.4.2"
   },
   "files": [
     "index.js",
     "index.d.ts",
-    "js/"
+    "dist/"
   ]
 }

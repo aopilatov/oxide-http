@@ -1,13 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import net from 'node:net';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 const here = dirname(fileURLToPath(import.meta.url));
 
 let PORT = 39000;
@@ -24,7 +22,7 @@ async function up(build) {
 test('M10a: listen эмитит listening, close эмитит shutdown+close', async () => {
   const server = new Server();
   server.get('/', (c) => c.text('ok'));
-  const seen = [];
+  const seen: any[] = [];
   server.on('listening', (info) => seen.push(['listening', info.port]));
   server.on('shutdown', () => seen.push(['shutdown']));
   server.on('close', () => seen.push(['close']));
@@ -43,7 +41,7 @@ test('M10a: занятый порт → listen реджектится и эми�
   try {
     const second = new Server();
     second.get('/', (c) => c.text('dup'));
-    let emitted = null;
+    let emitted: unknown = null;
     second.on('error', (e) => (emitted = e));
 
     await assert.rejects(
@@ -62,7 +60,7 @@ test('M10a: close() дожидается in-flight запроса', async () => 
   const s = await up({
     routes: (app) =>
       app.get('/slow', async (c) => {
-        await new Promise((r) => setTimeout(r, 600));
+        await new Promise<void>((r) => setTimeout(r, 600));
         handlerDone = true;
         return c.text('finished');
       }),
@@ -70,7 +68,7 @@ test('M10a: close() дожидается in-flight запроса', async () => 
 
   // Запрос в полёте, ответ ещё не пришёл.
   const inflight = fetch(`http://127.0.0.1:${s.port}/slow`);
-  await new Promise((r) => setTimeout(r, 150));
+  await new Promise<void>((r) => setTimeout(r, 150));
 
   await s.close(); // должен дождаться, а не оборвать
   assert.equal(handlerDone, true, 'хендлер должен был досчитать до конца close()');
@@ -109,13 +107,13 @@ test('M10a: shutdownTimeout обрывает застрявший запрос',
     config: { shutdownTimeout: '300ms' },
     routes: (app) =>
       app.get('/stuck', async (c) => {
-        await new Promise((r) => setTimeout(r, 10_000)); // дольше дедлайна
+        await new Promise<void>((r) => setTimeout(r, 10_000)); // дольше дедлайна
         return c.text('never');
       }),
   });
 
-  const inflight = fetch(`http://127.0.0.1:${s.port}/stuck`).catch((e) => e);
-  await new Promise((r) => setTimeout(r, 150));
+  const inflight = fetch(`http://127.0.0.1:${s.port}/stuck`).catch((e: any) => e);
+  await new Promise<void>((r) => setTimeout(r, 150));
 
   const t0 = Date.now();
   await s.close();
@@ -129,18 +127,18 @@ test('M10a: во время shutdown новые соединения не при
   const s = await up({
     routes: (app) =>
       app.get('/slow', async (c) => {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise<void>((r) => setTimeout(r, 500));
         return c.text('ok');
       }),
   });
 
   const inflight = fetch(`http://127.0.0.1:${s.port}/slow`);
-  await new Promise((r) => setTimeout(r, 100));
+  await new Promise<void>((r) => setTimeout(r, 100));
 
   const closing = s.close();
-  await new Promise((r) => setTimeout(r, 100)); // listener уже закрыт, drain идёт
+  await new Promise<void>((r) => setTimeout(r, 100)); // listener уже закрыт, drain идёт
 
-  const refused = await new Promise((resolve) => {
+  const refused = await new Promise<any>((resolve) => {
     const sock = net.connect(s.port, '127.0.0.1');
     sock.on('connect', () => {
       sock.destroy();
@@ -156,26 +154,26 @@ test('M10a: во время shutdown новые соединения не при
 
 test('M10a: SIGTERM → graceful shutdown и exit 0', async () => {
   const port = nextPort();
-  const child = spawn(process.execPath, [join(here, 'fixtures/sigterm-server.mjs'), String(port)], {
+  const child = spawn(process.execPath, [join(here, 'fixtures/sigterm-server.ts'), String(port)], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
     // Дожидаемся готовности.
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       child.stdout.on('data', (d) => (String(d).includes('ready') ? resolve() : null));
       child.on('exit', () => reject(new Error('процесс упал до готовности')));
       setTimeout(() => reject(new Error('сервер не поднялся')), 5000);
     });
 
     const inflight = fetch(`http://127.0.0.1:${port}/slow`);
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise<void>((r) => setTimeout(r, 150));
     child.kill('SIGTERM');
 
     const res = await inflight;
     assert.equal(res.status, 200, 'in-flight запрос должен пережить SIGTERM');
     assert.equal(await res.text(), 'drained');
 
-    const code = await new Promise((resolve) => child.on('exit', resolve));
+    const code = await new Promise<any>((resolve) => child.on('exit', resolve));
     assert.equal(code, 0, 'процесс должен выйти с кодом 0');
   } finally {
     if (child.exitCode === null) child.kill('SIGKILL');
@@ -188,7 +186,7 @@ test('M10a: h2 получает GOAWAY на shutdown, текущий стрим 
     config: { h2c: true },
     routes: (app) =>
       app.get('/slow', async (c) => {
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise<void>((r) => setTimeout(r, 500));
         return c.text('h2-drained');
       }),
   });
@@ -197,7 +195,7 @@ test('M10a: h2 получает GOAWAY на shutdown, текущий стрим 
   let goaway = false;
   client.on('goaway', () => (goaway = true));
 
-  const body = await new Promise((resolve, reject) => {
+  const body = await new Promise<any>((resolve, reject) => {
     const req = client.request({ ':path': '/slow' });
     let d = '';
     req.setEncoding('utf8');

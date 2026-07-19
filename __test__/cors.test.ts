@@ -1,9 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 let PORT = 38600;
 const nextPort = () => PORT++;
@@ -36,10 +34,10 @@ test('M6: CORS preflight отвечается в Rust, НЕ будя JS', async 
       },
     });
     assert.equal(res.status, 204);
-    assert.equal(res.headers.get('access-control-allow-origin'), '*');
-    assert.ok(res.headers.get('access-control-allow-methods').includes('POST'));
+    assert.equal(res.headers.get('access-control-allow-origin')!, '*');
+    assert.ok(res.headers.get('access-control-allow-methods')!.includes('POST'));
     // allowedHeaders не задан → отражаем запрошенные
-    assert.equal(res.headers.get('access-control-allow-headers'), 'content-type, authorization');
+    assert.equal(res.headers.get('access-control-allow-headers')!, 'content-type, authorization');
     assert.equal(jsWoken, false, 'JS не должен просыпаться на preflight');
   } finally {
     s.close();
@@ -57,7 +55,7 @@ test('M6: запрещённый origin отклонён (403) на preflight', 
       headers: { origin: 'https://evil.com', 'access-control-request-method': 'POST' },
     });
     assert.equal(res.status, 403);
-    assert.equal(res.headers.get('access-control-allow-origin'), null);
+    assert.equal(res.headers.get('access-control-allow-origin')!, null);
   } finally {
     s.close();
   }
@@ -71,10 +69,10 @@ test('M6: CORS-заголовки на обычном ответе (allowed orig
   try {
     const res = await fetch(`${s.base}/data`, { headers: { origin: 'https://ok.com' } });
     assert.equal(res.status, 200);
-    assert.equal(res.headers.get('access-control-allow-origin'), 'https://ok.com');
-    assert.equal(res.headers.get('access-control-allow-credentials'), 'true');
-    assert.equal(res.headers.get('access-control-expose-headers'), 'x-total');
-    assert.equal(res.headers.get('vary'), 'origin');
+    assert.equal(res.headers.get('access-control-allow-origin')!, 'https://ok.com');
+    assert.equal(res.headers.get('access-control-allow-credentials')!, 'true');
+    assert.equal(res.headers.get('access-control-expose-headers')!, 'x-total');
+    assert.equal(res.headers.get('vary')!, 'origin');
   } finally {
     s.close();
   }
@@ -89,7 +87,7 @@ test('M6: обычный запрос с чужого origin — без ACAO, н
     const res = await fetch(`${s.base}/data`, { headers: { origin: 'https://evil.com' } });
     assert.equal(res.status, 200);
     assert.equal(await res.text(), 'served'); // сервер отвечает
-    assert.equal(res.headers.get('access-control-allow-origin'), null); // но без ACAO
+    assert.equal(res.headers.get('access-control-allow-origin')!, null); // но без ACAO
   } finally {
     s.close();
   }
@@ -102,8 +100,8 @@ test('M6: credentials + origin=* → ACAO отражает конкретный 
   });
   try {
     const res = await fetch(`${s.base}/d`, { headers: { origin: 'https://x.com' } });
-    assert.equal(res.headers.get('access-control-allow-origin'), 'https://x.com');
-    assert.equal(res.headers.get('access-control-allow-credentials'), 'true');
+    assert.equal(res.headers.get('access-control-allow-origin')!, 'https://x.com');
+    assert.equal(res.headers.get('access-control-allow-credentials')!, 'true');
   } finally {
     s.close();
   }
@@ -119,7 +117,7 @@ test('M6: preflight с maxAge', async () => {
       method: 'OPTIONS',
       headers: { origin: 'https://a.com', 'access-control-request-method': 'POST' },
     });
-    assert.equal(res.headers.get('access-control-max-age'), '3600');
+    assert.equal(res.headers.get('access-control-max-age')!, '3600');
   } finally {
     s.close();
   }
@@ -131,7 +129,7 @@ test('M6: без cors-конфига CORS-заголовков нет', async ()
   });
   try {
     const res = await fetch(`${s.base}/x`, { headers: { origin: 'https://a.com' } });
-    assert.equal(res.headers.get('access-control-allow-origin'), null);
+    assert.equal(res.headers.get('access-control-allow-origin')!, null);
   } finally {
     s.close();
   }

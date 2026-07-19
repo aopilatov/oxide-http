@@ -7,15 +7,13 @@
 //   full    — публичный Server со всей обёрткой
 //
 // Разности между соседями и дают раскладку.
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
-const { RustServer } = require(join(here, '../index.js'));
-const { Server } = require(join(here, '../js/index.js'));
-const { buildContext, buildNativeResponse } = require(join(here, '../js/context.js'));
+const { RustServer } = await import(join(here, '../index.js'));
+const { Server } = await import(join(here, '../js/index.ts'));
+const { buildContext, buildNativeResponse } = await import(join(here, '../js/context.ts'));
 
 const variant = process.argv[2];
 const port = Number(process.argv[3]);

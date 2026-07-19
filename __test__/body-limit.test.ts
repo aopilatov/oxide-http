@@ -1,10 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import net from 'node:net';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 let PORT = 38400;
 const nextPort = () => PORT++;
@@ -18,8 +16,12 @@ async function up(build) {
 }
 
 /** Сырой HTTP-запрос через TCP (fetch не даёт слать «кривые» тела). */
-function rawRequest(port, requestText, { bodyChunks = [], settleMs = 300 } = {}) {
-  return new Promise((resolve, reject) => {
+function rawRequest(
+  port: number,
+  requestText: string,
+  { bodyChunks = [], settleMs = 300 }: { bodyChunks?: string[]; settleMs?: number } = {},
+) {
+  return new Promise<any>((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1');
     let data = '';
     socket.setEncoding('utf8');
@@ -31,7 +33,7 @@ function rawRequest(port, requestText, { bodyChunks = [], settleMs = 300 } = {})
       socket.write(requestText);
       for (const ch of bodyChunks) {
         socket.write(ch);
-        await new Promise((r) => setTimeout(r, 10));
+        await new Promise<void>((r) => setTimeout(r, 10));
       }
     });
     setTimeout(() => {
@@ -73,7 +75,7 @@ test('SECURITY: лимит держится на chunked БЕЗ Content-Length',
   });
   try {
     // 20 chunk'ов по 512 байт = 10kb > 2kb.
-    const chunks = [];
+    const chunks = [] as any[];
     for (let i = 0; i < 20; i++) {
       chunks.push(`200\r\n${'B'.repeat(512)}\r\n`);
     }

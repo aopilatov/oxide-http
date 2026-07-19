@@ -13,3 +13,7 @@ Cargo.lock
 # Node
 node_modules
 npm-debug.log*
+
+# TypeScript build output
+/dist
+

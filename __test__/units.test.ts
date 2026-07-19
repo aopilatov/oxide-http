@@ -1,9 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const { parseBytes, parseDuration } = require('../js/units.js');
+import { parseBytes, parseDuration } from '../js/units.ts';
 
 test('M3: parseBytes строка и число', () => {
   assert.equal(parseBytes('10mb'), 10 * 1024 * 1024);

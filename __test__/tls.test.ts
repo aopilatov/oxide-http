@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -8,8 +7,7 @@ import http2 from 'node:http2';
 import https from 'node:https';
 import net from 'node:net';
 
-const require = createRequire(import.meta.url);
-const { Server } = require('../js/index.js');
+import { Server } from '../js/index.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CERT = readFileSync(join(here, 'fixtures/cert.pem'), 'utf8');
@@ -28,7 +26,7 @@ async function up(build) {
 
 /** HTTP/2 клиент (TLS или h2c) → один GET. */
 function h2get(url, opts = {}) {
-  return new Promise((resolve, reject) => {
+  return new Promise<any>((resolve, reject) => {
     const client = http2.connect(url, opts);
     client.on('error', reject);
     const req = client.request({ ':path': '/' });
@@ -68,11 +66,11 @@ test('M9: TLS + HTTP/1.1 fallback', async () => {
     // alpnProtocol живёт на сокете, а не на IncomingMessage. Читаем его в
     // resolve-значение, а не ассертим внутри колбэка: throw там оборвал бы чтение
     // ответа и оставил TLS-сокет открытым (процесс теста не завершился бы).
-    const { body, alpn } = await new Promise((resolve, reject) => {
+    const { body, alpn } = await new Promise<any>((resolve, reject) => {
       const req = https.request(
-        { host: '127.0.0.1', port: s.port, path: '/', ca: CERT, ALPNProtocols: ['http/1.1'] },
-        (res) => {
-          const alpn = res.socket.alpnProtocol;
+        { host: '127.0.0.1', port: s.port, path: '/', ca: CERT, ALPNProtocols: ['http/1.1'] } as any,
+        (res: any) => {
+          const alpn = (res.socket as any).alpnProtocol;
           let d = '';
           res.on('data', (c) => (d += c));
           res.on('end', () => resolve({ body: d, alpn }));
@@ -108,7 +106,7 @@ test('M9: cert из Buffer грузится', async () => {
     routes: (app) => app.get('/', (c) => c.text('buf-ok')),
   });
   try {
-    const body = await new Promise((resolve, reject) => {
+    const body = await new Promise<any>((resolve, reject) => {
       const req = https.request({ host: '127.0.0.1', port: s.port, path: '/', ca: CERT }, (res) => {
         let d = '';
         res.on('data', (c) => (d += c));
@@ -129,7 +127,7 @@ test('M9: Slowloris — медленные заголовки отсекаютс
     routes: (app) => app.get('/', (c) => c.text('ok')),
   });
   try {
-    const closed = await new Promise((resolve) => {
+    const closed = await new Promise<any>((resolve) => {
       const socket = net.connect(s.port, '127.0.0.1');
       let done = false;
       const finish = (v) => {
@@ -175,7 +173,7 @@ test('M9: HTTP/2 с настройками (maxConcurrentStreams, initialWindowS
  *  `write(socket, stop)` — писатель; `stop()` возвращает true, когда ответ уже пришёл
  *  и продолжать писать не нужно (иначе close с непрочитанными данными даёт RST). */
 function raw(port, write, waitMs = 3000) {
-  return new Promise((resolve, reject) => {
+  return new Promise<any>((resolve, reject) => {
     const socket = net.connect(port, '127.0.0.1');
     let data = '';
     let done = false;
@@ -260,7 +258,7 @@ test('M9: idleTimeout не рвёт долгий запрос (in-flight не п
     routes: (app) =>
       app.get('/slow', async (c) => {
         // Хендлер думает дольше idleTimeout и ничего не пишет в сокет.
-        await new Promise((r) => setTimeout(r, 900));
+        await new Promise<void>((r) => setTimeout(r, 900));
         return c.text('slow-ok');
       }),
   });
