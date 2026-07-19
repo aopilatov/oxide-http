@@ -18,9 +18,10 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
+use hyper_util::server::graceful::GracefulConnection;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio_rustls::TlsAcceptor;
 
 use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
@@ -38,6 +39,8 @@ pub struct Tuning {
     pub body_read_timeout: Option<Duration>,
     /// Простой соединения без чтения/записи (§6c A2). Покрывает и h1 keep-alive.
     pub idle_timeout: Option<Duration>,
+    /// Дедлайн drain'а при graceful shutdown (§10); истёк — рвём что осталось.
+    pub shutdown_timeout: Duration,
     pub handshake_timeout: Duration,
     pub max_headers: Option<usize>,
     /// Предел размера блока заголовков; превышение → 431 (§6c B10).
@@ -124,39 +127,72 @@ fn build_h1(t: &Tuning) -> http1::Builder {
     b
 }
 
-/// Гонка соединения с idle-сторожем: истёк простой → future дропается, сокет закрыт.
-async fn drive<F: std::future::Future>(conn: F, idle: Option<(Activity, Duration)>) {
-    match idle {
-        Some((activity, dur)) => {
-            tokio::select! {
-                _ = conn => {}
-                _ = watch_idle(activity, dur) => {}
-            }
+/// Обслужить соединение до конца, реагируя на idle-таймаут и graceful shutdown.
+///
+/// - истёк idle → future дропается, сокет закрывается;
+/// - пришёл shutdown → `graceful_shutdown()` (для h2 это `GOAWAY`, для h1 — дожать
+///   текущий запрос и не брать следующий по keep-alive), затем ждём завершения.
+async fn drive<C: GracefulConnection>(
+    conn: C,
+    idle: Option<(Activity, Duration)>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::pin!(conn);
+    let idle_wait = async {
+        match idle {
+            Some((activity, dur)) => watch_idle(activity, dur).await,
+            // Нет idle-таймаута → ветка не должна выигрывать гонку никогда.
+            None => std::future::pending().await,
         }
-        None => {
-            conn.await;
-        }
+    };
+    tokio::pin!(idle_wait);
+
+    tokio::select! {
+        _ = conn.as_mut() => return,
+        _ = &mut idle_wait => return,
+        _ = shutdown.changed() => {}
+    }
+
+    // Фаза graceful: просим соединение закрыться и даём ему дожать текущий запрос.
+    // Дедлайн общий (его держит accept-цикл), здесь только idle остаётся страховкой.
+    conn.as_mut().graceful_shutdown();
+    tokio::select! {
+        _ = conn => {}
+        _ = idle_wait => {}
     }
 }
 
-/// Accept-цикл. Останавливается по `shutdown` либо при drop'е рантайма.
+/// Accept-цикл и graceful shutdown (§10).
+///
+/// По сигналу `shutdown`: перестаём принимать соединения и сразу закрываем listener
+/// (порт свободен для нового пода), затем даём открытым соединениям дожать запросы
+/// до `shutdown_timeout`. Когда drain закончен (или дедлайн истёк) — сигналим `done`.
 pub async fn serve(
     std_listener: std::net::TcpListener,
     shared: Arc<Shared>,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
+    done: Arc<Notify>,
 ) {
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
-        Err(_) => return,
+        Err(_) => {
+            done.notify_one();
+            return;
+        }
     };
 
     // Билдеры собираем один раз, шарим в задачи через Arc (serve_connection(&self)).
     let auto_builder = Arc::new(build_auto(&shared.tuning));
     let h1_builder = Arc::new(build_h1(&shared.tuning));
 
+    // Детектор drain'а: каждая задача держит клон отправителя. Когда все соединения
+    // завершились, все клоны дропнуты и recv() отдаёт None — счётчики не нужны.
+    let (drain_tx, mut drain_rx) = mpsc::channel::<()>(1);
+    let mut shutdown_acc = shutdown.clone();
+
     loop {
         tokio::select! {
-            _ = shutdown.notified() => break,
+            _ = shutdown_acc.changed() => break,
             accepted = listener.accept() => {
                 let (stream, peer) = match accepted {
                     Ok(v) => v,
@@ -170,7 +206,11 @@ pub async fn serve(
                 let handshake_to = shared.tuning.handshake_timeout;
                 let h2c = shared.tuning.h2c;
                 let idle_to = shared.tuning.idle_timeout;
+                let conn_shutdown = shutdown.clone();
+                // Клон живёт до конца задачи — по его дропу считается drain.
+                let drain = drain_tx.clone();
                 tokio::spawn(async move {
+                    let _drain = drain;
                     // Трекер активности вешаем на TCP-сокет до TLS: хендшейк тоже
                     // считается активностью, а idle одинаково работает для h1/h2/TLS.
                     let activity = Activity::new();
@@ -196,21 +236,44 @@ pub async fn serve(
                             tokio::time::timeout(handshake_to, acceptor.accept(stream)).await
                         {
                             let io = TokioIo::new(tls_stream);
-                            drive(auto_builder.serve_connection(io, service), idle).await;
+                            drive(
+                                auto_builder.serve_connection(io, service),
+                                idle,
+                                conn_shutdown,
+                            )
+                            .await;
                         }
                     } else if h2c {
                         // plaintext + h2c prior-knowledge → auto (h1 + h2).
                         let io = TokioIo::new(stream);
-                        drive(auto_builder.serve_connection(io, service), idle).await;
+                        drive(
+                            auto_builder.serve_connection(io, service),
+                            idle,
+                            conn_shutdown,
+                        )
+                        .await;
                     } else {
                         // plaintext, только HTTP/1.1.
                         let io = TokioIo::new(stream);
-                        drive(h1_builder.serve_connection(io, service), idle).await;
+                        drive(h1_builder.serve_connection(io, service), idle, conn_shutdown).await;
                     }
                 });
             }
         }
     }
+
+    // Listener закрываем немедленно: порт освобождается до окончания drain'а,
+    // чтобы сменщик (новый под) мог забиндиться, пока мы дожимаем старые запросы.
+    drop(listener);
+
+    // Ждём, пока задачи соединений отпустят свои клоны drain_tx — но не дольше дедлайна.
+    drop(drain_tx);
+    let deadline = shared.tuning.shutdown_timeout;
+    tokio::select! {
+        _ = drain_rx.recv() => {}
+        _ = tokio::time::sleep(deadline) => {}
+    }
+    done.notify_one();
 }
 
 /// Общие для запроса данные (вычислены один раз, затем перемещаются в диспетч).

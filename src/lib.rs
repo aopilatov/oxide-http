@@ -19,7 +19,7 @@ use napi::bindgen_prelude::{Function, Promise};
 use napi::Result;
 use napi_derive::napi;
 use tokio::runtime::Runtime;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::bridge::{Handler, JsResponse, MatchedRequest};
 use crate::cors::{Cors, CorsOptions as RCorsOptions};
@@ -107,13 +107,21 @@ pub struct ListenOptions {
     pub max_headers: Option<i64>,
     /// Предел размера блока заголовков в байтах (§6c B10) → 431.
     pub max_header_size: Option<i64>,
+    /// Дедлайн graceful shutdown в мс (§10). По умолчанию 10с.
+    pub shutdown_timeout: Option<i64>,
     pub http2: Option<Http2Options>,
 }
 
 /// Состояние запущенного сервера (живёт, пока сервер слушает).
 struct Running {
     runtime: Runtime,
-    shutdown: Arc<Notify>,
+    /// Broadcast сигнала остановки: его слушают и accept-цикл, и каждое соединение
+    /// (`watch`, а не `Notify`: нужно разбудить всех, включая ещё не подписавшихся).
+    shutdown: watch::Sender<bool>,
+    /// Сигнал «drain завершён» от accept-цикла.
+    done: Arc<Notify>,
+    /// Дедлайн drain'а + запас: страховка, если сигнал `done` не придёт вовсе.
+    close_deadline: std::time::Duration,
 }
 
 /// Низкоуровневый сервер. Оборачивается JS-классом `Server`.
@@ -192,8 +200,11 @@ impl RustServer {
             v.filter(|&n| n >= 0)
                 .map(|n| std::time::Duration::from_millis(n as u64))
         };
+        let shutdown_timeout =
+            ms(options.shutdown_timeout).unwrap_or_else(|| std::time::Duration::from_secs(10));
         let tuning = Tuning {
             tls,
+            shutdown_timeout,
             h2c: options.h2c.unwrap_or(false),
             header_read_timeout: ms(options.header_read_timeout),
             body_read_timeout: ms(options.body_read_timeout),
@@ -258,36 +269,50 @@ impl RustServer {
             multipart: mp_slots,
             tuning,
         });
-        let shutdown = Arc::new(Notify::new());
-        let sd = shutdown.clone();
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let done = Arc::new(Notify::new());
+        let done_srv = done.clone();
         runtime.spawn(async move {
-            serve(std_listener, shared, sd).await;
+            serve(std_listener, shared, shutdown_rx, done_srv).await;
         });
 
-        *self.state.lock().unwrap() = Some(Running { runtime, shutdown });
+        *self.state.lock().unwrap() = Some(Running {
+            runtime,
+            shutdown,
+            done,
+            close_deadline: shutdown_timeout + std::time::Duration::from_secs(1),
+        });
         Ok(())
     }
 
-    /// Остановить сервер: разбудить accept-цикл и уничтожить рантайм. Идемпотентно.
+    /// Graceful shutdown (§10). Резолвится, когда in-flight запросы дожаты
+    /// (или истёк `shutdownTimeout`). Идемпотентно: повторный вызов — no-op.
+    ///
+    /// Порядок: сигнал → accept-цикл закрывает listener (порт свободен сразу) →
+    /// соединения получают `graceful_shutdown` (h2 — `GOAWAY`) → drain → `done`.
     ///
     /// Рантайм гасим в отдельном системном потоке через `shutdown_timeout`, а не
     /// `shutdown_background`: последний возвращается сразу и **может не уничтожить
     /// рантайм вообще** (док tokio). Тогда не дропается `Arc<Shared>`, а вместе с ним
     /// живут listener (порт занят) и `ThreadsafeFunction` (держит ref на event loop) —
-    /// процесс Node не завершается. `shutdown_timeout` гарантирует Drop рантайма;
-    /// отдельный поток нужен, чтобы не блокировать JS-поток.
+    /// процесс Node не завершается.
     #[napi]
-    pub fn close(&self) -> Result<()> {
-        if let Some(running) = self.state.lock().unwrap().take() {
-            // notify_one, а не notify_waiters: сохраняет permit, если accept-цикл
-            // в этот момент не ждёт на notified() (иначе сигнал терялся бы).
-            running.shutdown.notify_one();
-            std::thread::spawn(move || {
-                running
-                    .runtime
-                    .shutdown_timeout(std::time::Duration::from_secs(1));
-            });
-        }
+    pub async fn close(&self) -> Result<()> {
+        let Some(running) = self.state.lock().unwrap().take() else {
+            return Ok(());
+        };
+        // Ошибку send игнорируем: получателей может уже не быть (accept-цикл упал).
+        let _ = running.shutdown.send(true);
+
+        // Ждём drain. Свой дедлайн — на случай, если сигнал `done` не придёт вовсе
+        // (паника в accept-цикле): close() не должен зависнуть навсегда.
+        let _ = tokio::time::timeout(running.close_deadline, running.done.notified()).await;
+
+        std::thread::spawn(move || {
+            running
+                .runtime
+                .shutdown_timeout(std::time::Duration::from_secs(1));
+        });
         Ok(())
     }
 }

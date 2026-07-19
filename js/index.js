@@ -4,6 +4,7 @@
 // middleware (луковица) и хуков жизненного цикла; роутинг/матчинг/404/405 — в Rust.
 // Цепочки предкомпилируются на listen() (см. pipeline.js), контекст — context.js.
 
+const { EventEmitter } = require('node:events');
 const { RustServer } = require('../index.js');
 const { buildContext, buildNativeResponse, HttpError } = require('./context.js');
 const { parseBytes, parseDuration } = require('./units.js');
@@ -92,6 +93,11 @@ class Server {
   #requestIdHeader;
   #bodyLimit;
   #requestTimeout;
+  #events = new EventEmitter();
+  #listening = false;
+  #closing = null; // Promise текущего close() — делает close() идемпотентным
+  #signalCleanup = null;
+  #handleSignals;
 
   constructor(config = {}) {
     this.#baseUrl = normalizeBase(config.baseUrl);
@@ -122,6 +128,12 @@ class Server {
     }
     if (config.maxHeaders != null) this.#options.maxHeaders = config.maxHeaders;
     if (config.maxHeaderSize != null) this.#options.maxHeaderSize = parseBytes(config.maxHeaderSize);
+    if (config.shutdownTimeout != null) {
+      this.#options.shutdownTimeout = parseDuration(config.shutdownTimeout);
+    }
+    // SIGTERM/SIGINT → graceful shutdown (§10). Выключается { handleSignals: false }
+    // — например когда процессом уже управляет внешний супервизор.
+    this.#handleSignals = config.handleSignals !== false;
     if (config.http2) this.#options.http2 = normalizeHttp2(config.http2);
     this.#native = new RustServer();
 
@@ -262,20 +274,81 @@ class Server {
       if (r.multipart) entry.multipart = r.multipart;
       return entry;
     });
-    this.#native.listen(
-      port,
-      host,
-      table,
-      this.#notFound != null,
-      this.#options,
-      // napi передаёт кортеж (MatchedRequest, BodyIo) одним аргументом-массивом.
-      ([req, bodyIo]) => this.#dispatch(req, bodyIo),
-    );
+    try {
+      this.#native.listen(
+        port,
+        host,
+        table,
+        this.#notFound != null,
+        this.#options,
+        // napi передаёт кортеж (MatchedRequest, BodyIo) одним аргументом-массивом.
+        ([req, bodyIo]) => this.#dispatch(req, bodyIo),
+      );
+    } catch (err) {
+      // Bind падает синхронно (EADDRINUSE и т.п.) — отдаём и событием, и reject'ом.
+      // emit только при наличии слушателя: 'error' без подписчика в EventEmitter
+      // роняет процесс, а у нас инвариант «процесс не падает» (§8).
+      if (this.#events.listenerCount('error') > 0) this.#events.emit('error', err);
+      throw err;
+    }
+
+    this.#listening = true;
+    if (this.#handleSignals) this.#installSignalHandlers();
+    this.#events.emit('listening', { port, host });
     return this;
   }
 
+  /** Подписка на server-события: `listening`, `error`, `close`, `shutdown` (§6d B7). */
+  on(event, fn) {
+    this.#events.on(event, fn);
+    return this;
+  }
+  off(event, fn) {
+    this.#events.off(event, fn);
+    return this;
+  }
+
+  /** Graceful shutdown (§10): закрыть listener, дожать in-flight, затем резолвнуться.
+   *  Идемпотентен и безопасен для параллельных вызовов — все ждут один и тот же drain. */
   close() {
-    this.#native.close();
+    if (this.#closing) return this.#closing;
+    this.#closing = (async () => {
+      this.#events.emit('shutdown');
+      await this.#native.close();
+      this.#listening = false;
+      this.#removeSignalHandlers();
+      this.#events.emit('close');
+    })();
+    return this.#closing;
+  }
+
+  get listening() {
+    return this.#listening;
+  }
+
+  /** SIGTERM/SIGINT → graceful shutdown → exit 0 (k8s: §10). */
+  #installSignalHandlers() {
+    if (this.#signalCleanup) return;
+    const onSignal = (sig) => {
+      this.close()
+        .then(() => process.exit(0))
+        .catch(() => process.exit(1));
+      void sig;
+    };
+    const handlers = [
+      ['SIGTERM', () => onSignal('SIGTERM')],
+      ['SIGINT', () => onSignal('SIGINT')],
+    ];
+    for (const [sig, fn] of handlers) process.on(sig, fn);
+    this.#signalCleanup = () => {
+      for (const [sig, fn] of handlers) process.off(sig, fn);
+    };
+  }
+
+  #removeSignalHandlers() {
+    if (!this.#signalCleanup) return;
+    this.#signalCleanup();
+    this.#signalCleanup = null;
   }
 
   async #dispatch(nreq, bodyIo) {
