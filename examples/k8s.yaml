@@ -1,0 +1,69 @@
+# Манифест для @oxide/http. Ключевое — согласование таймаутов остановки:
+# terminationGracePeriodSeconds > preShutdownDelay + shutdownTimeout,
+# иначе k8s убьёт под посреди drain'а.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      # preShutdownDelay 10s + shutdownTimeout 15s = 25s, берём с запасом.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: api
+          image: registry.example.com/api:1.0.0
+          ports:
+            - { name: http, containerPort: 3000 }
+            - { name: admin, containerPort: 9090 }   # health: { port: 9090 }
+
+          resources:
+            requests: { cpu: "1", memory: 256Mi }
+            limits:   { cpu: "1", memory: 512Mi }
+            # workerThreads: 'auto' прочитает именно эту квоту (1 vCPU),
+            # а не число ядер ноды — иначе tokio поднял бы воркеров по числу ядер.
+
+          # Пробы на admin-порту: они отвечают из Rust и работают даже когда
+          # event loop занят или сервер перегружен.
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            failureThreshold: 30
+            periodSeconds: 1
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 2
+            # readyz отдаёт 503 при: shutdown (draining), устойчивой перегрузке
+            # (overloaded) и по app.setReady(false) / setReadinessCheck.
+
+          env:
+            - { name: NODE_ENV, value: production }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+spec:
+  selector: { app: api }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+    # admin-порт наружу НЕ публикуем: /metrics не должен светиться из интернета.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }

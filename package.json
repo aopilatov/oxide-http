@@ -41,6 +41,34 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "dist/"
+    "dist/",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "peerDependencies": {
+    "valibot": ">=1",
+    "@valibot/to-json-schema": ">=1"
+  },
+  "peerDependenciesMeta": {
+    "valibot": {
+      "optional": true
+    },
+    "@valibot/to-json-schema": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saxik/oxide-http.git"
+  },
+  "keywords": [
+    "http",
+    "http2",
+    "server",
+    "rust",
+    "napi",
+    "hyper",
+    "tokio",
+    "fastify-alternative"
   ]
 }

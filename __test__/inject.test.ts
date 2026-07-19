@@ -177,3 +177,21 @@ test('M12: inject после close() не воскрешает сервер мо
   // close() тихо занять новый порт было бы сюрпризом.
   await assert.rejects(() => app.inject({ path: '/' }), /закрыт/);
 });
+
+test('M12: inject отвергает заголовок, который HTTP не передаёт', async () => {
+  const app = new Server();
+  app.get('/h', (c) => c.json({ got: c.req.header('authorization') ?? null }));
+  try {
+    // Реальный fetch на такое отвечает ошибкой ByteString — харнесс обязан тоже,
+    // иначе тест был бы зелёным там, где сеть отказывает.
+    await assert.rejects(
+      () => app.inject({ path: '/h', headers: { authorization: 'Bearer секрет' } }),
+      /вне диапазона байта/,
+    );
+    // ASCII-значение проходит как обычно.
+    const ok = await app.inject({ path: '/h', headers: { authorization: 'Bearer secret' } });
+    assert.equal(ok.json<{ got: string }>().got, 'Bearer secret');
+  } finally {
+    await app.close();
+  }
+});

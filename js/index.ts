@@ -662,7 +662,20 @@ export class Server {
 
     const pairs: KvPair[] = [];
     for (const [k, v] of Object.entries(headers)) {
-      for (const one of Array.isArray(v) ? v : [v]) pairs.push({ key: k, value: String(one) });
+      for (const one of Array.isArray(v) ? v : [v]) {
+        const value = String(one);
+        // Значение заголовка обязано укладываться в байты (ByteString): реальный
+        // HTTP-клиент откажется такое отправить, и харнесс обязан вести себя так же.
+        // Иначе тест на inject зелёный, а тот же код по сети падает.
+        const bad = [...value].findIndex((ch) => ch.codePointAt(0)! > 0xff);
+        if (bad >= 0) {
+          throw new TypeError(
+            `inject: значение заголовка «${k}» содержит символ вне диапазона байта ` +
+              `(позиция ${bad}); HTTP такое не передаёт`,
+          );
+        }
+        pairs.push({ key: k, value });
+      }
     }
 
     let payload: Buffer | undefined;
