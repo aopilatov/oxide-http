@@ -4,7 +4,7 @@ import net from 'node:net';
 
 import { Server } from '../js/index.ts';
 
-let PORT = 38400;
+let PORT = 20400;
 const nextPort = () => PORT++;
 
 async function up(build) {

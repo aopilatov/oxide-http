@@ -79,7 +79,7 @@ async function startServer(id, port) {
 }
 
 const rows = [];
-let port = 42000;
+let port = 24000;
 for (const v of VARIANTS) {
   const child = await startServer(v.id, port);
   const opts = { host: '127.0.0.1', port, path: '/json', method: 'GET' };

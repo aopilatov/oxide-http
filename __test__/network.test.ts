@@ -8,7 +8,7 @@ import net from 'node:net';
 
 import { Server } from '../js/index.ts';
 
-let PORT = 39200;
+let PORT = 21200;
 const nextPort = () => PORT++;
 let SOCK = 0;
 const nextSock = () => join(tmpdir(), `oxide-http-test-${process.pid}-${SOCK++}.sock`);

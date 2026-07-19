@@ -108,7 +108,7 @@ async function startServer(id, port) {
 }
 
 const results = [];
-let port = 41000;
+let port = 23000;
 
 for (const target of TARGETS) {
   const { child, err } = await startServer(target.id, port);

@@ -1,13 +1,13 @@
 # Red Hat UBI 10.
 FROM redhat/ubi10:latest
 
-# В полном образе UBI пакетный менеджер — dnf (microdnf только в ubi-minimal).
-# Модуль по умолчанию даёт Node 16 — ниже нашего engines>=18, поэтому явно
-# включаем поддерживаемый поток: смысл проверки в том, что мы декларируем.
-RUN dnf -y module enable nodejs:20 \
- && dnf -y install nodejs \
+# В UBI 10 модульность DNF объявлена устаревшей, потока nodejs:20 там нет
+# (в отличие от UBI 9) — nodejs ставится обычным пакетом и уже свежий.
+# Версию печатаем и проверяем, что она не ниже нашего engines >= 18.
+RUN dnf -y install nodejs \
  && dnf clean all \
- && node -v
+ && node -v \
+ && node -e 'if (+process.versions.node.split(".")[0] < 18) { console.error("Node ниже 18"); process.exit(1) }'
 
 WORKDIR /app
 COPY package.json index.js index.d.ts ./

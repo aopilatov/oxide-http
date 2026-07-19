@@ -4,7 +4,7 @@ import http2 from 'node:http2';
 
 import { Server } from '../js/index.ts';
 
-let PORT = 39600;
+let PORT = 21600;
 const nextPort = () => PORT++;
 
 async function up(build) {

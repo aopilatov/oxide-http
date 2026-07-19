@@ -4,7 +4,7 @@ import { gzipSync } from 'node:zlib';
 
 import { Server } from '../js/index.ts';
 
-let PORT = 38300;
+let PORT = 20300;
 const nextPort = () => PORT++;
 
 async function up(build) {

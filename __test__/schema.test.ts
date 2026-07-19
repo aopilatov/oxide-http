@@ -4,7 +4,7 @@ import * as v from 'valibot';
 
 import { Server } from '../js/index.ts';
 
-let PORT = 38700;
+let PORT = 20700;
 const nextPort = () => PORT++;
 
 async function up(build) {

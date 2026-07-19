@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { Server } from '../js/index.ts';
 
-let PORT = 38600;
+let PORT = 20600;
 const nextPort = () => PORT++;
 
 async function up(build) {

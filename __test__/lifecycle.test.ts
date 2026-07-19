@@ -8,7 +8,7 @@ import net from 'node:net';
 import { Server } from '../js/index.ts';
 const here = dirname(fileURLToPath(import.meta.url));
 
-let PORT = 39000;
+let PORT = 21000;
 const nextPort = () => PORT++;
 
 async function up(build) {

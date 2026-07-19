@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { Server } from '../js/index.ts';
 
 // Фиксированные порты (автовыбор listen({port:0}) — на M10).
-let PORT = 38100;
+let PORT = 20100;
 const nextPort = () => PORT++;
 
 /** Поднять сервер на свободном порту, вернуть { base, close }. */

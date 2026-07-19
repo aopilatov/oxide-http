@@ -13,7 +13,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const CERT = readFileSync(join(here, 'fixtures/cert.pem'), 'utf8');
 const KEY = readFileSync(join(here, 'fixtures/key.pem'), 'utf8');
 
-let PORT = 38900;
+// Порты намеренно ниже 32768: на Linux эфемерный диапазон начинается с 32768,
+// и тест с listen({port:0}) мог получить от ядра ровно наш фиксированный порт.
+// На macOS диапазон начинается с 49152, поэтому локально это не воспроизводилось.
+let PORT = 20900;
 const nextPort = () => PORT++;
 
 async function up(build) {

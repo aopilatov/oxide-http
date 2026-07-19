@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { Server } from '../js/index.ts';
 const here = dirname(fileURLToPath(import.meta.url));
 
-let PORT = 39400;
+let PORT = 21400;
 const nextPort = () => PORT++;
 
 async function up(build) {

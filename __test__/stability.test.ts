@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { Server } from '../js/index.ts';
 const here = dirname(fileURLToPath(import.meta.url));
 
-let PORT = 39800;
+let PORT = 21800;
 const nextPort = () => PORT++;
 
 async function up(build) {
@@ -60,17 +60,22 @@ test('M12: под нагрузкой память выходит на плато
   const { samples } = JSON.parse(line);
 
   const mb = (n) => n / 1024 / 1024;
-  // Утечка = устойчивый прирост на каждом блоке. Сравниваем последний блок с
-  // первым замеренным (прогрев и разовый рост арен уже позади).
-  const growthMb = mb(samples.at(-1).rss - samples[0].rss);
-  const heapGrowthMb = mb(samples.at(-1).heapUsed - samples[0].heapUsed);
+  const rss = samples.map((s) => s.rss);
+  const dump = samples
+    .map((s, i) => `  блок ${i}: rss=${mb(s.rss).toFixed(1)}MB heap=${mb(s.heapUsed).toFixed(1)}MB`)
+    .join('\n');
 
-  assert.ok(
-    growthMb < 40,
-    `RSS вырос на ${growthMb.toFixed(1)}MB за ${samples.length - 1} блоков — похоже на утечку\n` +
-      samples.map((s, i) => `  блок ${i}: rss=${mb(s.rss).toFixed(1)}MB heap=${mb(s.heapUsed).toFixed(1)}MB`).join('\n'),
-  );
-  assert.ok(heapGrowthMb < 20, `heapUsed вырос на ${heapGrowthMb.toFixed(1)}MB — держим объекты в JS`);
+  // Порог именно относительный: абсолютные мегабайты зависят от машины
+  // (на CI-раннере с двумя ядрами воркеров tokio меньше, базовый RSS другой),
+  // и фиксированные 40MB там ложно срабатывали при обычном шуме аллокатора.
+  // Утечка даёт рост, кратный размеру блока, — 25% её не пропустят.
+  const spreadPct = ((Math.max(...rss) - Math.min(...rss)) / Math.min(...rss)) * 100;
+  assert.ok(spreadPct < 25, `разброс RSS ${spreadPct.toFixed(1)}% — похоже на утечку\n${dump}`);
+
+  // Главный признак утечки в JS — растущая куча. Здесь порог остаётся жёстким:
+  // heapUsed не зависит от числа воркеров и на плато держится ровно.
+  const heapGrowthMb = mb(samples.at(-1).heapUsed - samples[0].heapUsed);
+  assert.ok(heapGrowthMb < 5, `heapUsed вырос на ${heapGrowthMb.toFixed(1)}MB — держим объекты в JS\n${dump}`);
 });
 
 test('M12: 5k запросов с телами обрабатываются без потерь', async () => {
