@@ -71,14 +71,6 @@
     "tokio",
     "fastify-alternative"
   ],
-  "optionalDependencies": {
-    "@oxide-ts/http-darwin-arm64": "0.1.1",
-    "@oxide-ts/http-darwin-x64": "0.1.1",
-    "@oxide-ts/http-linux-x64-gnu": "0.1.1",
-    "@oxide-ts/http-linux-arm64-gnu": "0.1.1",
-    "@oxide-ts/http-linux-x64-musl": "0.1.1",
-    "@oxide-ts/http-linux-arm64-musl": "0.1.1"
-  },
   "bugs": {
     "url": "https://github.com/aopilatov/oxide-http/issues"
   },
