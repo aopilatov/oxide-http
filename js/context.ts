@@ -468,224 +468,340 @@ export function serializeCookie(name: string, value: string, opts: CookieOptions
 }
 
 /** Contextual logger: structured JSON to stdout carrying requestId (§6d B3). */
-function makeLogger(requestId: string): Logger {
-  const emit = (level: string, msg: string, extra?: Record<string, unknown>): void => {
+class ReqLogger implements Logger {
+  readonly #requestId: string;
+
+  constructor(requestId: string) {
+    this.#requestId = requestId;
+  }
+
+  #emit(level: string, msg: string, extra?: Record<string, unknown>): void {
     process.stdout.write(
-      JSON.stringify({ level, time: new Date().toISOString(), requestId, msg, ...extra }) + '\n',
+      JSON.stringify({
+        level,
+        time: new Date().toISOString(),
+        requestId: this.#requestId,
+        msg,
+        ...extra,
+      }) + '\n',
     );
-  };
-  return {
-    debug: (m, e) => emit('debug', m, e),
-    info: (m, e) => emit('info', m, e),
-    warn: (m, e) => emit('warn', m, e),
-    error: (m, e) => emit('error', m, e),
-  };
+  }
+
+  debug(msg: string, extra?: Record<string, unknown>): void {
+    this.#emit('debug', msg, extra);
+  }
+  info(msg: string, extra?: Record<string, unknown>): void {
+    this.#emit('info', msg, extra);
+  }
+  warn(msg: string, extra?: Record<string, unknown>): void {
+    this.#emit('warn', msg, extra);
+  }
+  error(msg: string, extra?: Record<string, unknown>): void {
+    this.#emit('error', msg, extra);
+  }
 }
 
 const CT_JSON = 'application/json; charset=utf-8';
 const CT_TEXT = 'text/plain; charset=utf-8';
 
+/** The request side of `c`: methods live on the prototype, per-request state in fields.
+ *  Derived views (header map, query records, cookies, valid values) are built on first
+ *  access — a handler that never touches them pays nothing (§17). */
+class OxideRequest implements ContextRequest {
+  readonly #nreq: NativeRequest;
+  readonly #bodyIo: BodyIo;
+  readonly #baseUrl: string;
+  readonly #bodyLimit: number | undefined;
+  #path: string | undefined;
+  #headers: Map<string, string> | undefined;
+  #queryLast: Record<string, string> | undefined;
+  #queryMulti: Record<string, string[]> | undefined;
+  #cookies: Record<string, string> | undefined;
+  #bodyUsed = false;
+  #signal: AbortSignal | undefined;
+  #rustValid: Record<ValidLocation, unknown> | undefined;
+  #valid: Record<string, unknown> | undefined;
+
+  constructor(
+    nreq: NativeRequest,
+    bodyIo: BodyIo,
+    baseUrl: string,
+    bodyLimit: number | undefined,
+  ) {
+    this.#nreq = nreq;
+    this.#bodyIo = bodyIo;
+    this.#baseUrl = baseUrl;
+    this.#bodyLimit = bodyLimit;
+  }
+
+  get method(): string {
+    return this.#nreq.method;
+  }
+  get rawPath(): string {
+    return this.#nreq.path;
+  }
+  get path(): string {
+    if (this.#path === undefined) {
+      const raw = this.#nreq.path;
+      const base = this.#baseUrl;
+      this.#path = base && raw.startsWith(base) ? raw.slice(base.length) || '/' : raw;
+    }
+    return this.#path;
+  }
+  get url(): string {
+    const qs = this.#nreq.queryString;
+    return qs ? `${this.#nreq.path}?${qs}` : this.#nreq.path;
+  }
+  get params(): Record<string, string> {
+    return this.#nreq.params;
+  }
+
+  get query(): Record<string, string> {
+    if (this.#queryLast === undefined) {
+      const last: Record<string, string> = Object.create(null) as Record<string, string>;
+      for (const { key, value } of this.#nreq.query) last[key] = value;
+      this.#queryLast = last;
+    }
+    return this.#queryLast;
+  }
+  queries(key: string): string[] {
+    if (this.#queryMulti === undefined) {
+      const multi: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+      for (const { key: k, value } of this.#nreq.query) (multi[k] ??= []).push(value);
+      this.#queryMulti = multi;
+    }
+    return this.#queryMulti[key] ?? [];
+  }
+
+  #headersMap(): Map<string, string> {
+    return (this.#headers ??= buildReqHeaders(this.#nreq.headers));
+  }
+  header(name: string): string | undefined {
+    return this.#headersMap().get(name.toLowerCase());
+  }
+  get headers(): Record<string, string> {
+    return Object.fromEntries(this.#headersMap());
+  }
+
+  get ip(): string {
+    return this.#nreq.ip;
+  }
+  get ips(): string[] {
+    return this.#nreq.ips;
+  }
+  get country(): string | undefined {
+    return this.#nreq.country ?? undefined;
+  }
+  get id(): string {
+    return this.#nreq.id;
+  }
+
+  /** The dispatcher installs its controller's signal when a timeout or disconnect
+   *  watcher exists; otherwise the first reader gets an inert (never aborted) signal. */
+  get signal(): AbortSignal | undefined {
+    return (this.#signal ??= new AbortController().signal);
+  }
+  set signal(s: AbortSignal | undefined) {
+    this.#signal = s;
+  }
+
+  cookie(name: string): string | undefined {
+    return (this.#cookies ??= parseCookies(this.header('cookie')))[name];
+  }
+
+  // --- body (streaming plus buffering with limit/decompression) ---
+  #useBody(): void {
+    if (this.#bodyUsed) throw new Error('request body has already been read');
+    this.#bodyUsed = true;
+  }
+  get stream(): ReadableStream<Uint8Array> {
+    this.#useBody();
+    return makeReqStream(this.#bodyIo);
+  }
+  async arrayBuffer(): Promise<ArrayBuffer> {
+    this.#useBody();
+    const raw = await collectRaw(this.#bodyIo, this.#bodyLimit);
+    // Uniform: the channel always carries what the client sent, schema or not.
+    const buf = decompress(raw, this.header('content-encoding'), this.#bodyLimit);
+    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+  }
+  async text(): Promise<string> {
+    return Buffer.from(await this.arrayBuffer()).toString('utf8');
+  }
+  // Malformed JSON is a client mistake: 400, not the 500 a bare SyntaxError produced.
+  async json<T = unknown>(): Promise<T> {
+    const raw = await this.text();
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      throw new HttpError(400, 'Invalid JSON body');
+    }
+  }
+  async parseBody(): Promise<Record<string, string>> {
+    return Object.fromEntries(new URLSearchParams(await this.text()));
+  }
+  // multipart: streaming iterator over parts (§9a)
+  parts(): AsyncGenerator<MultipartPart, void, void> {
+    this.#useBody();
+    return partsIterator(this.#bodyIo);
+  }
+  async formData(): Promise<FormData> {
+    const ct = this.header('content-type') ?? '';
+    const fd = new FormData();
+    if (ct.startsWith('multipart/form-data')) {
+      this.#useBody();
+      for await (const part of partsIterator(this.#bodyIo)) {
+        if (part.filename != null) {
+          const buf = Buffer.from(await part.arrayBuffer());
+          const opts = part.contentType ? { type: part.contentType } : {};
+          fd.append(part.name ?? '', new Blob([buf], opts), part.filename);
+        } else {
+          fd.append(part.name ?? '', await part.text());
+        }
+      }
+    } else {
+      for (const [k, v] of new URLSearchParams(await this.text())) fd.append(k, v);
+    }
+    return fd;
+  }
+
+  // validation (§6b): the valibot transform (_valid) layered on Rust coercion (_rustValid)
+  get _rustValid(): Record<ValidLocation, unknown> {
+    // Values validated in Rust (JSON strings) → objects for c.req.valid().
+    return (this.#rustValid ??= {
+      body: this.#nreq.validBody != null ? JSON.parse(this.#nreq.validBody) : undefined,
+      query: this.#nreq.validQuery != null ? JSON.parse(this.#nreq.validQuery) : undefined,
+      params: this.#nreq.validParams != null ? JSON.parse(this.#nreq.validParams) : undefined,
+    });
+  }
+  get _valid(): Record<string, unknown> {
+    return (this.#valid ??= Object.create(null) as Record<string, unknown>);
+  }
+  valid<T = unknown>(loc: ValidLocation): T {
+    const transformed = this.#valid?.[loc];
+    return (transformed !== undefined ? transformed : this._rustValid[loc]) as T;
+  }
+}
+
+/** The mutable response side. ResHeaders (with the request-id echo, §6d B2) is created
+ *  on first touch, so an untouched response pays for it only at finalize time. */
+class OxideResponse implements ContextResponse {
+  status: number | undefined = undefined;
+  sent = false;
+  #headers: ResHeaders | undefined;
+  readonly #requestIdHeader: string;
+  readonly #requestId: string;
+
+  constructor(requestIdHeader: string, requestId: string) {
+    this.#requestIdHeader = requestIdHeader;
+    this.#requestId = requestId;
+  }
+
+  get headers(): ResHeaders {
+    // request-id is echoed into the response by default (§6d B2).
+    return (this.#headers ??= new ResHeaders().set(this.#requestIdHeader, this.#requestId));
+  }
+}
+
+/** The context `c`: prototype methods, lazy store and logger. */
+class OxideContext implements Context {
+  readonly req: OxideRequest;
+  readonly res: OxideResponse;
+  aborted = false; // true on disconnect/timeout
+  error: unknown = undefined; // the last error (for onError and the "after" hooks)
+  _responseStrip: ResponseStrip | null;
+  _bodyIo: BodyIo;
+  _body: string | undefined = undefined;
+  _stream: BodySource | undefined = undefined;
+  _finalized = false;
+  _settled = false; // the response is already fixed → mutators are ignored
+  #store: Map<string, unknown> | undefined;
+  #log: Logger | undefined;
+
+  constructor(nreq: NativeRequest, bodyIo: BodyIo, opts: BuildContextOptions) {
+    this.req = new OxideRequest(nreq, bodyIo, opts.baseUrl ?? '', opts.bodyLimit);
+    this.res = new OxideResponse(opts.requestIdHeader ?? 'x-request-id', nreq.id);
+    this._responseStrip = opts.responseStrip ?? null;
+    this._bodyIo = bodyIo;
+  }
+
+  get log(): Logger {
+    return (this.#log ??= new ReqLogger(this.req.id));
+  }
+
+  // store shared between middleware and the handler
+  get _store(): Map<string, unknown> {
+    return (this.#store ??= new Map<string, unknown>());
+  }
+  set(key: string, value: unknown): Context {
+    this._store.set(key, value);
+    return this;
+  }
+  get<T = unknown>(key: string): T | undefined {
+    return this.#store?.get(key) as T | undefined;
+  }
+
+  // response mutators (no-ops once the response is fixed: guards the timeout race)
+  status(code: number): Context {
+    if (!this._settled) this.res.status = code;
+    return this;
+  }
+  header(name: string, value: string): Context {
+    if (!this._settled) this.res.headers.set(name, value);
+    return this;
+  }
+  cookie(name: string, value: string, opts?: CookieOptions): Context {
+    if (!this._settled) this.res.headers.append('set-cookie', serializeCookie(name, value, opts));
+    return this;
+  }
+
+  // finalizing helpers
+  json(value: unknown, status?: number): Context {
+    if (this._settled) return this;
+    this.res.headers.set('content-type', CT_JSON);
+    this._body = JSON.stringify(value);
+    this._stream = undefined;
+    if (status != null) this.res.status = status;
+    this._finalized = true;
+    return this;
+  }
+  text(value: string, status?: number): Context {
+    if (this._settled) return this;
+    this.res.headers.set('content-type', CT_TEXT);
+    this._body = String(value);
+    this._stream = undefined;
+    if (status != null) this.res.status = status;
+    this._finalized = true;
+    return this;
+  }
+  body(data: BodySource | string | null | undefined, status?: number): Context {
+    if (this._settled) return this;
+    if (status != null) this.res.status = status;
+    if (isStreamSource(data)) {
+      this._stream = data; // Buffer/ReadableStream/AsyncIterable → streamed response
+      this._body = undefined;
+    } else {
+      this._body = data == null ? undefined : String(data);
+      this._stream = undefined;
+    }
+    this._finalized = true;
+    return this;
+  }
+  redirect(location: string, status = 302): Context {
+    return this.status(status).header('location', location).body('');
+  }
+  notFound(): Context {
+    return this.text('Not Found', 404);
+  }
+}
+
 /** Build the context `c` from a native request. */
 export function buildContext(
   nreq: NativeRequest,
   bodyIo: BodyIo,
-  {
-    baseUrl = '',
-    requestIdHeader = 'x-request-id',
-    bodyLimit,
-    responseStrip = null,
-  }: BuildContextOptions = {},
+  opts: BuildContextOptions = {},
 ): Context {
-  const reqHeaders = buildReqHeaders(nreq.headers);
-
-  // Values validated in Rust (JSON strings) → objects for c.req.valid().
-  const rustValid: Record<ValidLocation, unknown> = {
-    body: nreq.validBody != null ? JSON.parse(nreq.validBody) : undefined,
-    query: nreq.validQuery != null ? JSON.parse(nreq.validQuery) : undefined,
-    params: nreq.validParams != null ? JSON.parse(nreq.validParams) : undefined,
-  };
-
-  const rawPath = nreq.path;
-  const path =
-    baseUrl && rawPath.startsWith(baseUrl) ? rawPath.slice(baseUrl.length) || '/' : rawPath;
-  const url = nreq.queryString ? `${rawPath}?${nreq.queryString}` : rawPath;
-
-  const queryLast: Record<string, string> = Object.create(null) as Record<string, string>;
-  const queryMulti: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
-  for (const { key, value } of nreq.query) {
-    queryLast[key] = value;
-    (queryMulti[key] ??= []).push(value);
-  }
-
-  let cookies: Record<string, string> | undefined;
-
-  // --- request body (streaming plus buffering with limit/decompression) ---
-  let bodyUsed = false;
-  const useBody = (): void => {
-    if (bodyUsed) throw new Error('request body has already been read');
-    bodyUsed = true;
-  };
-  const readBuffered = async (): Promise<Buffer> => {
-    const raw = await collectRaw(bodyIo, bodyLimit);
-    // Uniform: the channel always carries what the client sent, schema or not.
-    return decompress(raw, reqHeaders.get('content-encoding'), bodyLimit);
-  };
-  const arrayBuffer = async (): Promise<ArrayBuffer> => {
-    useBody();
-    const buf = await readBuffered();
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
-  };
-  const text = async (): Promise<string> => Buffer.from(await arrayBuffer()).toString('utf8');
-  const parseBody = async (): Promise<Record<string, string>> =>
-    Object.fromEntries(new URLSearchParams(await text()));
-
-  const res: ContextResponse = { status: undefined, headers: new ResHeaders(), sent: false };
-  // request-id is echoed into the response by default (§6d B2).
-  res.headers.set(requestIdHeader, nreq.id);
-
-  const c: Context = {
-    req: {
-      method: nreq.method,
-      path,
-      rawPath,
-      url,
-      params: nreq.params,
-      query: queryLast,
-      queries: (k: string) => queryMulti[k] ?? [],
-      header: (name: string) => reqHeaders.get(name.toLowerCase()),
-      get headers(): Record<string, string> {
-        return Object.fromEntries(reqHeaders);
-      },
-      ip: nreq.ip,
-      ips: nreq.ips,
-      country: nreq.country ?? undefined,
-      id: nreq.id,
-      signal: undefined, // AbortSignal (timeout/disconnect) — set by the dispatcher
-      cookie: (name: string) => (cookies ??= parseCookies(reqHeaders.get('cookie')))[name],
-      // body
-      get stream(): ReadableStream<Uint8Array> {
-        useBody();
-        return makeReqStream(bodyIo);
-      },
-      arrayBuffer,
-      text,
-      // Malformed JSON is a client mistake: 400, not the 500 a bare SyntaxError produced.
-      json: async <T = unknown,>(): Promise<T> => {
-        const raw = await text();
-        try {
-          return JSON.parse(raw) as T;
-        } catch {
-          throw new HttpError(400, 'Invalid JSON body');
-        }
-      },
-      parseBody,
-      // multipart: streaming iterator over parts (§9a)
-      parts(): AsyncGenerator<MultipartPart, void, void> {
-        useBody();
-        return partsIterator(bodyIo);
-      },
-      formData: async (): Promise<FormData> => {
-        const ct = reqHeaders.get('content-type') ?? '';
-        const fd = new FormData();
-        if (ct.startsWith('multipart/form-data')) {
-          useBody();
-          for await (const part of partsIterator(bodyIo)) {
-            if (part.filename != null) {
-              const buf = Buffer.from(await part.arrayBuffer());
-              const opts = part.contentType ? { type: part.contentType } : {};
-              fd.append(part.name ?? '', new Blob([buf], opts), part.filename);
-            } else {
-              fd.append(part.name ?? '', await part.text());
-            }
-          }
-        } else {
-          for (const [k, v] of new URLSearchParams(await text())) fd.append(k, v);
-        }
-        return fd;
-      },
-      // validation (§6b): the valibot transform (_valid) layered on Rust coercion (_rustValid)
-      _rustValid: rustValid,
-      _valid: Object.create(null) as Record<string, unknown>,
-      valid<T = unknown>(this: ContextRequest, loc: ValidLocation): T {
-        return (this._valid[loc] !== undefined ? this._valid[loc] : this._rustValid[loc]) as T;
-      },
-    },
-    res,
-    _responseStrip: responseStrip,
-    aborted: false, // true on disconnect/timeout
-    error: undefined, // the last error (for onError and the "after" hooks)
-    _bodyIo: bodyIo,
-    _body: undefined,
-    _stream: undefined,
-    _finalized: false,
-    _settled: false, // the response is already fixed → mutators are ignored
-    log: makeLogger(nreq.id),
-
-    // store shared between middleware and the handler
-    _store: new Map<string, unknown>(),
-    set(k: string, v: unknown): Context {
-      this._store.set(k, v);
-      return this;
-    },
-    get<T = unknown>(k: string): T | undefined {
-      return this._store.get(k) as T | undefined;
-    },
-
-    // response mutators (no-ops once the response is fixed: guards the timeout race)
-    status(n: number): Context {
-      if (!this._settled) res.status = n;
-      return this;
-    },
-    header(k: string, v: string): Context {
-      if (!this._settled) res.headers.set(k, v);
-      return this;
-    },
-    cookie(name: string, value: string, opts?: CookieOptions): Context {
-      if (!this._settled) res.headers.append('set-cookie', serializeCookie(name, value, opts));
-      return this;
-    },
-
-    // finalizing helpers
-    json(v: unknown, status?: number): Context {
-      if (this._settled) return this;
-      res.headers.set('content-type', CT_JSON);
-      this._body = JSON.stringify(v);
-      this._stream = undefined;
-      if (status != null) res.status = status;
-      this._finalized = true;
-      return this;
-    },
-    text(v: string, status?: number): Context {
-      if (this._settled) return this;
-      res.headers.set('content-type', CT_TEXT);
-      this._body = String(v);
-      this._stream = undefined;
-      if (status != null) res.status = status;
-      this._finalized = true;
-      return this;
-    },
-    body(data: BodySource | string | null | undefined, status?: number): Context {
-      if (this._settled) return this;
-      if (status != null) res.status = status;
-      if (isStreamSource(data)) {
-        this._stream = data; // Buffer/ReadableStream/AsyncIterable → streamed response
-        this._body = undefined;
-      } else {
-        this._body = data == null ? undefined : String(data);
-        this._stream = undefined;
-      }
-      this._finalized = true;
-      return this;
-    },
-    redirect(location: string, status = 302): Context {
-      return this.status(status).header('location', location).body('');
-    },
-    notFound(): Context {
-      return this.text('Not Found', 404);
-    },
-  };
-
-  return c;
+  return new OxideContext(nreq, bodyIo, opts);
 }
 
 /** Apply the handler's return value as sugar (string→text, stream→body, else json). */

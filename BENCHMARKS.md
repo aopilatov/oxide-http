@@ -37,21 +37,25 @@ h2load -n 200000 -c 64 -m 32 https://<host>:<port>/json   # HTTP/2
 ## Results
 
 Hardware: Apple M-series, 16 cores, macOS (darwin-arm64), Node v24.16.0.
-Run: `--duration=8 --connections=64`.
+Run: `--duration=8 --connections=64`, after the prototype-context rewrite (see below).
 
 | Server | RPS | p50 | p99 |
 |---|---:|---:|---:|
-| `node:http` | 68,905 | 0.89 ms | 1.78 ms |
-| `@oxide-ts/http`, native endpoint (no JS) | 67,869 | 0.89 ms | 1.84 ms |
-| `@oxide-ts/http`, JS handler | 39,896 | 1.40 ms | 4.14 ms |
+| `node:http` | 71,622 | 0.87 ms | 1.74 ms |
+| `@oxide-ts/http`, native endpoint (no JS) | 76,192 | 0.79 ms | 1.71 ms |
+| `@oxide-ts/http`, JS handler | 60,657 | 0.88 ms | 3.2 ms |
 
 The same run with `--connections=192`:
 
 | Server | RPS | p50 | p99 |
 |---|---:|---:|---:|
-| `node:http` | 65,477 | 2.89 ms | 3.56 ms |
-| `@oxide-ts/http`, native endpoint | 64,606 | 2.92 ms | 3.75 ms |
-| `@oxide-ts/http`, JS handler | 40,069 | 4.23 ms | 11.59 ms |
+| `node:http` | 67,245 | 2.83 ms | 3.27 ms |
+| `@oxide-ts/http`, native endpoint | 69,413 | 2.74 ms | 3.25 ms |
+| `@oxide-ts/http`, JS handler | 59,974 | 2.85 ms | 16.29 ms |
+
+Before the rewrite the JS-handler row was 39,896 RPS (p50 1.40 ms, p99 4.14 ms) at 64
+connections — the wrapper rework bought **+52%** on JS routes and closed the gap to
+`node:http` from −42% to −15%.
 
 `fastify` and `hono` were not part of this run — they are not installed in the measurement
 environment.
@@ -63,25 +67,26 @@ environment.
 192 (they even dip slightly). That is saturated-client behaviour. The real ceiling of the
 Rust path is not visible here — an external generator is needed.
 
-**2. The dominant cost is crossing into JS.** The difference between the native endpoint
-and a JS handler on the same server: 67.9k → 39.9k RPS, i.e. **≈10.6 µs per request**
-(25.1 µs versus 14.5 µs). That is the TSFN call, the `Promise` across the boundary,
-building the context `c` and running the onion.
+**2. The dominant cost is crossing into JS.** After the prototype-context rewrite the
+difference between the native endpoint and a JS handler on the same server is
+76.2k → 60.7k RPS, i.e. **≈3.4 µs per request** (16.5 µs versus 13.1 µs) — down from
+≈10.6 µs before it. What remains is essentially the TSFN call and the `Promise` across
+the boundary; the wrapper itself is now nearly free (see the profile below).
 
-**3. The project's original hypothesis does not hold for routes with a JS handler.**
-`@oxide-ts/http` with a JS handler is slower than `node:http` (39.9k versus 68.9k). The win
-today exists only where JS never wakes at all: routing, `404`/`405`, CORS preflight, a
-schema rejection, probes, `413`/`415` — all of which are answered from Rust and run at the
-speed of the native endpoint.
-
-This is not a verdict on the architecture, but it is not what the architecture was built
-for either. Before claiming a speed advantage, those 10 µs need to be broken down.
+**3. JS-handler routes still do not beat `node:http`, and will not.** With a JS handler
+`@oxide-ts/http` reaches 60.7k versus 71.6k for `node:http` (−15%; before the rewrite it
+was −42%). The remaining gap is the boundary round trip itself — the floor measured by
+the `bridge` layer (~16.9 µs) sits above `node:http`'s entire request (~14 µs). The win
+exists where JS never wakes at all: routing, `404`/`405`, CORS preflight, a schema
+rejection, probes, `413`/`415` — all answered from Rust at native-endpoint speed.
 
 ## Profiling the boundary crossing
 
 A layer-by-layer breakdown — [bench/profile.mjs](bench/profile.mjs) plus
 [bench/profile-servers.mjs](bench/profile-servers.mjs). Each layer adds exactly one thing
 to the previous one; `ELU` is the event loop utilization of the server process under load.
+
+Before the prototype-context rewrite:
 
 | Layer | RPS | µs/request | ELU | Δ vs previous |
 |---|---:|---:|---:|---:|
@@ -90,6 +95,23 @@ to the previous one; `ELU` is the event loop utilization of the server process u
 | `touch` — same plus reading **all** fields of the napi object | 58,052 | 17.23 | ~0.98 | −0.19 µs |
 | `ctx` — plus `buildContext` and `buildNativeResponse` | 45,369 | 22.04 | **1.000** | +4.81 µs |
 | `full` — plus the middleware onion and hooks | 42,048 | 23.78 | **1.000** | +1.74 µs |
+
+After it (context methods on a prototype, lazy derived views, no per-request
+options/`AbortController`/logger/store allocations, onion skipped for bare routes):
+
+| Layer | RPS | µs/request | Δ vs `bridge` |
+|---|---:|---:|---:|
+| `native` | 69,855–71,135 | ~14.2 | — |
+| `bridge` | 59,107–60,032 | ~16.8 | — |
+| `ctx` | 53,682–53,888 | ~18.6 | +1.8 µs |
+| `full` — the whole public path | 57,249–57,760 | ~17.4 | **+0.6 µs** |
+
+`full` now sits within ~0.6 µs of the bare-bridge floor: the entire wrapper (context,
+onion, hooks, dispatch) costs less than a microsecond per request. `ctx` reads *slower*
+than `full` only because that harness variant allocates a fresh options literal per
+request and calls the standalone `buildContext`, while the public server passes
+per-leaf options precompiled at `listen()` — the anomaly measures the harness, not the
+library.
 
 ### What this means
 
@@ -104,16 +126,15 @@ the ceiling is set by the measurement client rather than the server.
 that touches none of them (17.23 versus 17.40 µs, within noise). That rules out the
 hypothesis of expensive napi object access: the boundary data shape does not need redesign.
 
-**3. The expensive part is our own JS layer.** `buildContext` plus `buildNativeResponse`
-add 4.81 µs and the onion another 1.74 µs: **6.55 µs** together, roughly 27% of main-thread
-time per request. That is the addressable headroom.
-
-A curious detail: in an isolated micro-benchmark (a tight loop over the same input object)
-`buildContext` + `c.json` + `buildNativeResponse` fit into **0.86 µs** — more than five
-times less than on the real path. The difference is the price of allocating ~25 closures,
-several `Map`s and a large object literal per request, all of which live across a promise
-boundary instead of dying inside a tight loop. V8's young-generation size
-(`--max-semi-space-size=64`) does not change the result — this is not GC pressure as such.
+**3. The expensive part was our own JS layer — and it has been reclaimed.** Before the
+rewrite `buildContext` plus `buildNativeResponse` added 4.81 µs and the onion another
+1.74 µs: **6.55 µs** together, roughly 27% of main-thread time per request. The cause was
+allocating ~25 closures, several `Map`s and a large object literal per request, all
+living across a promise boundary (an isolated micro-benchmark of the same work fit into
+0.86 µs). The rewrite moved context methods onto class prototypes, made every derived
+view lazy (header map, query records, cookies, logger, store, `ResHeaders`,
+`AbortController`), precompiled per-leaf context options at `listen()` and skips the
+onion for routes without middleware — after which the whole wrapper costs **~0.6 µs**.
 
 **4. Strategic conclusion: optimizing the wrapper will not make JS routes faster than
 `node:http`.** The round trip across the boundary alone is 17.4 µs of main-thread time, and
@@ -131,10 +152,11 @@ graceful shutdown, metrics without JS).
 - ✅ **The boundary-crossing profile has been taken** — see the section above. Conclusion:
   data access across the boundary is free; the expensive parts are our JS layer (6.55 µs)
   and the round trip itself (17.4 µs).
-- **Reduce allocations in `buildContext`** — the only genuinely addressable headroom
-  (~6.5 µs out of 23.8). Directions: move context methods onto a prototype instead of ~25
-  closures per request; build `query`, headers, `_store` and the logger lazily. The ceiling
-  of this work is returning to ~17.4 µs, which is still slower than `node:http`.
+- ✅ **Reduce allocations in `buildContext`** — done: prototype-based context, lazy derived
+  views, per-leaf options precompiled at `listen()`, onion fast-path. The full path landed
+  at ~17.4 µs (≈0.6 µs over the bare bridge), i.e. the predicted ceiling was reached; the
+  JS-handler scenario went 39.9k → 60.7k RPS. Further gains require attacking the round
+  trip itself or sharding JS across worker threads.
 - **Verify with an external generator** — to establish the real ceiling of the Rust path and
   how much headroom actually exists.
 - **Add scenarios:** streaming/SSE, multipart uploads, a route with a schema (where Rust-side

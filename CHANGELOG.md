@@ -3,11 +3,25 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning follows [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-07-20
 
 A security and correctness pass over the whole codebase ([FIXES.md](FIXES.md) tracks the
-audit it came from). Several defaults changed and a few APIs are stricter — on `0.x` that
-is allowed, but read the breaking list before upgrading.
+audit it came from), plus a performance rework of the JS wrapper. Several defaults
+changed and a few APIs are stricter — on `0.x` that is allowed, but read the breaking
+list before upgrading.
+
+### Performance
+
+- **JS-handler routes: 39.9k → 60.7k RPS (+52%)** on the reference benchmark; the wrapper
+  above the raw bridge now costs ~0.6 µs per request instead of ~7.9 µs (see
+  [BENCHMARKS.md](BENCHMARKS.md)).
+- The context `c` was rewritten onto class prototypes: no more ~25 closures per request.
+  Derived views — header map, `query`/`queries`, cookies, the logger, the store,
+  `ResHeaders` (with the request-id echo), the `AbortSignal` — are built lazily on first
+  access. Public API and behaviour are unchanged.
+- Per-leaf context options are precompiled at `listen()`; the `AbortController` is only
+  allocated when a timeout or disconnect watcher needs it; empty hook stages are skipped;
+  routes without middleware bypass the onion entirely.
 
 ### Security
 

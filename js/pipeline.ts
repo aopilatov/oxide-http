@@ -54,6 +54,8 @@ export type Chain = {
   handler: Handler;
   middleware: Middleware[];
   onError: ErrorHook[];
+  /** Precomputed at buildChain: any non-empty "before" stage (fast-path skips the loop). */
+  hasBefore: boolean;
 } & { [K in Exclude<StageName, 'onError'>]: Hook[] };
 
 /** Whether a middleware/hook prefix matches the route path. */
@@ -84,6 +86,7 @@ export function buildChain(
     // so this is the single place with a cast: we assign them by name.
     (chain as Record<string, unknown>)[stage] = [...globals, ...routeLevel];
   }
+  chain.hasBefore = BEFORE_STAGES.some((stage) => chain[stage].length > 0);
   return chain;
 }
 
@@ -143,11 +146,20 @@ async function handleError(chain: Chain, c: Context, err: unknown): Promise<void
 /** Core: "before" hooks → onion; exceptions → onError. Fills in c (does not write). */
 export async function runCore(chain: Chain, c: Context): Promise<void> {
   try {
-    for (const stage of BEFORE_STAGES) {
-      if (c._finalized) break;
-      await runBeforeHooks(chain[stage], c);
+    if (chain.hasBefore) {
+      for (const stage of BEFORE_STAGES) {
+        if (c._finalized) break;
+        await runBeforeHooks(chain[stage], c);
+      }
     }
-    if (!c._finalized) await runOnion(chain.middleware, chain.handler, c);
+    if (!c._finalized) {
+      if (chain.middleware.length === 0) {
+        // Bare route: no onion, no dispatch closures — straight to the handler.
+        applyReturnValue(c, await chain.handler(c));
+      } else {
+        await runOnion(chain.middleware, chain.handler, c);
+      }
+    }
   } catch (err) {
     await handleError(chain, c, err);
   }

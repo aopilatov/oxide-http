@@ -17,6 +17,7 @@ import type {
 import { buildContext, buildNativeResponse, HttpError } from './context.ts';
 import type {
   BodyIo,
+  BuildContextOptions,
   Context,
   KvPair,
   NativeRequest,
@@ -329,6 +330,8 @@ export class Server {
   #chains: Chain[] = []; // precompiled chains by leafId (after listen)
   #notFoundChain: Chain | null = null;
   #responseStrip: Array<ResponseStrip | null> = []; // by leafId
+  #ctxOpts: BuildContextOptions[] = []; // by leafId, precomputed at listen (§17)
+  #ctxOptsBase: BuildContextOptions = { responseStrip: null };
   #options: NativeListenOptions;
   #requestIdHeader: string;
   #bodyLimit: number | undefined;
@@ -657,6 +660,18 @@ export class Server {
 
     // Precompile the chain for every route leaf.
     this.#chains = this.#routes.map((r) => buildChain(r, this.#middleware, this.#hooks));
+
+    // Context options are identical per leaf across requests — build them once here
+    // instead of allocating an options object on every dispatch (§17).
+    this.#ctxOptsBase = {
+      baseUrl: this.#baseUrl,
+      requestIdHeader: this.#requestIdHeader,
+      bodyLimit: this.#bodyLimit,
+      responseStrip: null,
+    };
+    this.#ctxOpts = this.#responseStrip.map((strip) =>
+      strip == null ? this.#ctxOptsBase : { ...this.#ctxOptsBase, responseStrip: strip },
+    );
     if (this.#notFound) {
       this.#notFoundChain = buildChain(
         { path: '', handler: this.#notFound, middleware: [], hooks: {} },
@@ -885,25 +900,27 @@ export class Server {
       // Unreachable: the route table and the chains are built from the same array.
       return { status: 500, headers: [], body: 'Internal Server Error' };
     }
-    const c = buildContext(nreq, bodyIo, {
-      baseUrl: this.#baseUrl,
-      requestIdHeader: this.#requestIdHeader,
-      bodyLimit: this.#bodyLimit,
-      responseStrip: nreq.leafId < 0 ? null : (this.#responseStrip[nreq.leafId] ?? null),
-    });
+    const c = buildContext(
+      nreq,
+      bodyIo,
+      nreq.leafId < 0 ? this.#ctxOptsBase : (this.#ctxOpts[nreq.leafId] ?? this.#ctxOptsBase),
+    );
 
-    const controller = new AbortController();
-    c.req.signal = controller.signal;
+    // The AbortController exists only when something can actually abort (timeout or
+    // disconnect watcher); a bare request skips the allocation (§17).
+    let controller: AbortController | undefined;
 
     // Client-disconnect detection. Rust resolves this for every request (otherwise the
     // promise would leak on each successful one), so subscribing is only worth its cost
     // when something will act on the result.
     if (chain.onAbort.length > 0 || this.#detectDisconnect) {
+      const ctrl = (controller = new AbortController());
+      c.req.signal = ctrl.signal;
       void bodyIo.waitAbort().then(
         async (aborted) => {
           if (!aborted || c._settled) return;
           c.aborted = true;
-          controller.abort();
+          ctrl.abort();
           try {
             await runAfterHooks(chain.onAbort, c);
           } catch {
@@ -918,13 +935,17 @@ export class Server {
 
     try {
       if (this.#requestTimeout) {
+        if (controller === undefined) {
+          controller = new AbortController();
+          c.req.signal = controller.signal;
+        }
         await withTimeout(chain, c, this.#requestTimeout, controller);
       } else {
         await runCore(chain, c);
       }
       // "before write" hooks always run (short-circuit/normal/error/timeout).
-      await runAfterHooks(chain.preSerialization, c);
-      await runAfterHooks(chain.onSend, c);
+      if (chain.preSerialization.length > 0) await runAfterHooks(chain.preSerialization, c);
+      if (chain.onSend.length > 0) await runAfterHooks(chain.onSend, c);
     } catch (err) {
       // Last line of defence: an error in onSend/preSerialization → 500 (or the HttpError status).
       if (!c._finalized) {
@@ -937,10 +958,12 @@ export class Server {
     const response = buildNativeResponse(c);
 
     // onResponse is observation only and always runs; its errors are swallowed.
-    try {
-      await runAfterHooks(chain.onResponse, c);
-    } catch {
-      // onResponse must not break the response
+    if (chain.onResponse.length > 0) {
+      try {
+        await runAfterHooks(chain.onResponse, c);
+      } catch {
+        // onResponse must not break the response
+      }
     }
     return response;
   }
