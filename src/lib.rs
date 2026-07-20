@@ -5,6 +5,7 @@
 //! See DESIGN.md.
 
 mod bridge;
+mod compress;
 mod cors;
 mod cpu;
 mod health;
@@ -264,6 +265,15 @@ impl RustServer {
         let mut mp_slots: Vec<Option<crate::multipart::MultipartConfig>> =
             (0..n).map(|_| None).collect();
         for r in routes {
+            // A multipart body is a stream of parts, not one JSON document, so a body
+            // schema there can never match — every request would 400. Say so at startup.
+            if r.multipart.is_some() && r.body_schema.is_some() {
+                return Err(napi::Error::from_reason(format!(
+                    "route {} {}: schema.body is not supported on a multipart route — \
+                     validate the parsed parts inside the handler",
+                    r.method, r.path
+                )));
+            }
             let leaf = crate::schema::LeafSchema::build(crate::schema::SchemaDef {
                 body: r.body_schema,
                 query: r.query_schema,

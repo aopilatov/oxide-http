@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import * as v from 'valibot';
 
 import { Server } from '../js/index.ts';
@@ -14,6 +15,106 @@ async function up(build) {
   await server.listen({ port, host: '127.0.0.1' });
   return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
 }
+
+test('B1: a compressed body is validated, not rejected', async () => {
+  // The regression: a compressed body skipped Rust buffering, so the validator saw
+  // "no body" and answered 400 — a valid gzipped request could never reach the handler.
+  const User = v.object({ name: v.string(), age: v.number() });
+  const s = await up({
+    routes: (app) =>
+      app.post('/users', { schema: { body: User } }, (c) => c.json(c.req.valid('body'))),
+  });
+  try {
+    const payload = JSON.stringify({ name: 'Bob', age: 42 });
+    const encodings = {
+      gzip: gzipSync(payload),
+      deflate: deflateSync(payload),
+      br: brotliCompressSync(payload),
+    };
+    for (const [encoding, body] of Object.entries(encodings)) {
+      const res = await fetch(`${s.base}/users`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-encoding': encoding },
+        body,
+      });
+      assert.equal(res.status, 200, `${encoding} should be accepted`);
+      assert.deepEqual(await res.json(), { name: 'Bob', age: 42 }, `${encoding} payload`);
+    }
+
+    // The schema still applies to the decoded document.
+    const bad = await fetch(`${s.base}/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: gzipSync(JSON.stringify({ name: 'Bob', age: 'not a number' })),
+    });
+    assert.equal(bad.status, 400);
+  } finally {
+    s.close();
+  }
+});
+
+test('B1: a broken or unknown encoding is a client error', async () => {
+  const User = v.object({ name: v.string() });
+  const s = await up({
+    routes: (app) =>
+      app.post('/users', { schema: { body: User } }, (c) => c.json(c.req.valid('body'))),
+  });
+  try {
+    const notGzip = await fetch(`${s.base}/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: 'this is not gzip at all',
+    });
+    assert.equal(notGzip.status, 400);
+
+    const unknown = await fetch(`${s.base}/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-encoding': 'lzma' },
+      body: gzipSync('{"name":"Bob"}'),
+    });
+    assert.equal(unknown.status, 415);
+  } finally {
+    s.close();
+  }
+});
+
+test('B1: a zip bomb is stopped at bodyLimit', async () => {
+  const User = v.object({ name: v.string() });
+  const s = await up({
+    config: { bodyLimit: '8kb' },
+    routes: (app) =>
+      app.post('/users', { schema: { body: User } }, (c) => c.json(c.req.valid('body'))),
+  });
+  try {
+    // Compresses to well under 8kb but expands to 4 MiB — the limit applies to the
+    // decoded size, so this must never be materialised.
+    const bomb = gzipSync(Buffer.alloc(4 * 1024 * 1024, 0x41));
+    assert.ok(bomb.length < 8 * 1024, `bomb should be small: ${bomb.length}`);
+    const res = await fetch(`${s.base}/users`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: bomb,
+    });
+    assert.equal(res.status, 413);
+  } finally {
+    s.close();
+  }
+});
+
+test('B1: schema.body on a multipart route fails listen()', async () => {
+  // A multipart body is a stream of parts, so the schema could never match and every
+  // request would 400. Better to say so at startup.
+  const app = new Server();
+  app.post(
+    '/upload',
+    { multipart: true, schema: { body: v.object({ name: v.string() }) } },
+    (c) => c.text('ok'),
+  );
+  await assert.rejects(
+    () => app.listen({ port: nextPort(), host: '127.0.0.1' }),
+    /schema\.body is not supported on a multipart route/,
+  );
+});
 
 test('M7: invalid body → 400 without waking JS', async () => {
   let handlerCalled = false;

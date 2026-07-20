@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
 
 import { Server } from '../js/index.ts';
 
@@ -13,7 +14,27 @@ async function up(build) {
   build.routes(server);
   const port = nextPort();
   await server.listen({ port, host: '127.0.0.1' });
-  return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
+  return { base: `http://127.0.0.1:${port}`, port, close: () => server.close() };
+}
+
+/** Send a hand-written request and collect the raw response. */
+function raw(port: number, request: string, waitMs = 1500): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1');
+    let data = '';
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      resolve(data);
+    };
+    socket.on('connect', () => socket.write(request));
+    socket.on('data', (d) => (data += d));
+    socket.on('close', finish);
+    socket.on('error', (e) => (done ? null : ((done = true), reject(e))));
+    setTimeout(finish, waitMs);
+  });
 }
 
 test('M2: :param and static taking priority over param', async () => {
@@ -151,6 +172,39 @@ test('M3: request headers are case-insensitive', async () => {
   try {
     const res = await fetch(`${s.base}/h`, { headers: { 'x-custom': 'yes' } });
     assert.equal(await res.text(), 'yes');
+  } finally {
+    s.close();
+  }
+});
+
+test('B3: split cookie header fields rejoin with "; "', async () => {
+  // RFC 9113 §8.2.3 lets HTTP/2 clients split the cookie header across fields, and
+  // HTTP/1.1 permits it too. Joining with ', ' made everything after the first cookie
+  // unparseable, so only `a` survived.
+  const s = await up({
+    routes: (app) => app.get('/c', (c) => c.text(`${c.req.cookie('a')}|${c.req.cookie('b')}`)),
+  });
+  try {
+    const res = await raw(
+      s.port,
+      'GET /c HTTP/1.1\r\nHost: x\r\nCookie: a=1\r\nCookie: b=2\r\nConnection: close\r\n\r\n',
+    );
+    assert.match(res, /^HTTP\/1\.1 200 /, res.slice(0, 60));
+    assert.ok(res.endsWith('1|2'), `both cookies must parse, got: ${JSON.stringify(res.slice(-40))}`);
+  } finally {
+    s.close();
+  }
+});
+
+test('B4: a malformed cookie escape does not fail the request', async () => {
+  const s = await up({
+    routes: (app) => app.get('/c', (c) => c.text(`${c.req.cookie('bad')}|${c.req.cookie('ok')}`)),
+  });
+  try {
+    // `%zz` makes decodeURIComponent throw; that used to surface as a 500.
+    const res = await fetch(`${s.base}/c`, { headers: { cookie: 'bad=%zz; ok=fine' } });
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), '%zz|fine', 'the raw value is kept, other cookies still parse');
   } finally {
     s.close();
   }

@@ -43,6 +43,8 @@ export interface NativeRequest {
   ips: string[];
   country?: string | null;
   id: string;
+  /** Rust already decompressed the body (it buffered it for schema validation). */
+  bodyDecoded: boolean;
   validBody?: string | null;
   validQuery?: string | null;
   validParams?: string | null;
@@ -240,11 +242,14 @@ function decompress(buf: Buffer, encoding: string | undefined, limit: number | u
   if (!enc || enc === 'identity') return buf;
   const opts = limit != null ? { maxOutputLength: limit } : {};
   try {
-    if (enc === 'gzip') return zlib.gunzipSync(buf, opts);
+    if (enc === 'gzip' || enc === 'x-gzip') return zlib.gunzipSync(buf, opts);
     if (enc === 'deflate') return zlib.inflateSync(buf, opts);
     if (enc === 'br') return zlib.brotliDecompressSync(buf, opts);
-    return buf; // unknown encoding — leave it alone
+    // Passing an unknown encoding through just moved the failure to the parser, which
+    // surfaced as a 500 for what is a client mistake.
+    throw new HttpError(415, 'Unsupported Media Type');
   } catch (e) {
+    if (e instanceof HttpError) throw e;
     const code = e != null && typeof e === 'object' && 'code' in e ? String(e.code) : '';
     if (code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength|too large/i.test(messageOf(e))) {
       throw new HttpError(413, 'Payload Too Large');
@@ -406,12 +411,20 @@ export class ResHeaders {
   }
 }
 
-/** Parse request headers (Vec<KvPair>, already lowercase) into a map, joining duplicates. */
+/** Parse request headers (Vec<KvPair>, already lowercase) into a map, joining duplicates.
+ *
+ *  `cookie` rejoins with `'; '`: RFC 9113 §8.2.3 lets HTTP/2 clients split the cookie
+ *  header into several fields, and `', '` would make everything after the first cookie
+ *  unparseable. */
 function buildReqHeaders(pairs: KvPair[]): Map<string, string> {
   const map = new Map<string, string>();
   for (const { key, value } of pairs) {
     const prev = map.get(key);
-    map.set(key, prev !== undefined ? `${prev}, ${value}` : value);
+    if (prev === undefined) {
+      map.set(key, value);
+    } else {
+      map.set(key, `${prev}${key === 'cookie' ? '; ' : ', '}${value}`);
+    }
   }
   return map;
 }
@@ -425,7 +438,15 @@ export function parseCookies(cookieHeader: string | undefined): Record<string, s
     if (eq < 0) continue;
     const k = part.slice(0, eq).trim();
     const v = part.slice(eq + 1).trim();
-    if (k) out[k] = decodeURIComponent(v);
+    // A malformed escape (`x=%zz`) makes decodeURIComponent throw. A bad cookie must not
+    // take the whole request down with a 500 — keep the raw value instead.
+    if (k) {
+      try {
+        out[k] = decodeURIComponent(v);
+      } catch {
+        out[k] = v;
+      }
+    }
   }
   return out;
 }
@@ -506,6 +527,9 @@ export function buildContext(
   };
   const readBuffered = async (): Promise<Buffer> => {
     const raw = await collectRaw(bodyIo, bodyLimit);
+    // Rust decodes the body itself when a schema forced it to buffer; decoding the
+    // already-plain bytes a second time would just fail.
+    if (nreq.bodyDecoded) return raw;
     return decompress(raw, reqHeaders.get('content-encoding'), bodyLimit);
   };
   const arrayBuffer = async (): Promise<ArrayBuffer> => {
@@ -547,7 +571,15 @@ export function buildContext(
       },
       arrayBuffer,
       text,
-      json: async <T = unknown,>(): Promise<T> => JSON.parse(await text()) as T,
+      // Malformed JSON is a client mistake: 400, not the 500 a bare SyntaxError produced.
+      json: async <T = unknown,>(): Promise<T> => {
+        const raw = await text();
+        try {
+          return JSON.parse(raw) as T;
+        } catch {
+          throw new HttpError(400, 'Invalid JSON body');
+        }
+      },
       parseBody,
       // multipart: streaming iterator over parts (§9a)
       parts(): AsyncGenerator<MultipartPart, void, void> {

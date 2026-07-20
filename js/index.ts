@@ -369,7 +369,12 @@ export class Server {
       const opts = list.shift() as RouteOptions;
       hooks = normalizeRouteHooks(opts);
       schema = opts.schema ?? null;
-      multipart = opts.multipart != null ? normalizeMultipart(opts.multipart) : null;
+      // `multipart: false` must stay off — it used to fall through to the normalizer and
+      // switch multipart on with default limits.
+      multipart =
+        opts.multipart != null && opts.multipart !== false
+          ? normalizeMultipart(opts.multipart)
+          : null;
     }
     const handler = list.pop();
     if (typeof handler !== 'function') {
@@ -878,9 +883,10 @@ function normalizeHttp2(h: Http2Config): NativeHttp2Options {
   return out;
 }
 
-/** Normalize the multipart option (`true` | `{...}`) into native MultipartOptions (§9a). */
-function normalizeMultipart(mp: boolean | MultipartConfig): NativeMultipartOptions {
-  const o: MultipartConfig = mp === true ? {} : mp === false ? {} : mp;
+/** Normalize the multipart option (`true` | `{...}`) into native MultipartOptions (§9a).
+ *  `false` never reaches here — the caller keeps multipart off entirely. */
+function normalizeMultipart(mp: true | MultipartConfig): NativeMultipartOptions {
+  const o: MultipartConfig = mp === true ? {} : mp;
   const out: NativeMultipartOptions = {
     maxFileSize: parseBytes(o.maxFileSize ?? '50mb'),
     maxFieldSize: parseBytes(o.maxFieldSize ?? '1mb'),
@@ -923,7 +929,8 @@ function injectValidation(route: RouteEntry): void {
     for (const loc of VALIDATION_ORDER) {
       const vs = valibotSchemas[loc];
       if (!vs) continue;
-      // Raw value: coerced by Rust; for a compressed body we read it in JS.
+      // Raw value: coerced by Rust, which now also decodes compressed bodies. The
+      // c.req.json() branch is a safety net for a leaf Rust did not pre-validate.
       const raw =
         loc === 'body' && c.req._rustValid.body === undefined
           ? await c.req.json()

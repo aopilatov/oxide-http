@@ -36,6 +36,25 @@ function multipart(parts) {
   };
 }
 
+test('B2: multipart: false leaves the route as a plain body route', async () => {
+  // `false` used to fall through to the normalizer and switch multipart *on* with
+  // default limits, so a non-multipart Content-Type was rejected with 415.
+  const s = await up({
+    routes: (app) => app.post('/x', { multipart: false }, async (c) => c.text(await c.req.text())),
+  });
+  try {
+    const res = await fetch(`${s.base}/x`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: 'plain body',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), 'plain body');
+  } finally {
+    s.close();
+  }
+});
+
 test('M8: streaming upload — c.req.parts(), files and fields', async () => {
   const s = await up({
     routes: (app) =>

@@ -922,26 +922,47 @@ async fn dispatch(
         }
     }
 
-    // The body is buffered in Rust only for native validation of an uncompressed,
-    // non-multipart body.
-    let compressed = is_compressed(&data.headers);
+    // The body is buffered in Rust for native validation of a non-multipart body. A
+    // compressed body is buffered too and decoded here: skipping it used to make the
+    // validator see "no body" and reject every compressed request with 400.
+    let encoding = content_encoding(&data.headers);
     let buffer_for_schema =
-        multipart_cfg.is_none() && schema.is_some_and(|s| s.has_body()) && has_body && !compressed;
+        multipart_cfg.is_none() && schema.is_some_and(|s| s.has_body()) && has_body;
 
     let mut buffered: Option<Bytes> = None;
+    // Tells JS the payload it receives is already decoded, so it must not decode again.
+    let mut body_decoded = false;
     if buffer_for_schema {
-        match buffer_body(
+        let raw = match buffer_body(
             incoming.take().unwrap(),
             shared.body_limit,
             shared.tuning.body_read_timeout,
         )
         .await
         {
-            Ok(b) => buffered = Some(b),
+            Ok(b) => b,
             Err(BodyErr::TooLarge) => return status_text(413, "Payload Too Large"),
             Err(BodyErr::Timeout) => return status_text(408, "Request Timeout"),
             Err(BodyErr::Aborted) => return status_text(400, "Bad Request"),
-        }
+        };
+        buffered = Some(match &encoding {
+            None => raw,
+            Some(enc) => match crate::compress::decode(enc, &raw, shared.body_limit) {
+                Ok(decoded) => {
+                    body_decoded = true;
+                    decoded
+                }
+                Err(crate::compress::DecodeErr::Unsupported) => {
+                    return status_text(415, "Unsupported Media Type")
+                }
+                Err(crate::compress::DecodeErr::TooLarge) => {
+                    return status_text(413, "Payload Too Large")
+                }
+                Err(crate::compress::DecodeErr::Invalid) => {
+                    return status_text(400, "Invalid compressed body")
+                }
+            },
+        });
     }
 
     // Structural validation in Rust → 400 without waking JS (§6b). Body: non-multipart only.
@@ -996,6 +1017,7 @@ async fn dispatch(
         ips,
         country,
         id,
+        body_decoded,
         valid_body: validated.body,
         valid_query: validated.query,
         valid_params: validated.params,
@@ -1109,14 +1131,19 @@ async fn buffer_body(
     Ok(buf.freeze())
 }
 
-/// Whether the body is compressed (Content-Encoding other than identity).
-fn is_compressed(headers: &[KvPair]) -> bool {
-    headers.iter().any(|kv| {
-        kv.key == "content-encoding" && {
+/// The active `Content-Encoding` (lowercased), or `None` when absent or `identity`.
+fn content_encoding(headers: &[KvPair]) -> Option<String> {
+    headers
+        .iter()
+        .find(|kv| kv.key == "content-encoding")
+        .and_then(|kv| {
             let v = kv.value.trim().to_lowercase();
-            !v.is_empty() && v != "identity"
-        }
-    })
+            if v.is_empty() || v == "identity" {
+                None
+            } else {
+                Some(v)
+            }
+        })
 }
 
 /// A `400` response with the validation error list (machine-readable, without waking JS).

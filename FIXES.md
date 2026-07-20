@@ -5,17 +5,20 @@ stages. Stages land one at a time, each with its own confirmation before startin
 
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Progress:** 6 / 26 items · Stage A complete, awaiting confirmation for Stage B
+**Progress:** 11 / 26 items · Stage B complete, awaiting confirmation for Stage C
 
 | Stage | Theme | Items | Done |
 | --- | --- | --- | --- |
 | A | Security — blocks release | 6 | 6 |
-| B | Data correctness | 5 | 0 |
+| B | Data correctness | 5 | 5 |
 | C | Lifecycle and public API | 6 | 0 |
 | D | Observability and cleanups | 9 | 0 |
 
-Verification after Stage A: `cargo clippy -- -D warnings` clean, 33 Rust unit tests pass,
-132 JS tests pass (`npm test`), `npm run typecheck` clean.
+Verification after Stage B: `cargo clippy -- -D warnings` clean, 38 Rust unit tests pass,
+140 JS tests pass (`npm test`), `npm run typecheck` clean.
+
+The B3 and B4 tests were checked against the un-fixed code and each fails without its fix,
+so they genuinely pin the bug rather than passing by construction.
 
 ---
 
@@ -131,9 +134,9 @@ same property with a global middleware plus `notFound`, which is a stronger chec
 
 ---
 
-## Stage B — Data correctness
+## Stage B — Data correctness — **done 2026-07-20**
 
-### [ ] B1 — Compressed body plus a body schema returns 400
+### [x] B1 — Compressed body plus a body schema returns 400
 
 `buffer_for_schema` excludes compressed bodies (`src/server.rs:894`), so
 `schema.validate()` receives `body: None` and reports "body is required"
@@ -153,7 +156,16 @@ runs. The JS fallback at `js/index.ts:917` is dead code — it never gets reache
 - Test: gzipped body **with** a schema. The existing gzip test has no schema and misses
   this path entirely.
 
-### [ ] B2 — `multipart: false` turns multipart on
+Done as planned. Decoding lives in a new `src/compress.rs` with its own unit tests
+(round-trips, unsupported/malformed encodings, and a zip bomb stopped at the limit).
+`x-gzip` is accepted as an alias on both sides. `deflate` is read as zlib-wrapped to match
+`zlib.inflateSync` in JS — the same request must behave the same with or without a schema.
+
+Follow-up worth noting: the `c.req.json()` fallback inside `injectValidation`
+(`js/index.ts`) is now effectively unreachable, since Rust pre-validates every schema'd
+body including compressed ones. Left in place as a safety net, comment corrected.
+
+### [x] B2 — `multipart: false` turns multipart on
 
 `opts.multipart != null` (`js/index.ts:372`) lets `false` through to
 `normalizeMultipart`, which returns `{}` with default limits.
@@ -161,7 +173,10 @@ runs. The JS fallback at `js/index.ts:917` is dead code — it never gets reache
 - Change the guard to `opts.multipart != null && opts.multipart !== false`.
 - Drop the `mp === false` branch in `normalizeMultipart` (`js/index.ts:873`).
 
-### [ ] B3 — HTTP/2 cookie headers are joined with the wrong separator
+Done. `normalizeMultipart` now takes `true | MultipartConfig`, so the type system rules
+out the dead branch rather than leaving it as unreachable code.
+
+### [x] B3 — HTTP/2 cookie headers are joined with the wrong separator
 
 `buildReqHeaders` (`js/context.ts:407`) joins duplicates with `', '`. RFC 9113 §8.2.3
 lets h2 clients split `cookie` across several header fields and requires rejoining with
@@ -171,19 +186,30 @@ supports h2 over ALPN and h2c.
 - Join with `'; '` for `cookie`, `', '` for everything else.
 - Test over h2c with several cookie header fields.
 
-### [ ] B4 — A malformed percent-escape in a cookie returns 500
+Done, but tested over HTTP/1.1 with a raw socket instead of h2c: Node's http2 client
+normalises an array of cookie values into a single field before sending, which would have
+made the test assert nothing. Two `Cookie:` lines over h1 reach `buildReqHeaders` as the
+same two `KvPair`s an h2 client would produce, so it exercises the identical code path
+deterministically.
+
+### [x] B4 — A malformed percent-escape in a cookie returns 500
 
 `decodeURIComponent` (`js/context.ts:426`) throws `URIError` on `Cookie: x=%zz`, so any
 `c.req.cookie()` call on such a request fails the whole request.
 
 - Wrap in try/catch and fall back to the raw value.
 
-### [ ] B5 — Client body errors return 500 instead of 4xx
+Done as planned. Other cookies in the same header keep parsing normally.
+
+### [x] B5 — Client body errors return 500 instead of 4xx
 
 - `c.req.json()` (`js/context.ts:547`): catch `SyntaxError` →
   `HttpError(400, 'Invalid JSON body')`.
 - `decompress` (`js/context.ts:243`): an unknown `Content-Encoding` currently passes
   through and then fails during parsing → return `HttpError(415)` instead.
+
+Done. Both statuses now match what Rust returns for the same input on a schema'd route,
+so the response does not depend on whether the route happens to have a schema.
 
 ---
 
@@ -313,8 +339,13 @@ Acceptable on 0.x, but they all need a CHANGELOG entry (D9):
 4. Body, idle and header timeouts now have defaults; `0` disables a timeout (A4).
 5. A truncated request body now raises 400 instead of reading as a complete short body
    (A2) — handlers that silently accepted partial uploads will start seeing errors.
-6. `onConnect` / `onClose` removed from the public API (C2).
-7. A second `listen()` on the same instance now throws (C3).
+6. An unknown `Content-Encoding` is now `415` and malformed JSON in `c.req.json()` is
+   `400`; both used to surface as `500` (B5).
+7. `schema.body` on a multipart route now fails `listen()` (B1).
+8. `onConnect` / `onClose` removed from the public API (C2).
+9. A second `listen()` on the same instance now throws (C3).
+
+New runtime dependencies: `flate2` and `brotli`, both pure Rust (B1).
 
 ## Decisions
 

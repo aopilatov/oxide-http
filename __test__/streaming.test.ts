@@ -88,6 +88,34 @@ test('M4: 413 when bodyLimit is exceeded', async () => {
   }
 });
 
+test('B5: malformed JSON and unknown encodings are client errors', async () => {
+  const s = await up({
+    routes: (app) => {
+      app.post('/json', async (c) => c.json(await c.req.json()));
+      app.post('/text', async (c) => c.text(await c.req.text()));
+    },
+  });
+  try {
+    // A bare SyntaxError from JSON.parse used to escape as a 500.
+    const badJson = await fetch(`${s.base}/json`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{not json',
+    });
+    assert.equal(badJson.status, 400);
+
+    // An unknown Content-Encoding used to pass through undecoded and blow up later.
+    const badEnc = await fetch(`${s.base}/text`, {
+      method: 'POST',
+      headers: { 'content-encoding': 'lzma' },
+      body: 'whatever',
+    });
+    assert.equal(badEnc.status, 415);
+  } finally {
+    s.close();
+  }
+});
+
 test('A2: a body cut short raises an error instead of looking complete', async () => {
   // The regression this guards: a read error mid-body used to be indistinguishable from
   // a clean EOF, so the handler received half an upload and believed it was the whole

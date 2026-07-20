@@ -37,6 +37,11 @@ futures-util = { version = "0.3.32", default-features = false }
 # TLS: the ring provider (more portable than aws-lc-rs for musl/cross builds, M13)
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 rustls-pemfile = "2"
+# request body decompression, so native schema validation can see a compressed payload
+# (§6b). Both are pure Rust: the musl/cross builds stay dependency-free, same reasoning
+# as picking ring over aws-lc-rs above.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+brotli = { version = "8.0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 napi-build = "2"

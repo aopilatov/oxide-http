@@ -187,6 +187,11 @@ keep-alive so the upstream closes first), `handshakeTimeout` (default `'10s'`, a
 bounds the PROXY prefix read), `maxHeaders`, `maxHeaderSize` (→`431`). Set any of them
 to `0` to switch that protection off; a negative value is rejected.
 
+**Request bodies:** `gzip`, `deflate` and `br` are decoded transparently — in Rust when
+the route has a body schema, in JS otherwise. `bodyLimit` applies to the **decoded** size,
+so a zip bomb is refused with `413` rather than expanded. An encoding we do not implement
+is `415`, a corrupt stream `400`, and malformed JSON in `c.req.json()` is `400`.
+
 **Lifecycle:** `shutdownTimeout` (default `'10s'`), `preShutdownDelay`,
 `handleSignals` (SIGTERM/SIGINT are handled by default).
 
