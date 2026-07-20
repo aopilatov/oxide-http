@@ -177,6 +177,33 @@ test('M11: health on a separate port, absent from the main one', async () => {
   }
 });
 
+test('D2: streamed response bytes are counted too', async () => {
+  // Only the buffered path incremented the counter, so a streaming endpoint reported
+  // zero response bytes no matter how much it sent.
+  const s = await up({
+    config: { health: { metricsPath: '/metrics' } },
+    routes: (app) =>
+      app.get('/stream', (c) =>
+        c.body(
+          new ReadableStream({
+            start(controller) {
+              for (let i = 0; i < 4; i++) controller.enqueue(new TextEncoder().encode('x'.repeat(256)));
+              controller.close();
+            },
+          }),
+        ),
+      ),
+  });
+  try {
+    await (await fetch(`http://127.0.0.1:${s.port}/stream`)).text();
+    const res = await get(s.port, '/metrics');
+    const sent = Number(res.body.match(/http_response_body_bytes_total (\d+)/)![1]);
+    assert.ok(sent >= 1024, `streamed bytes must be counted, got ${sent}`);
+  } finally {
+    await s.close();
+  }
+});
+
 test('A6: /metrics is off on the main port unless asked for', async () => {
   const s = await up({ routes: (app) => app.get('/', (c) => c.text('app')) });
   try {

@@ -184,8 +184,15 @@ CORS, metrics, the onion. This is not a mock.
 new Server({ /* ... */ });
 ```
 
-**Basics:** `baseUrl`, `bodyLimit` (`'10mb'`), `requestTimeout` (`'30s'`),
-`requestId.header`, `customIpHeaders`, `customCountryHeaders`.
+**Basics:** `baseUrl`, `bodyLimit` (`'10mb'`, `null` to disable), `requestTimeout`
+(`'30s'`), `requestId.header`, `customIpHeaders`, `customCountryHeaders`.
+
+⚠️ **`customIpHeaders` is only trustworthy behind a proxy that _overwrites_ the header.**
+`c.req.ip` takes the leftmost entry, which is what the original client sent — so if your
+proxy _appends_ to `X-Forwarded-For` instead of replacing it, a client can put any address
+it likes there and it becomes `c.req.ip`. Behind an L4 balancer prefer `proxyProtocol: true`,
+which carries the real address ahead of the TLS handshake and cannot be forged by the
+client. With no configured header the peer socket address is used, which is always honest.
 
 **Protocol:** `tls: { cert, key }` (a PEM string, a path or a Buffer; ALPN negotiates
 h2/http1.1 automatically), `h2c: true` (HTTP/2 prior-knowledge on the plaintext port),

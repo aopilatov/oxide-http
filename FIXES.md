@@ -5,21 +5,21 @@ stages. Stages land one at a time, each with its own confirmation before startin
 
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Progress:** 17 / 26 items · Stage C complete, awaiting confirmation for Stage D
+**Progress:** 26 / 26 items · all stages complete
 
 | Stage | Theme | Items | Done |
 | --- | --- | --- | --- |
 | A | Security — blocks release | 6 | 6 |
 | B | Data correctness | 5 | 5 |
 | C | Lifecycle and public API | 6 | 6 |
-| D | Observability and cleanups | 9 | 0 |
+| D | Observability and cleanups | 9 | 9 |
 
-Verification after Stage C: `cargo clippy -- -D warnings` clean, 38 Rust unit tests pass,
-146 JS tests pass (`npm test`), `npm run typecheck` clean.
+Final verification: `cargo clippy -- -D warnings` clean, 38 Rust unit tests pass, 149 JS
+tests pass (`npm test`, run three times for flakiness), `npm run typecheck` clean.
 
 Tests for B3, B4 and C4 were run against the un-fixed code and each fails without its fix,
-so they pin the bug rather than passing by construction. C4 especially: it is a race, and
-a test for a race that never fails is worth nothing.
+so they pin the bug rather than passing by construction. C4 especially: it is a race, and a
+test for a race that never fails is worth nothing.
 
 ---
 
@@ -311,55 +311,96 @@ before recursing, which makes an accidental mount cycle terminate instead of han
 
 ---
 
-## Stage D — Observability and cleanups
+## Stage D — Observability and cleanups — **done 2026-07-20**
 
-### [ ] D1 — `bodyLimit` cannot be disabled
+### [x] D1 — `bodyLimit` cannot be disabled
 
 `config.bodyLimit ?? '10mb'` (`js/index.ts:283`) means `undefined` yields the default and
 there is no way to reach the `None` the Rust side supports. Distinguish "not provided"
 (default 10mb) from an explicit `null` (no limit) via `'bodyLimit' in config`.
 
-### [ ] D2 — `response_bytes` ignores streamed responses
+Done. Note the consequence, now documented: with no limit there is also no bound on
+decompressed size, so zip-bomb protection goes away with it.
+
+The test needed a second pass — asserting the capped case with a real 12MB `fetch` body was
+flaky under full-suite load: the server answers 413 from `Content-Length` alone and closes,
+so the client raced into `EPIPE`. It now declares the length over a raw socket without
+streaming a body the server has already refused.
+
+### [x] D2 — `response_bytes` ignores streamed responses
 
 Only the buffered path counts (`src/server.rs:1203`). Count bytes in
 `ChannelBody::poll_frame` (`src/stream.rs:195`) as well.
 
-### [ ] D3 — The access log blocks a worker thread
+Done. `ChannelBody` now carries an `Arc<Metrics>`, so `build_response` takes
+`&Arc<Metrics>` instead of `&Metrics`.
+
+### [x] D3 — The access log blocks a worker thread
 
 `println!` (`src/server.rs:651`) writes synchronously from a tokio worker; a slow log
 consumer throttles request handling. Move to an mpsc channel with a dedicated writer
 thread.
 
-### [ ] D4 — Race in `maxConnections`
+Done, with one addition the plan did not mention: the queue is bounded (8192) and a full
+queue drops the line rather than blocking the caller — but the drop count is reported in
+the log itself, so loss is never silent. Blocking the worker is exactly what this item was
+about, so blocking on a full queue would have reintroduced it.
+
+### [x] D4 — Race in `maxConnections`
 
 Check-then-increment (`src/server.rs:250`) lets concurrent accepts overshoot the limit.
 Use `fetch_add` with rollback.
 
-### [ ] D5 — `watch_idle` overshoots while a request is in flight
+**The original finding was wrong.** Only the accept loop increments `live`, and it is a
+single task, so two accepts can never both observe a free slot — concurrent decrements from
+`LiveGuard` only push the count down. The overshoot was not reachable.
+
+Changed anyway, as hardening rather than a fix: reserve-then-roll-back keeps the cap correct
+regardless of how many tasks accept, which matters now that the admin port runs its own
+accept loop. No behaviour change.
+
+### [x] D5 — `watch_idle` overshoots while a request is in flight
 
 It sleeps a whole interval (`src/idle.rs:76`), so an actual close can take up to
 2 × `idleTimeout`. Poll more frequently.
 
-### [ ] D6 — `setReadinessCheck` timeout timer is never cleared
+Done: while a request is in flight the watchdog re-checks every `idle/10`, clamped to
+50ms–5s so a short timeout does not spin and a long one does not doze.
+
+### [x] D6 — `setReadinessCheck` timeout timer is never cleared
 
 The inner `setTimeout` (`js/index.ts:738`) is not cleared or unref'd and can keep the
 process alive for up to a second after `close()`.
 
-### [ ] D7 — Document the XFF trust model
+Done — cleared in a `finally` and unref'd as well.
+
+### [x] D7 — Document the XFF trust model
 
 `client_ip_country` takes the leftmost entry (`src/server.rs:1127`), which the client
 supplies when a proxy appends rather than overwrites. README must state that
 `customIpHeaders` is only trustworthy behind a proxy that overwrites the header.
 
-### [ ] D8 — Negative durations and sizes are silently ignored
+Done, and expanded: the note also points at `proxyProtocol: true` as the alternative that
+cannot be forged by a client, and records that the peer socket address is used when no
+header is configured.
+
+### [x] D8 — Negative durations and sizes are silently ignored
 
 `ms()` filters `n >= 0` (`src/lib.rs:266`), so a typo like `bodyReadTimeout: -5000`
 quietly disables the protection. Folded into A4 for the timeout path; this item covers
 the remaining size/count options.
 
-### [ ] D9 — CHANGELOG entry for the breaking changes
+Done via a `count()` validator in `js/index.ts`, applied to `maxHeaders`, `backlog`,
+`maxConnections`, `workerThreads`, `health.port`, `maxConcurrentRequests`, `maxQueue`,
+`retryAfter`, the multipart counts and the http2 counts. Sizes and durations were already
+covered by `parseBytes`/`parseDuration`, which reject negatives.
+
+### [x] D9 — CHANGELOG entry for the breaking changes
 
 Collect every breaking change from this plan into one release note.
+
+Done: an `[Unreleased]` section in `CHANGELOG.md` with Security / Added / Fixed /
+Changed (breaking) / Dependencies, listing all ten breaking changes.
 
 ---
 
@@ -389,3 +430,34 @@ New runtime dependencies: `flate2` and `brotli`, both pure Rust (B1).
 
 - **2026-07-20 — C2:** remove `onConnect` / `onClose` rather than keeping them behind an
   opt-in. Per-connection JS wakeups contradict the design.
+- **2026-07-20 — C1:** the abort signal fires on *every* request, carrying a boolean,
+  rather than only on abort. A fire-only-on-abort design would leave one pending promise
+  per successfully served request.
+- **2026-07-20 — D4:** kept the change even though the race it targeted turned out not to
+  be reachable, since the new form is unconditionally correct and the admin port now runs
+  a second accept loop. Recorded as hardening, not a fix.
+
+## Not covered by tests
+
+Worth knowing when judging how much the green suite proves:
+
+- **C5** (`installSafetyNet`): the install flag is process-global and set by the first
+  `listen()` in a file, so an in-process assertion would depend on test ordering. Needs its
+  own subprocess fixture.
+- **D3** (access log off the worker thread): the output is unchanged, so a test would only
+  restate the existing access-log assertions. The property that actually changed — not
+  blocking a tokio worker — needs a load harness with a stalled stdout consumer.
+- **A5** (admin port hardening): covered indirectly by the existing admin-port tests. The
+  Slowloris behaviour it fixes has no dedicated test.
+
+## Follow-ups worth considering
+
+Out of scope for this pass, noticed along the way:
+
+- `c.req.signal` does not abort when a client disconnects **mid-stream** (C1 covers up to
+  the response being produced). The response pump sees a write failure there, but nothing
+  surfaces it to the handler.
+- `notFound` on a mounted sub-app is ignored — only the parent's is used. Arguably correct,
+  but it is undocumented either way.
+- The `c.req.json()` fallback in `injectValidation` is now unreachable (B1). Harmless, but
+  it is dead code that will confuse the next reader.

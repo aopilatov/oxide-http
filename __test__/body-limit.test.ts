@@ -142,3 +142,46 @@ test('SECURITY: without a limit (bodyLimit unset) a large body is still read', a
     s.close();
   }
 });
+
+test('D1: bodyLimit: null removes the limit, omitting it keeps the default', async () => {
+  // There was no way to reach the native "no limit" state: `undefined` and "not set"
+  // both fell back to the 10mb default.
+  const over = 11 * 1024 * 1024; // over the 10mb default
+
+  // Declared-only body: the early 413 fires on Content-Length alone, so the client never
+  // streams megabytes the server has already refused (which raced into EPIPE).
+  const capped = await up({
+    routes: (app) => app.post('/x', async (c) => c.json({ len: (await c.req.text()).length })),
+  });
+  try {
+    const req =
+      `POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: ${over}\r\nConnection: close\r\n\r\n`;
+    const res = await rawRequest(capped.port, req, { settleMs: 200 });
+    assert.equal(res.status, 413, 'the default limit still applies when unset');
+  } finally {
+    capped.close();
+  }
+
+  // With the limit off the same declaration is accepted and the body is read in full.
+  const uncapped = await up({
+    config: { bodyLimit: null },
+    routes: (app) => app.post('/x', async (c) => c.json({ len: (await c.req.text()).length })),
+  });
+  try {
+    const res = await fetch(`${uncapped.base}/x`, { method: 'POST', body: 'z'.repeat(over) });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { len: over });
+  } finally {
+    uncapped.close();
+  }
+});
+
+test('D8: a negative count option is a config error', () => {
+  // These used to be filtered out in Rust with `n > 0`, so `maxConnections: -1` quietly
+  // became "no limit" instead of failing.
+  assert.throws(() => new Server({ maxConnections: -1 }), /maxConnections/);
+  assert.throws(() => new Server({ maxHeaders: -5 }), /maxHeaders/);
+  assert.throws(() => new Server({ maxConcurrentRequests: -2 }), /maxConcurrentRequests/);
+  assert.throws(() => new Server({ maxQueue: 1.5 }), /maxQueue/);
+  assert.doesNotThrow(() => new Server({ maxConnections: 0 }));
+});

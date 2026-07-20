@@ -3,6 +3,91 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+A security and correctness pass over the whole codebase ([FIXES.md](FIXES.md) tracks the
+audit it came from). Several defaults changed and a few APIs are stricter — on `0.x` that
+is allowed, but read the breaking list before upgrading.
+
+### Security
+
+- **CORS: `origin: '*'` together with `credentials: true` is now refused at startup.**
+  Honouring it required reflecting the caller's `Origin`, which let *any* site make
+  credentialed requests and read the responses — the Same-Origin Policy stopped applying.
+  List the origins you trust instead.
+- **A request body cut short is no longer indistinguishable from a complete one.** A read
+  error part-way through used to look like a clean end of body, so a handler received half
+  an upload and treated it as whole. It is now `400`.
+- The PROXY protocol prefix read is bounded by `handshakeTimeout`. It happens before TLS
+  and before the idle watchdog exists, so a client that connected and stayed silent held a
+  task and a file descriptor indefinitely.
+- Protective timeouts now have defaults: `headerReadTimeout` and `bodyReadTimeout` `'30s'`,
+  `idleTimeout` `'75s'`, `handshakeTimeout` `'10s'`. Previously a client could trickle a
+  body forever and keep-alive connections were never reclaimed.
+- The admin port (`health.port`) is hardened like the main one: it had no timer, so not
+  even hyper's default header-read timeout applied, and nothing reclaimed idle sockets.
+- `/metrics` is no longer served on the main port unless asked for.
+
+### Added
+
+- `onAbort` now actually fires, and `c.req.signal` is aborted, when the client disconnects
+  before a response is produced. Both were registrable but inert. Watching costs a pending
+  promise per request, so it is enabled by registering an `onAbort` hook, or explicitly via
+  `detectDisconnect: true`.
+- `installSafetyNet: false` opts out of the process-wide `unhandledRejection` handler; it
+  is also skipped automatically when the application registered its own.
+- `bodyLimit: null` disables the body limit (there was previously no way to reach the
+  native "no limit" state).
+
+### Fixed
+
+- A compressed request body on a route with `schema.body` was rejected with
+  `400 body is required`: it skipped native buffering, so the validator saw no body at all.
+  `gzip`/`deflate`/`br` are now decoded in Rust before validation, bounded by `bodyLimit`
+  so a zip bomb is refused rather than expanded.
+- `multipart: false` switched multipart *on* with default limits.
+- Cookie header fields split across several lines (permitted for HTTP/2 by RFC 9113 §8.2.3)
+  were rejoined with `", "` instead of `"; "`, so every cookie after the first was lost.
+- A malformed percent-escape in a cookie (`x=%zz`) failed the whole request with `500`.
+- Malformed JSON in `c.req.json()` returned `500`; it is now `400`. An unrecognised
+  `Content-Encoding` passed through undecoded and failed later; it is now `415`.
+- Calling `listen()` twice on one instance silently dropped the running server, destroying
+  a tokio runtime on Node's event-loop thread and cutting live connections with no drain.
+- With several servers in one process, SIGTERM made each drain independently and call
+  `process.exit()`, so the first to finish killed the others mid-drain.
+- `route(prefix, sub)` copied the sub-app on the spot, silently discarding anything
+  registered on it afterwards.
+- Streamed response bodies were missing from `http_response_body_bytes_total`.
+- The access log wrote to stdout inline, blocking a tokio worker for as long as the log
+  consumer took to read.
+- A connection could take up to twice `idleTimeout` to be reclaimed after a request ended.
+- The readiness-check timeout timer was never cleared, keeping the process alive for up to
+  `timeout` after `close()`.
+- Negative count options (`maxConnections: -1` and friends) were silently dropped, turning
+  a typo into "no limit"; they are now a config error.
+
+### Changed (breaking)
+
+1. `cors: { origin: '*', credentials: true }` throws at construction.
+2. `/metrics` is off on the main port by default — set `health.metricsPath` or
+   `health.port`.
+3. Registering a route on an enabled probe path fails `listen()` instead of being silently
+   shadowed by the native probe.
+4. `headerReadTimeout`, `bodyReadTimeout` and `idleTimeout` now have defaults; pass `0` to
+   disable one explicitly.
+5. A truncated request body raises `400` where handlers previously received a short body.
+6. An unknown `Content-Encoding` is `415` and malformed JSON is `400`, both previously `500`.
+7. `schema.body` on a multipart route fails `listen()`.
+8. `onConnect` and `onClose` are removed. They could only be honoured by waking JS once per
+   connection, which is what serving connections in Rust exists to avoid.
+9. `listen()` throws if the instance is already listening, or was closed.
+10. `route(prefix, sub)` folds the sub-app in at `listen()`, so late registrations on it now
+    take effect.
+
+### Dependencies
+
+- Added `flate2` and `brotli` (both pure Rust, so musl and cross builds are unaffected).
+
 ## [0.1.1] — 2026-07-19
 
 Documentation only — no code changes, the published binaries are identical to `0.1.0`.

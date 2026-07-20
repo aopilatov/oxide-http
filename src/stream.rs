@@ -245,11 +245,12 @@ fn mp_reject(status: u16, message: &str) -> napi::Error {
 /// A hyper `Body` pulling chunks from a channel (fed by `BodyIo::write`).
 pub struct ChannelBody {
     rx: Receiver<Bytes>,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl ChannelBody {
-    pub fn new(rx: Receiver<Bytes>) -> Self {
-        ChannelBody { rx }
+    pub fn new(rx: Receiver<Bytes>, metrics: Arc<crate::metrics::Metrics>) -> Self {
+        ChannelBody { rx, metrics }
     }
 }
 
@@ -262,7 +263,12 @@ impl Body for ChannelBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, Infallible>>> {
         match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(b)) => Poll::Ready(Some(Ok(Frame::data(b)))),
+            Poll::Ready(Some(b)) => {
+                // Counted here rather than in build_response: streamed bodies never pass
+                // through it, so they were missing from the byte counter entirely.
+                self.metrics.add_response_bytes(b.len() as u64);
+                Poll::Ready(Some(Ok(Frame::data(b))))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }

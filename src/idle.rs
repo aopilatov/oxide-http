@@ -68,13 +68,21 @@ impl Drop for RequestGuard {
     }
 }
 
+/// How often to re-check while a request is in flight: a tenth of the window, bounded so
+/// we neither spin on a short timeout nor doze through a long one.
+fn poll_step(idle: Duration) -> Duration {
+    (idle / 10).clamp(Duration::from_millis(50), Duration::from_secs(5))
+}
+
 /// Wait until the connection has been idle longer than `idle`. Returning means it is
 /// time to close.
 pub async fn watch_idle(activity: Activity, idle: Duration) {
     loop {
-        // A request is in flight → not idle; re-check after another window.
+        // A request is in flight → not idle. Re-check on a fraction of the window:
+        // sleeping a whole one here meant a connection that fell quiet just after the
+        // check waited up to 2 × idle before being reclaimed.
         if activity.in_flight.load(Ordering::Relaxed) > 0 {
-            tokio::time::sleep(idle).await;
+            tokio::time::sleep(poll_step(idle)).await;
             continue;
         }
         let quiet = activity.idle_for();

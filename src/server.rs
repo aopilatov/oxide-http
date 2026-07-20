@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -257,13 +257,13 @@ pub async fn serve(
         };
 
         // Connection limit: above it we close immediately, spending no task or memory.
-        if let Some(max) = shared.tuning.max_connections {
-            if live.load(Ordering::Relaxed) >= max {
-                drop(stream);
-                continue;
-            }
+        // Reserve first and roll back, so the cap holds no matter how many tasks accept.
+        let count = live.fetch_add(1, Ordering::Relaxed) + 1;
+        if shared.tuning.max_connections.is_some_and(|max| count > max) {
+            live.fetch_sub(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
         }
-        live.fetch_add(1, Ordering::Relaxed);
 
         let ctx = ConnCtx {
             shared: shared.clone(),
@@ -468,13 +468,12 @@ pub async fn serve_admin(
             a = listener.accept() => a,
         };
         let Ok((stream, _)) = accepted else { continue };
-        if let Some(max) = shared.tuning.max_connections {
-            if live.load(Ordering::Relaxed) >= max {
-                drop(stream);
-                continue;
-            }
+        let count = live.fetch_add(1, Ordering::Relaxed) + 1;
+        if shared.tuning.max_connections.is_some_and(|max| count > max) {
+            live.fetch_sub(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
         }
-        live.fetch_add(1, Ordering::Relaxed);
         let shared = shared.clone();
         let builder = builder.clone();
         let live = live.clone();
@@ -680,15 +679,63 @@ fn admin_response(shared: &Shared, method: &str, path: &str) -> Option<Response<
 ///
 /// Written from Rust so the log never wakes JS. Fields are assembled by hand without
 /// serde: only the path needs escaping (method and numbers are safe by construction).
+///
+/// The line is handed to a dedicated writer thread instead of being printed inline:
+/// `println!` locks stdout and blocks the tokio worker for as long as the consumer takes
+/// to read, so a slow log pipe would throttle request handling.
 fn access_log(method: &str, path: &str, status: u16, elapsed: std::time::Duration) {
     let ms = elapsed.as_secs_f64() * 1000.0;
-    println!(
+    let line = format!(
         r#"{{"level":"info","msg":"request","method":"{}","path":"{}","status":{},"durationMs":{:.3}}}"#,
         method,
         escape_json(path),
         status,
         ms
     );
+    // Full queue means the consumer cannot keep up. Dropping an access line beats
+    // stalling request handling — but the drop is reported, never silent.
+    if access_log_tx().try_send(line).is_err() {
+        ACCESS_LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Access lines dropped because the writer could not keep up.
+static ACCESS_LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Queue depth before we start dropping lines rather than blocking the caller.
+const ACCESS_LOG_QUEUE: usize = 8192;
+
+/// Lazily started writer thread; the sender lives for the process lifetime.
+fn access_log_tx() -> &'static std::sync::mpsc::SyncSender<String> {
+    static TX: std::sync::OnceLock<std::sync::mpsc::SyncSender<String>> =
+        std::sync::OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(ACCESS_LOG_QUEUE);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            let mut reported = 0u64;
+            while let Ok(line) = rx.recv() {
+                if writeln!(out, "{line}").is_err() {
+                    break; // stdout is gone; nothing useful left to do
+                }
+                let dropped = ACCESS_LOG_DROPPED.load(Ordering::Relaxed);
+                if dropped > reported {
+                    let _ = writeln!(
+                        out,
+                        r#"{{"level":"warn","msg":"access log dropped lines","dropped":{}}}"#,
+                        dropped - reported
+                    );
+                    reported = dropped;
+                }
+                // Flushed per line: a log that only appears once a buffer fills is
+                // useless for tailing a pod.
+                let _ = out.flush();
+            }
+        });
+        tx
+    })
 }
 
 /// Minimal string escaping for the JSON log.
@@ -1267,7 +1314,7 @@ fn build_response(
     res: JsResponse,
     head: bool,
     resp_rx: Receiver<Bytes>,
-    metrics: &Metrics,
+    metrics: &Arc<Metrics>,
 ) -> Response<ResBody> {
     let mut builder = Response::builder().status(res.status.unwrap_or(200));
     if let Some(headers) = res.headers {
@@ -1293,7 +1340,7 @@ fn build_response(
     }
 
     if streamed {
-        return builder_or_500(builder, ChannelBody::new(resp_rx).boxed());
+        return builder_or_500(builder, ChannelBody::new(resp_rx, metrics.clone()).boxed());
     }
 
     let bytes = Bytes::from(res.body.unwrap_or_default());

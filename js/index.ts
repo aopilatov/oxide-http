@@ -104,7 +104,9 @@ export interface MultipartConfig {
 export interface ServerConfig {
   baseUrl?: string;
   requestId?: { header?: string };
-  bodyLimit?: ByteSize;
+  /** Max request body size; defaults to `'10mb'`. Pass `null` to remove the limit —
+   *  note that this also removes the bound on decompressed size (zip bombs). */
+  bodyLimit?: ByteSize | null;
   requestTimeout?: Duration;
   customIpHeaders?: string[];
   customCountryHeaders?: string[];
@@ -276,6 +278,19 @@ function unregisterFromSignals(server: Server): void {
   removeSignalHandler = null;
 }
 
+/** A count/size option that must be a non-negative integer.
+ *
+ *  The native layer filters these with `n > 0`, so a negative used to be dropped in
+ *  silence — turning `maxConnections: -1` into "no limit" instead of a startup error.
+ *  Sizes and durations go through `parseBytes`/`parseDuration`, which already reject
+ *  negatives; this covers the plain-number options. */
+function count(name: string, v: number): number {
+  if (!Number.isInteger(v) || v < 0) {
+    throw new TypeError(`${name}: expected a non-negative integer, got ${v}`);
+  }
+  return v;
+}
+
 /** Prefix normalization: '' | '/' → ''; a leading slash is required; trailing (and /*) removed. */
 function normalizeBase(b: string | undefined): string {
   if (!b || b === '/') return '';
@@ -326,7 +341,12 @@ export class Server {
   constructor(config: ServerConfig = {}) {
     this.#baseUrl = normalizeBase(config.baseUrl);
     this.#requestIdHeader = (config.requestId?.header ?? 'x-request-id').toLowerCase();
-    this.#bodyLimit = parseBytes(config.bodyLimit ?? '10mb');
+    // An explicit `bodyLimit: null` means "no limit"; omitting the key keeps the default.
+    // Previously both read as absent, so the limit could never actually be turned off.
+    this.#bodyLimit =
+      'bodyLimit' in config && config.bodyLimit == null
+        ? undefined
+        : parseBytes(config.bodyLimit ?? '10mb');
     this.#requestTimeout =
       config.requestTimeout != null ? (parseDuration(config.requestTimeout) ?? null) : null;
 
@@ -354,7 +374,7 @@ export class Server {
     if (config.handshakeTimeout != null) {
       options.handshakeTimeout = parseDuration(config.handshakeTimeout);
     }
-    if (config.maxHeaders != null) options.maxHeaders = config.maxHeaders;
+    if (config.maxHeaders != null) options.maxHeaders = count('maxHeaders', config.maxHeaders);
     if (config.maxHeaderSize != null) options.maxHeaderSize = parseBytes(config.maxHeaderSize);
     if (config.shutdownTimeout != null) {
       options.shutdownTimeout = parseDuration(config.shutdownTimeout);
@@ -365,14 +385,16 @@ export class Server {
       options.preShutdownDelay = parseDuration(config.preShutdownDelay);
     }
     // Socket options (§6c B9) and PROXY protocol (A4).
-    if (config.backlog != null) options.backlog = config.backlog;
+    if (config.backlog != null) options.backlog = count('backlog', config.backlog);
     if (config.reusePort != null) options.reusePort = config.reusePort;
     if (config.noDelay != null) options.noDelay = config.noDelay;
-    if (config.maxConnections != null) options.maxConnections = config.maxConnections;
+    if (config.maxConnections != null) {
+      options.maxConnections = count('maxConnections', config.maxConnections);
+    }
     if (config.proxyProtocol != null) options.proxyProtocol = config.proxyProtocol;
     // workerThreads: a number | 'auto' (from the cgroup quota). 'auto' = leave unset.
     if (typeof config.workerThreads === 'number') {
-      options.workerThreads = config.workerThreads;
+      options.workerThreads = count('workerThreads', config.workerThreads);
     } else if (config.workerThreads != null && config.workerThreads !== 'auto') {
       throw new TypeError("workerThreads: a number or 'auto'");
     }
@@ -382,16 +404,16 @@ export class Server {
       if (h.path != null) options.healthPath = h.path;
       if (h.readyPath != null) options.readyPath = h.readyPath;
       if (h.metricsPath != null) options.metricsPath = h.metricsPath;
-      if (h.port != null) options.adminPort = h.port;
+      if (h.port != null) options.adminPort = count('health.port', h.port);
     }
     if (config.accessLog != null) options.accessLog = config.accessLog;
     // Overload protection (§6c C5).
     if (config.maxConcurrentRequests != null) {
-      options.maxConcurrentRequests = config.maxConcurrentRequests;
+      options.maxConcurrentRequests = count('maxConcurrentRequests', config.maxConcurrentRequests);
     }
-    if (config.maxQueue != null) options.maxQueue = config.maxQueue;
+    if (config.maxQueue != null) options.maxQueue = count('maxQueue', config.maxQueue);
     if (config.queueTimeout != null) options.queueTimeout = parseDuration(config.queueTimeout);
-    if (config.retryAfter != null) options.retryAfter = config.retryAfter;
+    if (config.retryAfter != null) options.retryAfter = count('retryAfter', config.retryAfter);
     if (config.overloadShedAfter != null) {
       options.overloadShedAfter = parseDuration(config.overloadShedAfter);
     }
@@ -796,16 +818,21 @@ export class Server {
 
     const tick = async (): Promise<void> => {
       let ok = false;
+      let deadline: NodeJS.Timeout | undefined;
       try {
         const verdict = await Promise.race([
           Promise.resolve(fn()),
-          new Promise<never>((_, rej) =>
-            setTimeout(() => rej(new Error('timeout')), timeout),
-          ),
+          new Promise<never>((_, rej) => {
+            deadline = setTimeout(() => rej(new Error('timeout')), timeout);
+            deadline.unref?.();
+          }),
         ]);
         ok = verdict !== false; // undefined/anything non-false means ready
       } catch {
         ok = false; // threw or timed out — treat as not ready
+      } finally {
+        // Left dangling, this kept the process alive for up to `timeout` after close().
+        if (deadline) clearTimeout(deadline);
       }
       if (this.#readinessTimer) this.setReady(ok);
     };
@@ -942,9 +969,13 @@ function resolvePem(v: string | Buffer): string {
 /** Normalize config.http2 → native Http2Options (initialWindowSize accepts '1mb'). */
 function normalizeHttp2(h: Http2Config): NativeHttp2Options {
   const out: NativeHttp2Options = {};
-  if (h.maxConcurrentStreams != null) out.maxConcurrentStreams = h.maxConcurrentStreams;
+  if (h.maxConcurrentStreams != null) {
+    out.maxConcurrentStreams = count('http2.maxConcurrentStreams', h.maxConcurrentStreams);
+  }
   if (h.initialWindowSize != null) out.initialWindowSize = parseBytes(h.initialWindowSize);
-  if (h.maxResetStreamsPerSec != null) out.maxResetStreamsPerSec = h.maxResetStreamsPerSec;
+  if (h.maxResetStreamsPerSec != null) {
+    out.maxResetStreamsPerSec = count('http2.maxResetStreamsPerSec', h.maxResetStreamsPerSec);
+  }
   return out;
 }
 
@@ -955,8 +986,8 @@ function normalizeMultipart(mp: true | MultipartConfig): NativeMultipartOptions 
   const out: NativeMultipartOptions = {
     maxFileSize: parseBytes(o.maxFileSize ?? '50mb'),
     maxFieldSize: parseBytes(o.maxFieldSize ?? '1mb'),
-    maxFiles: o.maxFiles ?? 10,
-    maxFields: o.maxFields ?? 100,
+    maxFiles: count('multipart.maxFiles', o.maxFiles ?? 10),
+    maxFields: count('multipart.maxFields', o.maxFields ?? 100),
   };
   // napi's Option<Vec> rejects null → set the key only when provided.
   if (o.allowedMimeTypes) out.allowedMimeTypes = o.allowedMimeTypes;
