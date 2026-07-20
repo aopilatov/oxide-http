@@ -181,8 +181,11 @@ new Server({ /* ... */ });
 h2/http1.1 automatically), `h2c: true` (HTTP/2 prior-knowledge on the plaintext port),
 `http2: { maxConcurrentStreams, initialWindowSize, maxResetStreamsPerSec }`.
 
-**Timeouts and limits:** `headerReadTimeout`, `bodyReadTimeout` (→`408`),
-`idleTimeout`, `handshakeTimeout`, `maxHeaders`, `maxHeaderSize` (→`431`).
+**Timeouts and limits:** `headerReadTimeout` (default `'30s'`), `bodyReadTimeout`
+(default `'30s'`, →`408`), `idleTimeout` (default `'75s'` — above the usual balancer
+keep-alive so the upstream closes first), `handshakeTimeout` (default `'10s'`, also
+bounds the PROXY prefix read), `maxHeaders`, `maxHeaderSize` (→`431`). Set any of them
+to `0` to switch that protection off; a negative value is rejected.
 
 **Lifecycle:** `shutdownTimeout` (default `'10s'`), `preShutdownDelay`,
 `handleSignals` (SIGTERM/SIGINT are handled by default).
@@ -191,12 +194,19 @@ h2/http1.1 automatically), `h2c: true` (HTTP/2 prior-knowledge on the plaintext 
 `workerThreads: number | 'auto'` (auto reads the pod's cgroup quota, not the node's cores).
 
 **Observability:** `health: { path, readyPath, metricsPath, port }`, `accessLog`.
+`/healthz` and `/readyz` are on by default; `/metrics` is **not** — set `metricsPath`
+explicitly, or `health.port` to put probes and metrics on an internal-only port.
+Registering a route on an enabled probe path fails `listen()`: the probe is answered
+before routing, so the handler could never run.
 
 **Overload:** `maxConcurrentRequests`, `maxQueue`, `queueTimeout`, `retryAfter`,
 `overloadShedAfter`.
 
 **CORS:** `cors: { origin, methods, allowedHeaders, exposedHeaders, credentials, maxAge }`.
 Preflight is answered by Rust. Dynamic origin logic goes into a regular JS middleware.
+`origin: '*'` with `credentials: true` is refused — the only way to honour it is to
+reflect the caller's Origin, which lets any site issue credentialed requests and read the
+reply. List the origins you trust instead.
 
 Units accept both a string (`'10mb'`, `'30s'`) and a number (bytes, milliseconds).
 
@@ -226,6 +236,9 @@ listener **keeps accepting** for `preShutdownDelay` → then accepting stops, h2
 `GOAWAY`, in-flight requests finish until `shutdownTimeout` → `exit 0`.
 
 ## Metrics
+
+Disabled by default — enable with `health: { metricsPath: '/metrics' }` or expose them
+on an internal port with `health: { port }`.
 
 `/metrics` in Prometheus format: `http_requests_total{method,status}` (status is a class:
 `2xx`/`4xx`/...), the `http_request_duration_seconds` histogram,

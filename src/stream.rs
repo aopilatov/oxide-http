@@ -28,6 +28,9 @@ pub const BODY_LIMIT_EXCEEDED: &str = "BODY_LIMIT_EXCEEDED";
 /// Expired `bodyReadTimeout` marker (→ 408).
 pub const BODY_READ_TIMEOUT: &str = "BODY_READ_TIMEOUT";
 
+/// Connection died mid-body marker (→ 400): what arrived is truncated.
+pub const BODY_READ_ABORTED: &str = "BODY_READ_ABORTED";
+
 /// Request body channel message: data or the reason the stream was cut.
 pub enum BodyMsg {
     Data(Bytes),
@@ -35,6 +38,9 @@ pub enum BodyMsg {
     Overflow,
     /// The client was silent longer than `bodyReadTimeout` — reading aborted (§6c A2).
     Timeout,
+    /// The connection failed part-way through the body. Distinct from a clean end:
+    /// reporting it as "body finished" would hand JS a partial payload as complete.
+    Aborted,
 }
 
 /// Multipart part metadata for JS.
@@ -90,6 +96,8 @@ impl BodyIo {
                 Some(BodyMsg::Overflow) => Err(napi::Error::from_reason(BODY_LIMIT_EXCEEDED)),
                 // Client silent longer than bodyReadTimeout → 408.
                 Some(BodyMsg::Timeout) => Err(napi::Error::from_reason(BODY_READ_TIMEOUT)),
+                // Connection dropped mid-body → 400; never a silent short read.
+                Some(BodyMsg::Aborted) => Err(napi::Error::from_reason(BODY_READ_ABORTED)),
                 None => Ok(None),
             },
             None => Ok(None),

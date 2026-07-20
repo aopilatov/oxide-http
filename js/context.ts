@@ -203,14 +203,17 @@ const messageOf = (e: unknown): string =>
   e != null && typeof e === 'object' && 'message' in e ? String((e as Error).message) : String(e);
 const isLimitError = (e: unknown): boolean => e != null && /BODY_LIMIT_EXCEEDED/.test(messageOf(e));
 const isReadTimeout = (e: unknown): boolean => e != null && /BODY_READ_TIMEOUT/.test(messageOf(e));
+const isReadAborted = (e: unknown): boolean => e != null && /BODY_READ_ABORTED/.test(messageOf(e));
 
-/** Read a chunk, mapping the native markers to HttpError (413 / 408). */
+/** Read a chunk, mapping the native markers to HttpError (413 / 408 / 400). */
 async function readChunk(bodyIo: BodyIo): Promise<Buffer | null> {
   try {
     return await bodyIo.read();
   } catch (e) {
     if (isLimitError(e)) throw new HttpError(413, 'Payload Too Large');
     if (isReadTimeout(e)) throw new HttpError(408, 'Request Timeout');
+    // The connection died mid-body: surface it instead of returning a short buffer.
+    if (isReadAborted(e)) throw new HttpError(400, 'Request body aborted');
     throw e;
   }
 }

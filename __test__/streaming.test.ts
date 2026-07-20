@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import { gzipSync } from 'node:zlib';
 
 import { Server } from '../js/index.ts';
@@ -12,8 +13,10 @@ async function up(build) {
   build.routes(server);
   const port = nextPort();
   await server.listen({ port, host: '127.0.0.1' });
-  return { base: `http://127.0.0.1:${port}`, close: () => server.close() };
+  return { base: `http://127.0.0.1:${port}`, port, close: () => server.close() };
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 test('M4: c.req.json() reads the body', async () => {
   const s = await up({
@@ -80,6 +83,38 @@ test('M4: 413 when bodyLimit is exceeded', async () => {
   try {
     const res = await fetch(`${s.base}/small`, { method: 'POST', body: 'z'.repeat(5000) });
     assert.equal(res.status, 413);
+  } finally {
+    s.close();
+  }
+});
+
+test('A2: a body cut short raises an error instead of looking complete', async () => {
+  // The regression this guards: a read error mid-body used to be indistinguishable from
+  // a clean EOF, so the handler received half an upload and believed it was the whole
+  // thing. The client is gone by then, so we assert on what the handler saw.
+  const seen: { text?: string; error?: string } = {};
+  const s = await up({
+    routes: (app) =>
+      app.post('/sink', async (c) => {
+        try {
+          seen.text = await c.req.text();
+        } catch (e) {
+          seen.error = e instanceof Error ? e.message : String(e);
+        }
+        return c.text('ok');
+      }),
+  });
+  try {
+    const sock = net.connect(s.port, '127.0.0.1');
+    await new Promise<void>((r) => sock.once('connect', () => r()));
+    // Announce 100 bytes, deliver 5, then kill the connection.
+    sock.write('POST /sink HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nhello');
+    await sleep(80);
+    sock.destroy();
+    await sleep(400);
+
+    assert.equal(seen.text, undefined, 'a truncated body must never read as complete');
+    assert.match(seen.error ?? '', /abort/i, `unexpected error: ${seen.error}`);
   } finally {
     s.close();
   }

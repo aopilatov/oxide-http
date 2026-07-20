@@ -24,16 +24,23 @@ const get = async (port, path) => {
 };
 
 test('M11: /healthz answers 200 without waking JS', async () => {
-  let handlerCalled = false;
+  // Registering a route on /healthz is now a listen() error (it could never run), so the
+  // "JS stayed asleep" property is proven with a global middleware plus notFound —
+  // between them every path into JS is covered.
+  let jsWoken = false;
   const s = await up({
-    routes: (app) => app.get('/healthz', () => ((handlerCalled = true), 'from JS')),
+    routes: (app) => {
+      app.use((_c, next) => ((jsWoken = true), next()));
+      app.notFound((c) => ((jsWoken = true), c.text('nf', 404)));
+      app.get('/', (c) => c.text('app'));
+    },
   });
   try {
     const res = await get(s.port, '/healthz');
     assert.equal(res.status, 200);
     assert.equal(res.body, 'ok');
     // The native probe intercepts the path before the router.
-    assert.equal(handlerCalled, false, 'the JS handler must not run');
+    assert.equal(jsWoken, false, 'the probe must be answered entirely in Rust');
   } finally {
     await s.close();
   }
@@ -102,6 +109,8 @@ test('M11: a throwing or hanging readinessCheck means not ready', async () => {
 
 test('M11: /metrics returns Prometheus format and counts requests', async () => {
   const s = await up({
+    // Metrics are off on the main port by default — opt in explicitly.
+    config: { health: { metricsPath: '/metrics' } },
     routes: (app) => {
       app.get('/ok', (c) => c.text('ok'));
       app.post('/bad', (c) => c.text('nope', 404));
@@ -130,6 +139,7 @@ test('M11: /metrics returns Prometheus format and counts requests', async () => 
 
 test('M11: metrics count body bytes', async () => {
   const s = await up({
+    config: { health: { metricsPath: '/metrics' } },
     routes: (app) => app.post('/echo', async (c) => c.text(await c.req.text())),
   });
   try {
@@ -164,6 +174,41 @@ test('M11: health on a separate port, absent from the main one', async () => {
     assert.equal((await get(s.port, '/')).body, 'app');
   } finally {
     await s.close();
+  }
+});
+
+test('A6: /metrics is off on the main port unless asked for', async () => {
+  const s = await up({ routes: (app) => app.get('/', (c) => c.text('app')) });
+  try {
+    // Liveness/readiness stay on — k8s needs them. Metrics are an information-disclosure
+    // surface, so they require an explicit opt-in or a dedicated admin port.
+    assert.equal((await get(s.port, '/healthz')).status, 200);
+    assert.equal((await get(s.port, '/readyz')).status, 200);
+    assert.equal((await get(s.port, '/metrics')).status, 404, 'metrics must not be public');
+  } finally {
+    await s.close();
+  }
+});
+
+test('A6: a route colliding with a probe path fails listen()', async () => {
+  // The probe is answered in Rust before routing, so this handler could never run.
+  // Failing loudly beats a route that silently does nothing.
+  const app = new Server();
+  app.get('/healthz', (c) => c.text('mine'));
+  await assert.rejects(
+    () => app.listen({ port: nextPort(), host: '127.0.0.1' }),
+    /collides with the health endpoint/,
+  );
+
+  // Disabling the endpoint frees the path.
+  const ok = new Server({ health: { path: '' } });
+  ok.get('/healthz', (c) => c.text('mine'));
+  const port = nextPort();
+  await ok.listen({ port, host: '127.0.0.1' });
+  try {
+    assert.equal((await get(port, '/healthz')).body, 'mine');
+  } finally {
+    await ok.close();
   }
 });
 

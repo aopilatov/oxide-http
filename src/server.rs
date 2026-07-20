@@ -60,7 +60,9 @@ pub struct Tuning {
     pub admin_port: Option<u16>,
     /// Print the access log to stdout as a JSON line (§11).
     pub access_log: bool,
-    pub handshake_timeout: Duration,
+    /// TLS handshake deadline; also bounds the PROXY prefix read (§6c A4), which happens
+    /// before TLS and before the idle watchdog exists. None = no deadline.
+    pub handshake_timeout: Option<Duration>,
     pub max_headers: Option<usize>,
     /// Header block size limit; exceeding it → 431 (§6c B10).
     pub max_header_size: Option<usize>,
@@ -71,6 +73,14 @@ pub struct Tuning {
 
 /// hyper's lower bound for the read buffer: anything smaller panics inside `max_buf_size`.
 const MIN_HEADER_BUF: usize = 8192;
+
+/// Apply a deadline when one is configured, otherwise just await. `None` = timed out.
+async fn maybe_timeout<F: std::future::Future>(d: Option<Duration>, fut: F) -> Option<F::Output> {
+    match d {
+        Some(d) => tokio::time::timeout(d, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
 
 /// Unified response body type: a buffer (`Full`) or a stream (`ChannelBody`).
 type ResBody = BoxBody<Bytes, Infallible>;
@@ -343,10 +353,13 @@ where
     // PROXY protocol (§6c A4) — strictly before TLS: the prefix arrives raw ahead of
     // the handshake.
     let (stream, peer_ip) = if tuning.proxy_protocol {
-        match proxy_protocol::read_header(stream).await {
-            Ok((io, addr)) => (io, addr.unwrap_or(peer_ip)),
-            // No prefix or a malformed one — this connection is not from our balancer.
-            Err(()) => return,
+        // The prefix is read before TLS and before the stream is wrapped in ActivityIo,
+        // so `handshake_timeout` is the only guard here — without it a client that
+        // connects and stays quiet parks a task and an FD indefinitely.
+        match maybe_timeout(tuning.handshake_timeout, proxy_protocol::read_header(stream)).await {
+            Some(Ok((io, addr))) => (io, addr.unwrap_or(peer_ip)),
+            // Missing prefix, malformed prefix, or silence — not from our balancer.
+            _ => return,
         }
     } else {
         (proxy_protocol::PrefixedIo::new(stream, Vec::new()), peer_ip)
@@ -381,8 +394,8 @@ where
     // Connection errors are swallowed: the process must not go down.
     if let Some(acceptor) = tuning.tls.clone() {
         // TLS: handshake with a timeout → ALPN decides h2/h1.1.
-        if let Ok(Ok(tls_stream)) =
-            tokio::time::timeout(tuning.handshake_timeout, acceptor.accept(stream)).await
+        if let Some(Ok(tls_stream)) =
+            maybe_timeout(tuning.handshake_timeout, acceptor.accept(stream)).await
         {
             let io = TokioIo::new(tls_stream);
             drive(
@@ -444,16 +457,33 @@ pub async fn serve_admin(
     shared: Arc<Shared>,
     mut shutdown: watch::Receiver<u8>,
 ) {
-    let builder = Arc::new(http1::Builder::new());
+    // Same hardening as the main port. A bare `http1::Builder::new()` has no timer, so
+    // hyper's header-read timeout does not apply at all, and nothing reclaims an idle
+    // socket — a Slowloris from inside the cluster is still a Slowloris.
+    let builder = Arc::new(build_h1(&shared.tuning));
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
         let accepted = tokio::select! {
             _ = wait_closing(&mut shutdown) => break,
             a = listener.accept() => a,
         };
         let Ok((stream, _)) = accepted else { continue };
+        if let Some(max) = shared.tuning.max_connections {
+            if live.load(Ordering::Relaxed) >= max {
+                drop(stream);
+                continue;
+            }
+        }
+        live.fetch_add(1, Ordering::Relaxed);
         let shared = shared.clone();
         let builder = builder.clone();
+        let live = live.clone();
+        let conn_shutdown = shutdown.clone();
         tokio::spawn(async move {
+            let _live = LiveGuard(live);
+            let activity = Activity::new();
+            let idle = shared.tuning.idle_timeout.map(|d| (activity.clone(), d));
+            let io = ActivityIo::new(stream, activity);
             let service = service_fn(move |req: Request<Incoming>| {
                 let shared = shared.clone();
                 async move {
@@ -463,9 +493,13 @@ pub async fn serve_admin(
                     Ok::<_, Infallible>(res)
                 }
             });
-            let _ = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
+            drive(
+                builder.serve_connection(TokioIo::new(io), service),
+                idle,
+                conn_shutdown,
+                Arc::new(Notify::new()),
+            )
+            .await;
         });
     }
 }
@@ -906,6 +940,7 @@ async fn dispatch(
             Ok(b) => buffered = Some(b),
             Err(BodyErr::TooLarge) => return status_text(413, "Payload Too Large"),
             Err(BodyErr::Timeout) => return status_text(408, "Request Timeout"),
+            Err(BodyErr::Aborted) => return status_text(400, "Bad Request"),
         }
     }
 
@@ -1001,7 +1036,16 @@ async fn read_body_task(
             },
             None => body.frame().await,
         };
-        let Some(Ok(frame)) = next else { break };
+        let frame = match next {
+            Some(Ok(f)) => f,
+            // A read error part-way through means the client vanished. Treating it as a
+            // clean end would give JS a truncated body it believes is complete.
+            Some(Err(_)) => {
+                let _ = tx.send(BodyMsg::Aborted).await;
+                return;
+            }
+            None => break, // end of body
+        };
         if let Ok(data) = frame.into_data() {
             total = total.saturating_add(data.len() as u64);
             metrics.add_request_bytes(data.len() as u64);
@@ -1026,10 +1070,12 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Why the body could not be read: limit exceeded (413) or client silence (408).
+/// Why the body could not be read: limit exceeded (413), client silence (408), or the
+/// connection dying part-way through (400).
 enum BodyErr {
     TooLarge,
     Timeout,
+    Aborted,
 }
 
 /// Buffer the whole body (for native validation), honouring the limit and read timeout.
@@ -1047,7 +1093,12 @@ async fn buffer_body(
             },
             None => body.frame().await,
         };
-        let Some(Ok(frame)) = next else { break };
+        let frame = match next {
+            Some(Ok(f)) => f,
+            // Truncated body — never validate a partial payload as if it were whole.
+            Some(Err(_)) => return Err(BodyErr::Aborted),
+            None => break, // end of body
+        };
         if let Ok(data) = frame.into_data() {
             if limit.is_some_and(|l| buf.len() as u64 + data.len() as u64 > l) {
                 return Err(BodyErr::TooLarge);

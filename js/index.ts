@@ -835,8 +835,18 @@ const DEFAULT_CORS_METHODS = ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', '
  *  napi's Option<Vec> fields reject null → omit the key when unset. */
 function normalizeCors(cors: CorsConfig): NativeCorsOptions {
   const origin = cors.origin ?? '*';
+  const origins = Array.isArray(origin) ? origin : [origin];
+  // Forbidden by the CORS spec and refused by browsers: the only way to honour it is to
+  // reflect the caller's Origin, which lets any site make credentialed requests and read
+  // the response. List the origins you actually trust instead.
+  if (cors.credentials && origins.includes('*')) {
+    throw new TypeError(
+      "cors: origin '*' cannot be combined with credentials: true — " +
+        'list the allowed origins explicitly',
+    );
+  }
   const out: NativeCorsOptions = {
-    origins: Array.isArray(origin) ? origin : [origin],
+    origins,
     methods: cors.methods ?? DEFAULT_CORS_METHODS,
     credentials: Boolean(cors.credentials),
   };

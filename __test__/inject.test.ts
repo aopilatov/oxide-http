@@ -156,7 +156,7 @@ test('M12: inject works with a streamed response and a binary body', async () =>
 });
 
 test('M12: inject is counted in metrics like a regular request', async () => {
-  const app = new Server();
+  const app = new Server({ health: { metricsPath: '/metrics' } });
   app.get('/counted', (c) => c.text('ok'));
   try {
     await app.inject({ path: '/counted' });

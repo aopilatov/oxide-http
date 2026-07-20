@@ -40,11 +40,15 @@ impl Cors {
     }
 
     /// Value for `Access-Control-Allow-Origin` if the origin is allowed.
-    /// With credentials `*` is not permitted — reflect the concrete origin.
+    ///
+    /// `*` together with credentials is refused rather than reflected: reflecting turns
+    /// "any origin" into "every origin may send cookies and read the reply", which
+    /// removes the Same-Origin Policy entirely. The JS wrapper rejects that combination
+    /// at config time; this is the defence in depth for a direct native call.
     fn resolve_origin(&self, origin: Option<&str>) -> Option<String> {
         if self.any_origin {
             return if self.credentials {
-                Some(origin.unwrap_or("*").to_string())
+                None
             } else {
                 Some("*".to_string())
             };
@@ -128,12 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn any_origin_with_credentials_echoes() {
+    fn any_origin_with_credentials_is_refused() {
+        // Reflecting here would let any site issue credentialed requests and read the
+        // reply. The wrapper rejects the config; native must not fall back to reflecting.
         let c = cors(&["*"], true);
-        assert_eq!(
-            c.resolve_origin(Some("https://x.com")).unwrap(),
-            "https://x.com"
-        );
+        assert!(c.resolve_origin(Some("https://x.com")).is_none());
+        assert!(c.preflight(Some("https://x.com"), None).is_none());
+        assert!(c.actual(Some("https://x.com")).is_empty());
     }
 
     #[test]

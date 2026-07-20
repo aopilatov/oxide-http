@@ -21,6 +21,7 @@ mod stream;
 mod tls;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use napi::bindgen_prelude::{Function, Promise};
 use napi::Result;
@@ -168,6 +169,41 @@ pub struct InjectResponse {
     pub body: napi::bindgen_prelude::Buffer,
 }
 
+// Default protective timeouts (§6c A2). Leaving these off meant a client could trickle a
+// body forever and keep-alive connections were never reclaimed.
+const DEFAULT_HEADER_READ_TIMEOUT_MS: i64 = 30_000;
+const DEFAULT_BODY_READ_TIMEOUT_MS: i64 = 30_000;
+/// Above the usual ALB/nginx keep-alive (60s) so the upstream closes first — closing
+/// under it makes the balancer race us into a half-closed connection.
+const DEFAULT_IDLE_TIMEOUT_MS: i64 = 75_000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_QUEUE_TIMEOUT_MS: i64 = 1_000;
+
+/// A protective timeout in ms: unset falls back to `default_ms`, `0` disables it, and a
+/// negative value is a config error. Silently dropping a negative used to turn a typo
+/// (`-5000`) into "protection off".
+fn timeout_ms(name: &str, v: Option<i64>, default_ms: i64) -> Result<Option<Duration>> {
+    match v.unwrap_or(default_ms) {
+        0 => Ok(None),
+        n if n > 0 => Ok(Some(Duration::from_millis(n as u64))),
+        n => Err(napi::Error::from_reason(format!(
+            "{name}: must be >= 0 (0 disables it), got {n}"
+        ))),
+    }
+}
+
+/// A literal delay or deadline in ms, where `0` genuinely means zero (no wait) rather
+/// than "disabled".
+fn delay_ms(name: &str, v: Option<i64>, default_ms: i64) -> Result<Duration> {
+    match v.unwrap_or(default_ms) {
+        n if n >= 0 => Ok(Duration::from_millis(n as u64)),
+        n => Err(napi::Error::from_reason(format!(
+            "{name}: must be >= 0, got {n}"
+        ))),
+    }
+}
+
 /// A bound socket before handing it to the runtime (reactor registration happens there).
 enum ListenTarget {
     Tcp(std::net::TcpListener),
@@ -249,6 +285,12 @@ impl RustServer {
             .into_iter()
             .map(Option::unwrap_or_default)
             .collect();
+        // Kept for the health-path collision check below: `tuning` (which resolves those
+        // paths) is built after `route_defs` has been consumed by the router.
+        let route_paths: Vec<(String, String)> = route_defs
+            .iter()
+            .map(|r| (r.method.clone(), r.path.clone()))
+            .collect();
         let routes = Routes::build(route_defs).map_err(napi::Error::from_reason)?;
 
         // Build the TSFN synchronously while the JS function is alive; afterwards it is
@@ -263,12 +305,11 @@ impl RustServer {
             None => None,
         };
         let http2 = options.http2;
-        let ms = |v: Option<i64>| {
-            v.filter(|&n| n >= 0)
-                .map(|n| std::time::Duration::from_millis(n as u64))
-        };
-        let shutdown_timeout =
-            ms(options.shutdown_timeout).unwrap_or_else(|| std::time::Duration::from_secs(10));
+        let shutdown_timeout = delay_ms(
+            "shutdownTimeout",
+            options.shutdown_timeout,
+            DEFAULT_SHUTDOWN_TIMEOUT_MS,
+        )?;
         let default_sock = crate::listener::SocketOptions::default();
         let socket = crate::listener::SocketOptions {
             backlog: options
@@ -289,20 +330,43 @@ impl RustServer {
             proxy_protocol: options.proxy_protocol.unwrap_or(false),
             health_paths: {
                 let d = crate::health::HealthPaths::default();
+                // Metrics stay off the main port unless asked for: /metrics is an
+                // information-disclosure surface and DESIGN §11 keeps it internal. With a
+                // dedicated admin port there is no public exposure, so default it on.
+                let metrics_default = if options.admin_port.is_some() {
+                    d.metrics
+                } else {
+                    String::new()
+                };
                 crate::health::HealthPaths {
                     health: options.health_path.unwrap_or(d.health),
                     ready: options.ready_path.unwrap_or(d.ready),
-                    metrics: options.metrics_path.unwrap_or(d.metrics),
+                    metrics: options.metrics_path.unwrap_or(metrics_default),
                 }
             },
             admin_port: options.admin_port,
             access_log: options.access_log.unwrap_or(false),
             h2c: options.h2c.unwrap_or(false),
-            header_read_timeout: ms(options.header_read_timeout),
-            body_read_timeout: ms(options.body_read_timeout),
-            idle_timeout: ms(options.idle_timeout),
-            handshake_timeout: ms(options.handshake_timeout)
-                .unwrap_or_else(|| std::time::Duration::from_secs(10)),
+            header_read_timeout: timeout_ms(
+                "headerReadTimeout",
+                options.header_read_timeout,
+                DEFAULT_HEADER_READ_TIMEOUT_MS,
+            )?,
+            body_read_timeout: timeout_ms(
+                "bodyReadTimeout",
+                options.body_read_timeout,
+                DEFAULT_BODY_READ_TIMEOUT_MS,
+            )?,
+            idle_timeout: timeout_ms(
+                "idleTimeout",
+                options.idle_timeout,
+                DEFAULT_IDLE_TIMEOUT_MS,
+            )?,
+            handshake_timeout: timeout_ms(
+                "handshakeTimeout",
+                options.handshake_timeout,
+                DEFAULT_HANDSHAKE_TIMEOUT_MS,
+            )?,
             max_headers: options.max_headers.filter(|&n| n > 0).map(|n| n as usize),
             max_header_size: options
                 .max_header_size
@@ -325,6 +389,29 @@ impl RustServer {
                 .map(|n| n as usize),
             socket,
         };
+
+        // Probes and metrics are answered in Rust before routing, so a user route sharing
+        // one of those paths would silently never run. Only the main port is affected —
+        // with an admin port the endpoints live on a different socket entirely.
+        if tuning.admin_port.is_none() {
+            let p = &tuning.health_paths;
+            let endpoints = [
+                ("health", &p.health),
+                ("readiness", &p.ready),
+                ("metrics", &p.metrics),
+            ];
+            for (method, path) in &route_paths {
+                for (name, endpoint) in endpoints {
+                    if !endpoint.is_empty() && path == endpoint {
+                        return Err(napi::Error::from_reason(format!(
+                            "route {method} {path} collides with the {name} endpoint; \
+                             rename the route, disable the endpoint with an empty path, \
+                             or move probes to a separate port via health.port"
+                        )));
+                    }
+                }
+            }
+        }
 
         // Bind synchronously → errors (EADDRINUSE, no permission for the path) surface
         // immediately. A Unix socket takes priority over port/host when a path is set.
@@ -366,6 +453,14 @@ impl RustServer {
             .max_concurrent_requests
             .filter(|&n| n > 0)
             .map(|n| n as usize);
+        // Computed up front: the `overload` field below builds them inside a closure,
+        // where `?` is unavailable.
+        let queue_timeout = delay_ms(
+            "queueTimeout",
+            options.queue_timeout,
+            DEFAULT_QUEUE_TIMEOUT_MS,
+        )?;
+        let overload_shed_after = timeout_ms("overloadShedAfter", options.overload_shed_after, 0)?;
 
         let shared = Arc::new(Shared {
             tsfn,
@@ -396,13 +491,13 @@ impl RustServer {
                 crate::overload::Limiter::new(
                     limit,
                     options.max_queue.filter(|&n| n > 0).unwrap_or(0) as usize,
-                    ms(options.queue_timeout).unwrap_or_else(|| std::time::Duration::from_secs(1)),
+                    queue_timeout,
                     options.retry_after.filter(|&n| n > 0).unwrap_or(1) as u64,
-                    ms(options.overload_shed_after).filter(|d| !d.is_zero()),
+                    overload_shed_after,
                 )
             }),
         });
-        let pre_shutdown_delay = ms(options.pre_shutdown_delay).unwrap_or_default();
+        let pre_shutdown_delay = delay_ms("preShutdownDelay", options.pre_shutdown_delay, 0)?;
         let (shutdown, shutdown_rx) = watch::channel(crate::server::RUNNING);
         let done = Arc::new(Notify::new());
         let done_srv = done.clone();

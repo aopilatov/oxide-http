@@ -234,6 +234,25 @@ test('M9: bodyReadTimeout — silence mid-body → 408', async () => {
   }
 });
 
+test('A4: a negative timeout is a config error, 0 disables it', async () => {
+  // A typo used to reach Rust and be filtered out there, turning `-5000` into
+  // "protection off". The unit parser rejects it first; the native layer now refuses it
+  // too, for anything that bypasses the wrapper.
+  assert.throws(() => new Server({ bodyReadTimeout: -5000 }), /invalid number/);
+
+  // 0 is the explicit way to switch a protective timeout off.
+  const off = new Server({ idleTimeout: 0 });
+  off.get('/', (c) => c.text('ok'));
+  const port = nextPort();
+  await off.listen({ port, host: '127.0.0.1' });
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`);
+    assert.equal(await res.text(), 'ok');
+  } finally {
+    await off.close();
+  }
+});
+
 test('M9: idleTimeout closes an idle keep-alive connection', async () => {
   const s = await up({
     config: { idleTimeout: '400ms' },

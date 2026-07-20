@@ -139,7 +139,7 @@ test('M10b: queueTimeout expired → 503', async () => {
 test('M10b: probes answer under overload', async () => {
   const g = gate();
   const s = await up({
-    config: { maxConcurrentRequests: 1 },
+    config: { maxConcurrentRequests: 1, health: { metricsPath: '/metrics' } },
     routes: (app) =>
       app.get('/hold', async (c) => {
         await g.opened;

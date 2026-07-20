@@ -93,18 +93,20 @@ test('M6: a regular request from a foreign origin — no ACAO, but still served'
   }
 });
 
-test('M6: credentials + origin=* → ACAO reflects the concrete origin (not *)', async () => {
-  const s = await up({
-    config: { cors: { origin: '*', credentials: true } },
-    routes: (app) => app.get('/d', (c) => c.text('ok')),
-  });
-  try {
-    const res = await fetch(`${s.base}/d`, { headers: { origin: 'https://x.com' } });
-    assert.equal(res.headers.get('access-control-allow-origin')!, 'https://x.com');
-    assert.equal(res.headers.get('access-control-allow-credentials')!, 'true');
-  } finally {
-    s.close();
-  }
+test('M6: credentials + origin=* is refused at construction', () => {
+  // Honouring it means reflecting the caller's Origin, which lets any site send
+  // credentialed requests and read the reply — the Same-Origin Policy stops applying.
+  assert.throws(
+    () => new Server({ cors: { origin: '*', credentials: true } }),
+    /cannot be combined with credentials/,
+  );
+  // The same via an explicit list containing '*'.
+  assert.throws(
+    () => new Server({ cors: { origin: ['https://ok.com', '*'], credentials: true } }),
+    /cannot be combined with credentials/,
+  );
+  // Without credentials '*' stays perfectly fine.
+  assert.doesNotThrow(() => new Server({ cors: { origin: '*' } }));
 });
 
 test('M6: preflight with maxAge', async () => {
