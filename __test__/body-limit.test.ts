@@ -185,3 +185,20 @@ test('D8: a negative count option is a config error', () => {
   assert.throws(() => new Server({ maxQueue: 1.5 }), /maxQueue/);
   assert.doesNotThrow(() => new Server({ maxConnections: 0 }));
 });
+
+test('E2: an explicit bodyLimit: undefined keeps the default, only null disables', async () => {
+  // `== null` matched undefined too, so spreading a config carrying an explicit
+  // `bodyLimit: undefined` silently removed the limit — and the zip-bomb bound with it.
+  const s = await up({
+    config: { bodyLimit: undefined },
+    routes: (app) => app.post('/x', async (c) => c.json({ len: (await c.req.text()).length })),
+  });
+  try {
+    const req =
+      `POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: ${11 * 1024 * 1024}\r\nConnection: close\r\n\r\n`;
+    const res = await rawRequest(s.port, req, { settleMs: 200 });
+    assert.equal(res.status, 413, 'undefined must fall back to the 10mb default');
+  } finally {
+    s.close();
+  }
+});

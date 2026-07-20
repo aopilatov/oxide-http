@@ -45,8 +45,6 @@ export interface NativeRequest {
   ips: string[];
   country?: string | null;
   id: string;
-  /** Rust already decompressed the body (it buffered it for schema validation). */
-  bodyDecoded: boolean;
   validBody?: string | null;
   validQuery?: string | null;
   validParams?: string | null;
@@ -529,9 +527,7 @@ export function buildContext(
   };
   const readBuffered = async (): Promise<Buffer> => {
     const raw = await collectRaw(bodyIo, bodyLimit);
-    // Rust decodes the body itself when a schema forced it to buffer; decoding the
-    // already-plain bytes a second time would just fail.
-    if (nreq.bodyDecoded) return raw;
+    // Uniform: the channel always carries what the client sent, schema or not.
     return decompress(raw, reqHeaders.get('content-encoding'), bodyLimit);
   };
   const arrayBuffer = async (): Promise<ArrayBuffer> => {

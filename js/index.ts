@@ -219,6 +219,10 @@ interface RouteEntry {
   schema: RouteSchema | null;
   multipart: NativeMultipartOptions | null;
   handler: Handler;
+  /** The synthetic valibot preValidation hook is already in `hooks` — see
+   *  `injectValidation`. Guards against a second copy when `listen()` is retried after a
+   *  failed bind. */
+  validationInjected?: boolean;
 }
 
 type HooksByStage = Record<StageName, Array<Scoped<Hook | ErrorHook>>>;
@@ -332,6 +336,7 @@ export class Server {
   #events = new EventEmitter();
   #listening = false;
   #closing: Promise<void> | null = null; // makes close() idempotent
+  #autostart: Promise<this> | null = null; // in-flight inject() auto-start, shared
   #handleSignals: boolean;
   #installSafetyNet: boolean;
   #detectDisconnect: boolean;
@@ -342,11 +347,11 @@ export class Server {
     this.#baseUrl = normalizeBase(config.baseUrl);
     this.#requestIdHeader = (config.requestId?.header ?? 'x-request-id').toLowerCase();
     // An explicit `bodyLimit: null` means "no limit"; omitting the key keeps the default.
-    // Previously both read as absent, so the limit could never actually be turned off.
+    // Strictly `null`: `== null` also matched an explicit `undefined`, so spreading a
+    // config that carried one silently disabled the limit — and with it the bound on
+    // decompressed size, i.e. zip-bomb protection.
     this.#bodyLimit =
-      'bodyLimit' in config && config.bodyLimit == null
-        ? undefined
-        : parseBytes(config.bodyLimit ?? '10mb');
+      config.bodyLimit === null ? undefined : parseBytes(config.bodyLimit ?? '10mb');
     this.#requestTimeout =
       config.requestTimeout != null ? (parseDuration(config.requestTimeout) ?? null) : null;
 
@@ -739,7 +744,7 @@ export class Server {
   async inject(req: InjectRequest = {}): Promise<InjectResult> {
     const { method = 'GET', path = '/', headers = {}, body, query } = req;
     if (this.#closed) throw new Error('inject: server is closed (close() was already called)');
-    if (!this.#listening) await this.listen({ port: 0, host: '127.0.0.1' });
+    await this.#ensureListening();
 
     let url = path;
     if (query && Object.keys(query).length > 0) {
@@ -795,6 +800,21 @@ export class Server {
       text: () => res.body.toString('utf8'),
       json: <T = unknown,>(): T => JSON.parse(res.body.toString('utf8')) as T,
     };
+  }
+
+  /** Start the server for `inject()` if it is not running yet.
+   *
+   *  Concurrent cold injects must share one `listen()`. `listen()` suspends on
+   *  `loadSchemaDeps()` when any route has a schema, so a plain `if (!listening) listen()`
+   *  lets two callers both get past the check — and the second then trips the
+   *  "already listening" guard. The in-flight promise is cleared once it settles, so a
+   *  retry after a failed start still works. */
+  async #ensureListening(): Promise<void> {
+    if (this.#listening) return;
+    this.#autostart ??= this.listen({ port: 0, host: '127.0.0.1' }).finally(() => {
+      this.#autostart = null;
+    });
+    await this.#autostart;
   }
 
   /** Manual readiness (§11): `false` → `/readyz` returns 503; liveness is untouched. */
@@ -1013,6 +1033,9 @@ const VALIDATION_ORDER = ['params', 'query', 'body'] as const;
 function injectValidation(route: RouteEntry): void {
   const schema = route.schema;
   if (!schema) return;
+  // listen() runs this over every route, and a retry after a failed bind (EADDRINUSE on
+  // the first port choice) would otherwise prepend a second copy of the hook.
+  if (route.validationInjected) return;
 
   const valibotSchemas: Partial<Record<(typeof VALIDATED_LOCATIONS)[number], ValibotSchema>> = {};
   for (const loc of VALIDATED_LOCATIONS) {
@@ -1045,6 +1068,7 @@ function injectValidation(route: RouteEntry): void {
     ...route.hooks,
     preValidation: [hook, ...(route.hooks.preValidation ?? [])],
   };
+  route.validationInjected = true;
 }
 
 /** Normalize route options `{onRequest:[...]|fn, preHandler, ...}` into `{stage:[fn]}`. */

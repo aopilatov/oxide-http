@@ -38,9 +38,6 @@ pub struct MatchedRequest {
     pub ips: Vec<String>,
     pub country: Option<String>,
     pub id: String,
-    /// True when Rust already decompressed the body (it buffered it for schema
-    /// validation). JS must then skip its own decoding — the bytes are already plain.
-    pub body_decoded: bool,
     /// Validated/coerced values (JSON strings) — present when the leaf has a schema.
     /// `c.req.valid('body'|'query'|'params')` in JS then applies the valibot transform.
     pub valid_body: Option<String>,

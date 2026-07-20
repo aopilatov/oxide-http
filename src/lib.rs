@@ -412,6 +412,10 @@ impl RustServer {
         // Probes and metrics are answered in Rust before routing, so a user route sharing
         // one of those paths would silently never run. Only the main port is affected —
         // with an admin port the endpoints live on a different socket entirely.
+        //
+        // Matched through the router rather than by comparing pattern strings: `/:page`
+        // never equals "/healthz" as text but swallows it at runtime, which is exactly the
+        // trap this check exists to catch.
         if tuning.admin_port.is_none() {
             let p = &tuning.health_paths;
             let endpoints = [
@@ -419,15 +423,26 @@ impl RustServer {
                 ("readiness", &p.ready),
                 ("metrics", &p.metrics),
             ];
-            for (method, path) in &route_paths {
-                for (name, endpoint) in endpoints {
-                    if !endpoint.is_empty() && path == endpoint {
-                        return Err(napi::Error::from_reason(format!(
-                            "route {method} {path} collides with the {name} endpoint; \
-                             rename the route, disable the endpoint with an empty path, \
-                             or move probes to a separate port via health.port"
-                        )));
-                    }
+            for (name, endpoint) in endpoints {
+                if endpoint.is_empty() {
+                    continue;
+                }
+                // Probes only answer GET/HEAD, so a POST on the same path is fine.
+                let hit = routes
+                    .match_route("GET", endpoint)
+                    .or_else(|| routes.match_route("HEAD", endpoint));
+                if let Some(m) = hit {
+                    let which = usize::try_from(m.leaf_id)
+                        .ok()
+                        .and_then(|i| route_paths.get(i))
+                        .map(|(method, path)| format!("route {method} {path}"))
+                        .unwrap_or_else(|| "a route".to_string());
+                    return Err(napi::Error::from_reason(format!(
+                        "{which} collides with the {name} endpoint ({endpoint}): the probe \
+                         is answered before routing, so the route would never run. Rename \
+                         the route, disable the endpoint with an empty path, or move probes \
+                         to a separate port via health.port"
+                    )));
                 }
             }
         }

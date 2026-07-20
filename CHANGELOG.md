@@ -65,6 +65,20 @@ is allowed, but read the breaking list before upgrading.
   `timeout` after `close()`.
 - Negative count options (`maxConnections: -1` and friends) were silently dropped, turning
   a typo into "no limit"; they are now a config error.
+- Concurrent `inject()` calls on a not-yet-started server raced each other into
+  "already listening" whenever any route had a schema. The auto-start is now shared.
+- An explicit `bodyLimit: undefined` disabled the limit instead of applying the default;
+  only `null` disables it.
+- Retrying `listen()` on another port after `EADDRINUSE` registered a second copy of the
+  valibot validation hook.
+- `c.req.stream` yielded decoded bytes on a route with a schema and the raw compressed
+  bytes on one without. It now always yields exactly what the client sent, on every route;
+  `text()`, `json()` and `arrayBuffer()` decode.
+- Request bodies buffered for schema validation were missing from
+  `http_request_body_bytes_total`.
+- The probe-collision check compared pattern strings, so a parametric route like `/:page`
+  passed `listen()` and was then shadowed by `/healthz` at runtime. Probe paths are now
+  matched through the router.
 
 ### Changed (breaking)
 

@@ -209,16 +209,29 @@ the route has a body schema, in JS otherwise. `bodyLimit` applies to the **decod
 so a zip bomb is refused with `413` rather than expanded. An encoding we do not implement
 is `415`, a corrupt stream `400`, and malformed JSON in `c.req.json()` is `400`.
 
+`c.req.stream` always yields the body **exactly as the client sent it**, compressed bytes
+included; `c.req.text()`, `json()` and `arrayBuffer()` decode. That split does not depend
+on whether the route has a schema — validation decodes its own copy in Rust and never
+changes what reaches the handler.
+
 **Lifecycle:** `shutdownTimeout` (default `'10s'`), `preShutdownDelay`,
 `handleSignals` (SIGTERM/SIGINT are handled by default; one handler per process drains
 every server before exiting), `installSafetyNet` (the process-wide `unhandledRejection`
 logger — on by default, skipped when the application registers its own handler).
 `listen()` may only be called once per instance.
 
-**Network:** `backlog`, `reusePort`, `noDelay`, `maxConnections`, `proxyProtocol`,
+**Network:** `backlog`, `reusePort`, `noDelay`, `maxConnections` (applied per listener —
+with `health.port` set, the admin port gets its own pool of the same size, so the process
+can hold up to twice that many; load on the main port must not be able to starve the
+probes), `proxyProtocol`,
 `workerThreads: number | 'auto'` (auto reads the pod's cgroup quota, not the node's cores).
 
 **Observability:** `health: { path, readyPath, metricsPath, port }`, `accessLog`.
+The access log is written from a dedicated thread so a slow log consumer cannot throttle
+request handling. The queue holds 8192 lines; beyond that lines are dropped and the loss is
+reported in the log itself — but that notice only appears with the *next* written line, and
+anything still queued at process exit is lost. If you need every line, ship logs from the
+handler instead.
 `/healthz` and `/readyz` are on by default; `/metrics` is **not** — set `metricsPath`
 explicitly, or `health.port` to put probes and metrics on an internal-only port.
 Registering a route on an enabled probe path fails `listen()`: the probe is answered

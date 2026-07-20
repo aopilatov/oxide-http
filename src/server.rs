@@ -976,14 +976,18 @@ async fn dispatch(
     let buffer_for_schema =
         multipart_cfg.is_none() && schema.is_some_and(|s| s.has_body()) && has_body;
 
+    // `buffered` is what JS will receive — always the bytes the client actually sent.
+    // `decoded` is the plain form and exists only for the schema check: handing the
+    // decoded copy to JS made `c.req.stream` yield different bytes on a schema'd route
+    // than on an identical route without one.
     let mut buffered: Option<Bytes> = None;
-    // Tells JS the payload it receives is already decoded, so it must not decode again.
-    let mut body_decoded = false;
+    let mut decoded: Option<Bytes> = None;
     if buffer_for_schema {
         let raw = match buffer_body(
             incoming.take().unwrap(),
             shared.body_limit,
             shared.tuning.body_read_timeout,
+            &shared.metrics,
         )
         .await
         {
@@ -992,13 +996,11 @@ async fn dispatch(
             Err(BodyErr::Timeout) => return status_text(408, "Request Timeout"),
             Err(BodyErr::Aborted) => return status_text(400, "Bad Request"),
         };
-        buffered = Some(match &encoding {
-            None => raw,
+        decoded = Some(match &encoding {
+            // Cheap: Bytes is refcounted, so this shares the buffer rather than copying.
+            None => raw.clone(),
             Some(enc) => match crate::compress::decode(enc, &raw, shared.body_limit) {
-                Ok(decoded) => {
-                    body_decoded = true;
-                    decoded
-                }
+                Ok(plain) => plain,
                 Err(crate::compress::DecodeErr::Unsupported) => {
                     return status_text(415, "Unsupported Media Type")
                 }
@@ -1010,17 +1012,13 @@ async fn dispatch(
                 }
             },
         });
+        buffered = Some(raw);
     }
 
     // Structural validation in Rust → 400 without waking JS (§6b). Body: non-multipart only.
     let mut validated = crate::schema::Validated::default();
     if let Some(schema) = schema {
-        let body_bytes = if buffer_for_schema {
-            buffered.as_deref()
-        } else {
-            None
-        };
-        match schema.validate(&data.query, &params, body_bytes) {
+        match schema.validate(&data.query, &params, decoded.as_deref()) {
             Ok(v) => validated = v,
             Err(issues) => return validation_response(&issues),
         }
@@ -1070,7 +1068,6 @@ async fn dispatch(
         ips,
         country,
         id,
-        body_decoded,
         valid_body: validated.body,
         valid_query: validated.query,
         valid_params: validated.params,
@@ -1167,10 +1164,16 @@ enum BodyErr {
 }
 
 /// Buffer the whole body (for native validation), honouring the limit and read timeout.
+///
+/// Counts bytes into the metrics like `read_body_task` does: without it every route with a
+/// body schema was missing from `http_request_body_bytes_total`. What is counted is what
+/// came off the socket, so the counter keeps meaning "bytes received" even when the body is
+/// decompressed afterwards.
 async fn buffer_body(
     mut body: Incoming,
     limit: Option<u64>,
     read_timeout: Option<Duration>,
+    metrics: &Metrics,
 ) -> Result<Bytes, BodyErr> {
     let mut buf = BytesMut::new();
     loop {
@@ -1188,6 +1191,7 @@ async fn buffer_body(
             None => break, // end of body
         };
         if let Ok(data) = frame.into_data() {
+            metrics.add_request_bytes(data.len() as u64);
             if limit.is_some_and(|l| buf.len() as u64 + data.len() as u64 > l) {
                 return Err(BodyErr::TooLarge);
             }

@@ -53,6 +53,41 @@ test('B1: a compressed body is validated, not rejected', async () => {
   }
 });
 
+test('F3: c.req.stream sees the same bytes with and without a schema', async () => {
+  // Rust used to hand JS the decoded copy it had buffered for validation, so an identical
+  // request reached c.req.stream as plain bytes on a schema'd route and as gzip on one
+  // without. The decoded copy now stays on the validation side only.
+  const drain = async (c: any): Promise<string> => {
+    const chunks: Buffer[] = [];
+    for await (const ch of c.req.stream) chunks.push(Buffer.from(ch));
+    return Buffer.concat(chunks).toString('hex');
+  };
+  const s = await up({
+    routes: (app) => {
+      app.post('/plain', async (c) => c.text(await drain(c)));
+      app.post('/schema', { schema: { query: v.object({}) } }, async (c) => c.text(await drain(c)));
+    },
+  });
+  try {
+    const body = gzipSync(JSON.stringify({ name: 'Bob' }));
+    const send = async (path: string): Promise<string> =>
+      (
+        await fetch(`${s.base}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+          body,
+        })
+      ).text();
+
+    const plain = await send('/plain');
+    const schema = await send('/schema');
+    assert.equal(schema, plain, 'a schema must not change what the raw stream yields');
+    assert.equal(plain, body.toString('hex'), 'the stream carries exactly what was sent');
+  } finally {
+    s.close();
+  }
+});
+
 test('B1: a broken or unknown encoding is a client error', async () => {
   const User = v.object({ name: v.string() });
   const s = await up({

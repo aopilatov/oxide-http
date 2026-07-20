@@ -217,6 +217,68 @@ test('A6: /metrics is off on the main port unless asked for', async () => {
   }
 });
 
+test('F1: bodies buffered for schema validation are counted too', async () => {
+  // Only read_body_task counted bytes, so any route with a body schema was missing from
+  // the request-byte counter entirely.
+  const v = await import('valibot');
+  const s = await up({
+    config: { health: { metricsPath: '/metrics' } },
+    routes: (app) =>
+      app.post(
+        '/validated',
+        { schema: { body: v.object({ pad: v.string() }) } },
+        (c) => c.json(c.req.valid('body')),
+      ),
+  });
+  try {
+    const payload = JSON.stringify({ pad: 'x'.repeat(2000) });
+    const res = await fetch(`http://127.0.0.1:${s.port}/validated`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: payload,
+    });
+    assert.equal(res.status, 200);
+
+    const metrics = await get(s.port, '/metrics');
+    const read = Number(metrics.body.match(/http_request_body_bytes_total (\d+)/)![1]);
+    assert.ok(read >= payload.length, `schema-buffered bytes must be counted, got ${read}`);
+  } finally {
+    await s.close();
+  }
+});
+
+test('F2: a parametric route that would swallow a probe path fails listen()', async () => {
+  // The check used to compare pattern strings, so '/:page' passed — and then shadowed
+  // /healthz at runtime, which is the exact trap the check exists to prevent.
+  const app = new Server();
+  app.get('/:page', (c) => c.text('page'));
+  await assert.rejects(
+    () => app.listen({ port: nextPort(), host: '127.0.0.1' }),
+    /collides with the health endpoint/,
+  );
+
+  // A wildcard is caught the same way.
+  const wild = new Server();
+  wild.get('/*rest', (c) => c.text('any'));
+  await assert.rejects(
+    () => wild.listen({ port: nextPort(), host: '127.0.0.1' }),
+    /collides with the health endpoint/,
+  );
+
+  // A non-GET route on the probe path is fine: probes only answer GET/HEAD.
+  const post = new Server();
+  post.post('/healthz', (c) => c.text('posted'));
+  const port = nextPort();
+  await post.listen({ port, host: '127.0.0.1' });
+  try {
+    assert.equal((await get(port, '/healthz')).body, 'ok', 'GET still reaches the probe');
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`, { method: 'POST' });
+    assert.equal(await res.text(), 'posted');
+  } finally {
+    await post.close();
+  }
+});
+
 test('A6: a route colliding with a probe path fails listen()', async () => {
   // The probe is answered in Rust before routing, so this handler could never run.
   // Failing loudly beats a route that silently does nothing.

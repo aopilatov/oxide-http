@@ -211,11 +211,6 @@ export interface MatchedRequest {
   country?: string
   id: string
   /**
-   * True when Rust already decompressed the body (it buffered it for schema
-   * validation). JS must then skip its own decoding — the bytes are already plain.
-   */
-  bodyDecoded: boolean
-  /**
    * Validated/coerced values (JSON strings) — present when the leaf has a schema.
    * `c.req.valid('body'|'query'|'params')` in JS then applies the valibot transform.
    */

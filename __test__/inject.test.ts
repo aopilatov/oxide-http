@@ -4,6 +4,59 @@ import * as v from 'valibot';
 
 import { Server } from '../js/index.ts';
 
+test('E1: concurrent cold injects share one auto-start', async () => {
+  // Regression: inject() auto-starts with `if (!listening) await listen()`, and listen()
+  // suspends on loadSchemaDeps() as soon as any route has a schema. Both callers got past
+  // the check, both called listen(), and the second hit the "already listening" guard.
+  const app = new Server();
+  app.post('/a', { schema: { body: v.object({ x: v.number() }) } }, (c) =>
+    c.json(c.req.valid('body')),
+  );
+  app.get('/b', (c) => c.text('b'));
+  try {
+    const [a, b] = await Promise.all([
+      app.inject({ method: 'POST', path: '/a', body: { x: 1 } }),
+      app.inject({ path: '/b' }),
+    ]);
+    assert.equal(a.status, 200);
+    assert.deepEqual(a.json<any>(), { x: 1 });
+    assert.equal(b.text(), 'b');
+  } finally {
+    await app.close();
+  }
+});
+
+test('E3: a retry after a failed bind does not double the validation hook', async () => {
+  // The synthetic valibot hook is prepended by listen(); retrying on another port after
+  // EADDRINUSE used to prepend a second copy, so the transform ran twice.
+  let transforms = 0;
+  const Counting = v.pipe(
+    v.object({ x: v.number() }),
+    v.transform((o) => {
+      transforms++;
+      return o;
+    }),
+  );
+
+  const blocker = new Server();
+  blocker.get('/', (c) => c.text('blocker'));
+  await blocker.listen({ port: 21999, host: '127.0.0.1' });
+
+  const app = new Server();
+  app.post('/a', { schema: { body: Counting } }, (c) => c.json(c.req.valid('body')));
+  try {
+    await assert.rejects(() => app.listen({ port: 21999, host: '127.0.0.1' }));
+    await app.listen({ port: 22000, host: '127.0.0.1' });
+
+    const res = await app.inject({ method: 'POST', path: '/a', body: { x: 1 } });
+    assert.equal(res.status, 200);
+    assert.equal(transforms, 1, 'the validation hook must be registered exactly once');
+  } finally {
+    await app.close();
+    await blocker.close();
+  }
+});
+
 test('M12: inject without listen — starts on its own, no socket needed', async () => {
   const app = new Server();
   app.get('/hello', (c) => c.json({ hi: true }));
