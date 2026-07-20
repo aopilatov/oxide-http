@@ -356,7 +356,12 @@ where
         // The prefix is read before TLS and before the stream is wrapped in ActivityIo,
         // so `handshake_timeout` is the only guard here — without it a client that
         // connects and stays quiet parks a task and an FD indefinitely.
-        match maybe_timeout(tuning.handshake_timeout, proxy_protocol::read_header(stream)).await {
+        match maybe_timeout(
+            tuning.handshake_timeout,
+            proxy_protocol::read_header(stream),
+        )
+        .await
+        {
             Some(Ok((io, addr))) => (io, addr.unwrap_or(peer_ip)),
             // Missing prefix, malformed prefix, or silence — not from our balancer.
             _ => return,

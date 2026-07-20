@@ -376,11 +376,7 @@ impl RustServer {
                 options.body_read_timeout,
                 DEFAULT_BODY_READ_TIMEOUT_MS,
             )?,
-            idle_timeout: timeout_ms(
-                "idleTimeout",
-                options.idle_timeout,
-                DEFAULT_IDLE_TIMEOUT_MS,
-            )?,
+            idle_timeout: timeout_ms("idleTimeout", options.idle_timeout, DEFAULT_IDLE_TIMEOUT_MS)?,
             handshake_timeout: timeout_ms(
                 "handshakeTimeout",
                 options.handshake_timeout,
