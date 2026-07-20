@@ -35,7 +35,7 @@ use crate::metrics::Metrics;
 use crate::overload::{Limiter, Slot};
 use crate::proxy_protocol;
 use crate::router::Routes;
-use crate::stream::{BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
+use crate::stream::{AbortSignal, BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
 
 /// Protocol/security parameters (TLS, h2, read timeouts) — §12, §6c A1/A2.
 pub struct Tuning {
@@ -1003,7 +1003,13 @@ async fn dispatch(
 
     // Response body channel (used when the handler streams).
     let (resp_tx, resp_rx) = mpsc::channel::<Bytes>(BODY_CHANNEL_CAP);
-    let body_io = BodyIo::new(req_rx, Some(resp_tx), mp_rx);
+
+    // Disconnect detection. Everything above this point returns early without ever
+    // reaching JS, so the guard is created here — after the last early return — and any
+    // drop from now on means hyper gave up on the connection.
+    let abort = Arc::new(AbortSignal::new());
+    let _abort_guard = AbortGuard(abort.clone());
+    let body_io = BodyIo::new(req_rx, Some(resp_tx), mp_rx, abort.clone());
 
     let req = MatchedRequest {
         leaf_id,
@@ -1023,12 +1029,25 @@ async fn dispatch(
         valid_params: validated.params,
     };
 
-    match shared.tsfn.call_async((req, body_io)).await {
+    let response = match shared.tsfn.call_async((req, body_io)).await {
         Ok(promise) => match promise.await {
             Ok(res) => build_response(res, head, resp_rx, &shared.metrics),
             Err(_) => status_text(500, "Internal Server Error"),
         },
         Err(_) => status_text(500, "Internal Server Error"),
+    };
+    // Reached only if the future was never dropped, i.e. the request really finished.
+    abort.complete();
+    response
+}
+
+/// Fires the abort signal when the request future is dropped. Hyper drops it as soon as
+/// the connection dies, which is the only client-disconnect notification we get.
+struct AbortGuard(Arc<AbortSignal>);
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        self.0.fire();
     }
 }
 

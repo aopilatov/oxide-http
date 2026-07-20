@@ -257,6 +257,15 @@ impl RustServer {
         options: ListenOptions,
         dispatch: Function<(MatchedRequest, BodyIo), Promise<JsResponse>>,
     ) -> Result<()> {
+        // Overwriting a running server used to drop the previous `Running` silently: that
+        // destroys a tokio Runtime on Node's event-loop thread and cuts the first server's
+        // connections with no graceful drain.
+        if self.state.lock().unwrap().is_some() {
+            return Err(napi::Error::from_reason(
+                "listen: this server is already listening; call close() first",
+            ));
+        }
+
         // Compile trees and schemas BEFORE bind: conflicts/invalid patterns/schemas fail early.
         let n = routes.len();
         let mut route_defs = Vec::with_capacity(n);

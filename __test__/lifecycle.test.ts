@@ -180,6 +180,58 @@ test('M10a: SIGTERM → graceful shutdown and exit 0', async () => {
   }
 });
 
+test('C4: SIGTERM drains every server, not just the first to finish', async () => {
+  const portA = nextPort();
+  const portB = nextPort();
+  const child = spawn(
+    process.execPath,
+    [join(here, 'fixtures/two-servers-sigterm.ts'), String(portA), String(portB)],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on('data', (d) => (String(d).includes('ready') ? resolve() : null));
+      child.on('exit', () => reject(new Error('the process died before becoming ready')));
+      setTimeout(() => reject(new Error('the servers did not start')), 5000);
+    });
+
+    const a = fetch(`http://127.0.0.1:${portA}/slow`);
+    const b = fetch(`http://127.0.0.1:${portB}/slow`);
+    await new Promise<void>((r) => setTimeout(r, 150));
+    child.kill('SIGTERM');
+
+    // The fast server drains first; its process.exit() used to kill the slow one too.
+    assert.equal(await (await a).text(), 'drained-a');
+    assert.equal(await (await b).text(), 'drained-b', 'the slower server must also drain');
+
+    const code = await new Promise<any>((resolve) => child.on('exit', resolve));
+    assert.equal(code, 0);
+  } finally {
+    if (child.exitCode === null) child.kill('SIGKILL');
+  }
+});
+
+test('C3: listen() twice on one server is an error', async () => {
+  const s = await up({ routes: (app) => app.get('/', (c) => c.text('ok')) });
+  try {
+    // Overwriting the running state used to drop a tokio Runtime on Node's event-loop
+    // thread and cut the first server's connections with no drain.
+    await assert.rejects(
+      () => s.server.listen({ port: nextPort(), host: '127.0.0.1' }),
+      /already listening/,
+    );
+    // The original server keeps working.
+    assert.equal(await (await fetch(`http://127.0.0.1:${s.port}/`)).text(), 'ok');
+  } finally {
+    await s.close();
+  }
+  // And after close() it stays closed rather than silently restarting.
+  await assert.rejects(
+    () => s.server.listen({ port: nextPort(), host: '127.0.0.1' }),
+    /closed/,
+  );
+});
+
 test('M10a: h2 receives GOAWAY on shutdown while the current stream finishes', async () => {
   const http2 = await import('node:http2');
   const s = await up({

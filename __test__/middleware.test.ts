@@ -173,6 +173,61 @@ test('M5: timeout → 504 + onTimeout + AbortSignal', async () => {
   }
 });
 
+test('C1: client disconnect fires onAbort and aborts c.req.signal', async () => {
+  // onAbort was registrable but never fired, and c.req.signal only reacted to timeouts
+  // despite being documented as "timeout/disconnect".
+  let aborted = false;
+  let signalAborted = false;
+  let handlerFinished = false;
+  const s = await up({
+    routes: (app) => {
+      app.onAbort((c) => {
+        aborted = true;
+        signalAborted = c.req.signal?.aborted === true;
+      });
+      app.get('/slow', async (c) => {
+        await new Promise<void>((r) => setTimeout(r, 600));
+        handlerFinished = true;
+        return c.text('too late');
+      });
+    },
+  });
+  try {
+    // Issue a request and walk away while the handler is still thinking.
+    const ac = new AbortController();
+    const inflight = fetch(`${s.base}/slow`, { signal: ac.signal }).catch(() => undefined);
+    await new Promise<void>((r) => setTimeout(r, 100));
+    ac.abort();
+    await inflight;
+    await new Promise<void>((r) => setTimeout(r, 300));
+
+    assert.equal(aborted, true, 'onAbort must fire when the client goes away');
+    assert.equal(signalAborted, true, 'c.req.signal must be aborted by then');
+    assert.equal(handlerFinished, false, 'the check ran before the handler could finish');
+  } finally {
+    s.close();
+  }
+});
+
+test('C1: a completed request never reports an abort', async () => {
+  let aborted = false;
+  const s = await up({
+    routes: (app) => {
+      app.onAbort(() => {
+        aborted = true;
+      });
+      app.get('/fast', (c) => c.text('ok'));
+    },
+  });
+  try {
+    assert.equal(await (await fetch(`${s.base}/fast`)).text(), 'ok');
+    await new Promise<void>((r) => setTimeout(r, 150));
+    assert.equal(aborted, false, 'a normal response must not look like an abort');
+  } finally {
+    s.close();
+  }
+});
+
 test('M5: route middleware and route-level hook options', async () => {
   const order: string[] = [];
   const mw = async (c, next) => {
@@ -211,6 +266,45 @@ test('M5: group encapsulation — sub-app hooks do not leak onto the parent', as
     await (await fetch(`${s.base}/outer`)).text();
     // the sub hook ran only on /g/inner, not on /outer
     assert.deepEqual(seen, ['sub-hook:/g/inner']);
+  } finally {
+    s.close();
+  }
+});
+
+test('C6: routes added to a sub-app after route() still mount', async () => {
+  const sub = new Server();
+  sub.get('/early', (c) => c.text('early'));
+
+  const s = await up({
+    routes: (app) => {
+      app.route('/g', sub);
+      // Registered after the mount. This used to be dropped silently: route() copied
+      // the sub-app's tables on the spot instead of keeping a reference.
+      sub.get('/late', (c) => c.text('late'));
+      sub.onRequest((c) => c.header('x-sub-hook', c.req.path));
+    },
+  });
+  try {
+    assert.equal(await (await fetch(`${s.base}/g/early`)).text(), 'early');
+    const late = await fetch(`${s.base}/g/late`);
+    assert.equal(await late.text(), 'late');
+    assert.equal(late.headers.get('x-sub-hook'), '/g/late', 'late hooks mount too');
+  } finally {
+    s.close();
+  }
+});
+
+test('C6: nested mounts compose', async () => {
+  const leaf = new Server();
+  leaf.get('/ping', (c) => c.text('pong'));
+  const mid = new Server();
+  mid.route('/inner', leaf);
+
+  const s = await up({
+    routes: (app) => app.route('/outer', mid),
+  });
+  try {
+    assert.equal(await (await fetch(`${s.base}/outer/inner/ping`)).text(), 'pong');
   } finally {
     s.close();
   }

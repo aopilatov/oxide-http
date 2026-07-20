@@ -6,6 +6,8 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::task::{Context, Poll};
 
@@ -43,6 +45,45 @@ pub enum BodyMsg {
     Aborted,
 }
 
+/// Tells JS how the request future ended: dropped by hyper (the connection died) or
+/// completed normally.
+///
+/// It fires in **both** cases on purpose. JS awaits it once per request when a handler
+/// cares about disconnects, and a future that resolved only on abort would stay pending
+/// forever on every successfully served request — a leak per request.
+pub struct AbortSignal {
+    notify: tokio::sync::Notify,
+    aborted: AtomicBool,
+}
+
+impl Default for AbortSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AbortSignal {
+    pub fn new() -> Self {
+        // Armed by default: only producing a response disarms it, so a future dropped
+        // part-way is correctly reported as an abort.
+        AbortSignal {
+            notify: tokio::sync::Notify::new(),
+            aborted: AtomicBool::new(true),
+        }
+    }
+
+    /// A response was produced — this was not an abort.
+    pub fn complete(&self) {
+        self.aborted.store(false, Ordering::Relaxed);
+    }
+
+    /// Wake the JS waiter. `notify_one` stores a permit, so a waiter that arrives late
+    /// still sees it.
+    pub fn fire(&self) {
+        self.notify.notify_one();
+    }
+}
+
 /// Multipart part metadata for JS.
 #[napi(object)]
 pub struct PartMeta {
@@ -66,6 +107,8 @@ pub struct BodyIo {
     resp_tx: StdMutex<Option<Sender<Bytes>>>,
     /// Multipart event stream (None → the route is not multipart).
     mp: TokioMutex<Option<MpState>>,
+    /// How this request ended — see `wait_abort`.
+    abort: Arc<AbortSignal>,
 }
 
 impl BodyIo {
@@ -73,11 +116,13 @@ impl BodyIo {
         req_rx: Option<Receiver<BodyMsg>>,
         resp_tx: Option<Sender<Bytes>>,
         mp_rx: Option<Receiver<MpEvent>>,
+        abort: Arc<AbortSignal>,
     ) -> Self {
         BodyIo {
             req_rx: TokioMutex::new(req_rx),
             resp_tx: StdMutex::new(resp_tx),
             mp: TokioMutex::new(mp_rx.map(|rx| MpState { rx, ended: false })),
+            abort,
         }
     }
 }
@@ -121,6 +166,18 @@ impl BodyIo {
     #[napi]
     pub fn end_write(&self) {
         self.resp_tx.lock().unwrap().take();
+    }
+
+    /// How the request ended: `true` — the client went away before a response was
+    /// produced, `false` — it completed normally.
+    ///
+    /// Hyper dropping the request future is the only disconnect notification available,
+    /// so this is what backs `onAbort` and `c.req.signal`. JS subscribes only when a
+    /// handler will act on it: the promise costs a pending task per request.
+    #[napi]
+    pub async fn wait_abort(&self) -> Result<bool> {
+        self.abort.notify.notified().await;
+        Ok(self.abort.aborted.load(Ordering::Relaxed))
     }
 
     /// Next multipart part (skipping the tail of an unread one). `null` = end of form.

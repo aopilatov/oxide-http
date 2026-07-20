@@ -14,6 +14,15 @@ export declare class BodyIo {
   write(chunk: Buffer): Promise<void>
   /** Finish the response body (close the channel → hyper sees the end). */
   endWrite(): void
+  /**
+   * How the request ended: `true` — the client went away before a response was
+   * produced, `false` — it completed normally.
+   *
+   * Hyper dropping the request future is the only disconnect notification available,
+   * so this is what backs `onAbort` and `c.req.signal`. JS subscribes only when a
+   * handler will act on it: the promise costs a pending task per request.
+   */
+  waitAbort(): Promise<boolean>
   /** Next multipart part (skipping the tail of an unread one). `null` = end of form. */
   nextPart(): Promise<PartMeta | null>
   /** Next chunk of the current part. `null` = end of part. */

@@ -183,8 +183,6 @@ live in Rust — with no JS subscription they run in Rust and the event loop sta
 **The full pipeline of one request (top to bottom):**
 
 ```
-onConnect            (Rust)  a new TCP/TLS connection (per connection, not per request)
-─────────────────────────────────────────────────────────────────
 [ native cors: preflight OPTIONS ]  (Rust, BEFORE onRequest — JS is not woken at all)
 onRequest            (JS)    headers parsed, BEFORE routing (early rate-limit/auth)
 [ matchit: the route ]       no match → notFound (Rust, or app.notFound in JS)
@@ -199,13 +197,16 @@ preSerialization     (JS)    before the result is serialized into bytes
 onSend               (JS)    the response is formed, before writing (native outbound: cors headers; compression — phase 2)
 [ write to the socket ]      (Rust)
 onResponse           (Rust)  processing finished (not necessarily sent successfully); logging/metrics/cleanup
-onClose              (Rust)  the connection is closed
 ─────────────────────────────────────────────────────────────────
 EXCEPTIONS (at any moment):
 onError   (JS)   unified: observation plus building the response; no response → 500
 onTimeout (Rust) the deadline expired → abort the signal → hooks → c.res or the default 504
 onAbort   (Rust) the client went away before the response → abort the signal → hooks → finalization
 ```
+
+Connection-level hooks (`onConnect` / `onClose`) are deliberately absent: honouring them
+means waking JS once per connection, which is exactly what serving connections in Rust
+exists to avoid. Per-connection work belongs in a proxy or in metrics.
 
 **Semantics (settled):**
 - The handlers of one event run **sequentially** in registration order, each `async`, each

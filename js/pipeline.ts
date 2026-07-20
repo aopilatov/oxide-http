@@ -23,14 +23,10 @@ export type ErrorHook = (err: unknown, c: Context) => unknown | Promise<unknown>
 export const BEFORE_STAGES = ['onRequest', 'preParsing', 'preValidation', 'preHandler'] as const;
 /** Stages that run after (always executed). */
 export const AFTER_STAGES = ['preSerialization', 'onSend'] as const;
-const OTHER_STAGES = [
-  'onResponse',
-  'onError',
-  'onTimeout',
-  'onAbort',
-  'onConnect',
-  'onClose',
-] as const;
+// No onConnect/onClose: connection-level hooks would mean waking JS once per connection,
+// which is precisely what serving connections in Rust avoids. They were registrable but
+// never fired, so they are gone rather than silently inert.
+const OTHER_STAGES = ['onResponse', 'onError', 'onTimeout', 'onAbort'] as const;
 /** All lifecycle stages. */
 export const ALL_STAGES = [...BEFORE_STAGES, ...AFTER_STAGES, ...OTHER_STAGES] as const;
 

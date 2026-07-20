@@ -125,6 +125,13 @@ export interface ServerConfig {
   /** The "readiness dropped but still accepting" pause — 5–15s under k8s. */
   preShutdownDelay?: Duration;
   handleSignals?: boolean;
+  /** Install the process-wide `unhandledRejection` log handler (§8). Default `true`;
+   *  skipped anyway when the application already registered its own. */
+  installSafetyNet?: boolean;
+  /** Watch for client disconnects even with no `onAbort` hook, so `c.req.signal` aborts
+   *  when the client goes away. Costs one pending promise per request, hence opt-in;
+   *  registering an `onAbort` hook enables the watch on its own. */
+  detectDisconnect?: boolean;
   // network and platform (§6c B9, A3, A4)
   backlog?: number;
   reusePort?: boolean;
@@ -216,9 +223,15 @@ type HooksByStage = Record<StageName, Array<Scoped<Hook | ErrorHook>>>;
 
 // Process-level safety net (§8): normally never fires — if it does, it means a bug in
 // the wrapper (an uncaught reject). We log it but do NOT bring the process down.
+//
+// It is a process-wide handler, so it also catches rejections that have nothing to do
+// with this library. When the application registered its own handler we stay out of the
+// way: replacing Node's default crash with a log line can leave an app running on broken
+// state. `installSafetyNet: false` opts out entirely.
 let safetyNetInstalled = false;
 function installSafetyNet(): void {
   if (safetyNetInstalled) return;
+  if (process.listenerCount('unhandledRejection') > 0) return;
   safetyNetInstalled = true;
   process.on('unhandledRejection', (reason: unknown) => {
     process.stderr.write(
@@ -230,6 +243,37 @@ function installSafetyNet(): void {
       }) + '\n',
     );
   });
+}
+
+// One SIGTERM/SIGINT handler per process, shared by every server that opted in (§10).
+// Per-instance handlers each called process.exit() after their own drain, so with several
+// servers the first to finish killed the process while the others were still draining.
+const SHUTDOWN_SIGNALS: NodeJS.Signals[] = ['SIGTERM', 'SIGINT'];
+const signalServers = new Set<Server>();
+let removeSignalHandler: (() => void) | null = null;
+
+function onShutdownSignal(): void {
+  // Snapshot first: close() removes each server from the set as it finishes.
+  const draining = [...signalServers].map((s) => s.close());
+  void Promise.allSettled(draining).then((results) => {
+    process.exit(results.some((r) => r.status === 'rejected') ? 1 : 0);
+  });
+}
+
+function registerForSignals(server: Server): void {
+  signalServers.add(server);
+  if (removeSignalHandler) return;
+  for (const sig of SHUTDOWN_SIGNALS) process.on(sig, onShutdownSignal);
+  removeSignalHandler = () => {
+    for (const sig of SHUTDOWN_SIGNALS) process.off(sig, onShutdownSignal);
+  };
+}
+
+function unregisterFromSignals(server: Server): void {
+  signalServers.delete(server);
+  if (signalServers.size > 0 || !removeSignalHandler) return;
+  removeSignalHandler();
+  removeSignalHandler = null;
 }
 
 /** Prefix normalization: '' | '/' → ''; a leading slash is required; trailing (and /*) removed. */
@@ -258,6 +302,7 @@ function emptyHooks(): HooksByStage {
 export class Server {
   readonly #native: RustServer;
   #routes: RouteEntry[] = [];
+  #mounted: Array<{ prefix: string; sub: Server }> = []; // sub-apps, folded in at listen()
   #middleware: Array<Scoped<Middleware>> = []; // the onion (global plus prefixed)
   #hooks: HooksByStage = emptyHooks();
   #baseUrl = '';
@@ -272,8 +317,9 @@ export class Server {
   #events = new EventEmitter();
   #listening = false;
   #closing: Promise<void> | null = null; // makes close() idempotent
-  #signalCleanup: (() => void) | null = null;
   #handleSignals: boolean;
+  #installSafetyNet: boolean;
+  #detectDisconnect: boolean;
   #readinessTimer: NodeJS.Timeout | null = null;
   #closed = false;
 
@@ -352,6 +398,8 @@ export class Server {
     // SIGTERM/SIGINT → graceful shutdown (§10). Disabled with { handleSignals: false }
     // — for example when an external supervisor already manages the process.
     this.#handleSignals = config.handleSignals !== false;
+    this.#installSafetyNet = config.installSafetyNet !== false;
+    this.#detectDisconnect = config.detectDisconnect === true;
     if (config.http2) options.http2 = normalizeHttp2(config.http2);
     this.#native = new RustServer();
   }
@@ -516,33 +564,38 @@ export class Server {
   onAbort(fn: Hook): this {
     return this.addHook('onAbort', fn);
   }
-  onConnect(fn: Hook): this {
-    return this.addHook('onConnect', fn);
-  }
-  onClose(fn: Hook): this {
-    return this.addHook('onClose', fn);
-  }
 
   // --- groups ---
 
-  /** Mount a sub-application under a prefix (encapsulation via prefix matching). */
+  /** Mount a sub-application under a prefix (encapsulation via prefix matching).
+   *
+   *  The sub-app is recorded by reference and folded in at `listen()`, so routes,
+   *  middleware and hooks added to it *after* this call are still picked up. Copying
+   *  eagerly meant anything registered later was silently dropped. */
   route(prefix: string, sub: Server): this {
     if (!(sub instanceof Server)) {
       throw new TypeError('route(prefix, sub): sub must be a Server instance');
     }
-    const P = join(this.#baseUrl, normalizeBase(prefix));
-    const remap = (pfx: string): string => (pfx === '' ? P : join(P, pfx));
-
-    for (const m of sub.#middleware) this.#middleware.push({ prefix: remap(m.prefix), fn: m.fn });
-    for (const stage of ALL_STAGES) {
-      for (const h of sub.#hooks[stage]) {
-        this.#hooks[stage].push({ prefix: remap(h.prefix), fn: h.fn });
-      }
-    }
-    for (const r of sub.#routes) {
-      this.#routes.push({ ...r, path: join(P, r.path) });
-    }
+    if (sub === this) throw new TypeError('route: a server cannot mount itself');
+    this.#mounted.push({ prefix: join(this.#baseUrl, normalizeBase(prefix)), sub });
     return this;
+  }
+
+  /** Fold mounted sub-apps into this one. Recursive, so a sub-app may mount its own. */
+  #applyMounts(): void {
+    const mounts = this.#mounted;
+    this.#mounted = []; // cleared first: a cycle would otherwise recurse forever
+    for (const { prefix, sub } of mounts) {
+      sub.#applyMounts();
+      const remap = (pfx: string): string => (pfx === '' ? prefix : join(prefix, pfx));
+      for (const m of sub.#middleware) this.#middleware.push({ prefix: remap(m.prefix), fn: m.fn });
+      for (const stage of ALL_STAGES) {
+        for (const h of sub.#hooks[stage]) {
+          this.#hooks[stage].push({ prefix: remap(h.prefix), fn: h.fn });
+        }
+      }
+      for (const r of sub.#routes) this.#routes.push({ ...r, path: join(prefix, r.path) });
+    }
   }
 
   /** Custom 404 handler (otherwise Rust answers 404 without waking JS). */
@@ -555,6 +608,8 @@ export class Server {
 
   /** Listen on TCP (`{ port, host }`) or a Unix socket (`{ path }`) — §6c B9. */
   async listen({ port, host = '0.0.0.0', path }: ListenArgs = {}): Promise<this> {
+    if (this.#closed) throw new Error('listen: server is closed (close() was already called)');
+    if (this.#listening) throw new Error('listen: server is already listening');
     if (path != null) {
       if (typeof path !== 'string') throw new TypeError('listen: path must be a string');
       this.#options.unixPath = path;
@@ -562,7 +617,11 @@ export class Server {
     } else if (typeof port !== 'number') {
       throw new TypeError('listen: a numeric port or a path for a Unix socket is required');
     }
-    installSafetyNet();
+    if (this.#installSafetyNet) installSafetyNet();
+
+    // Mounted sub-apps are folded in now, not at route() time, so late registrations
+    // on them are included.
+    this.#applyMounts();
 
     // Schemas: conversion to JSON Schema (for Rust) plus valibot preValidation injection.
     if (this.#routes.some((r) => r.schema != null)) await loadSchemaDeps();
@@ -766,26 +825,11 @@ export class Server {
 
   /** SIGTERM/SIGINT → graceful shutdown → exit 0 (k8s: §10). */
   #installSignalHandlers(): void {
-    if (this.#signalCleanup) return;
-    const onSignal = (): void => {
-      this.close()
-        .then(() => process.exit(0))
-        .catch(() => process.exit(1));
-    };
-    const handlers: Array<[NodeJS.Signals, () => void]> = [
-      ['SIGTERM', onSignal],
-      ['SIGINT', onSignal],
-    ];
-    for (const [sig, fn] of handlers) process.on(sig, fn);
-    this.#signalCleanup = () => {
-      for (const [sig, fn] of handlers) process.off(sig, fn);
-    };
+    registerForSignals(this);
   }
 
   #removeSignalHandlers(): void {
-    if (!this.#signalCleanup) return;
-    this.#signalCleanup();
-    this.#signalCleanup = null;
+    unregisterFromSignals(this);
   }
 
   async #dispatch(nreq: NativeRequest, bodyIo: BodyIo): Promise<NativeResponse> {
@@ -803,6 +847,27 @@ export class Server {
 
     const controller = new AbortController();
     c.req.signal = controller.signal;
+
+    // Client-disconnect detection. Rust resolves this for every request (otherwise the
+    // promise would leak on each successful one), so subscribing is only worth its cost
+    // when something will act on the result.
+    if (chain.onAbort.length > 0 || this.#detectDisconnect) {
+      void bodyIo.waitAbort().then(
+        async (aborted) => {
+          if (!aborted || c._settled) return;
+          c.aborted = true;
+          controller.abort();
+          try {
+            await runAfterHooks(chain.onAbort, c);
+          } catch {
+            // The client is already gone — an onAbort failure has nowhere to surface.
+          }
+        },
+        () => {
+          // The native bridge went away; there is nothing left to report.
+        },
+      );
+    }
 
     try {
       if (this.#requestTimeout) {

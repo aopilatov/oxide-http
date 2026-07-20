@@ -28,6 +28,8 @@ export interface BodyIo {
   endWrite(): void;
   nextPart(): Promise<PartMeta | null>;
   readPart(): Promise<Buffer | null>;
+  /** Resolves when the request ends: `true` if the client disconnected first. */
+  waitAbort(): Promise<boolean>;
 }
 
 /** A matched request received from Rust. */

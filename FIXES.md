@@ -5,20 +5,21 @@ stages. Stages land one at a time, each with its own confirmation before startin
 
 **Status legend:** `[ ]` not started · `[~]` in progress · `[x]` done
 
-**Progress:** 11 / 26 items · Stage B complete, awaiting confirmation for Stage C
+**Progress:** 17 / 26 items · Stage C complete, awaiting confirmation for Stage D
 
 | Stage | Theme | Items | Done |
 | --- | --- | --- | --- |
 | A | Security — blocks release | 6 | 6 |
 | B | Data correctness | 5 | 5 |
-| C | Lifecycle and public API | 6 | 0 |
+| C | Lifecycle and public API | 6 | 6 |
 | D | Observability and cleanups | 9 | 0 |
 
-Verification after Stage B: `cargo clippy -- -D warnings` clean, 38 Rust unit tests pass,
-140 JS tests pass (`npm test`), `npm run typecheck` clean.
+Verification after Stage C: `cargo clippy -- -D warnings` clean, 38 Rust unit tests pass,
+146 JS tests pass (`npm test`), `npm run typecheck` clean.
 
-The B3 and B4 tests were checked against the un-fixed code and each fails without its fix,
-so they genuinely pin the bug rather than passing by construction.
+Tests for B3, B4 and C4 were run against the un-fixed code and each fails without its fix,
+so they pin the bug rather than passing by construction. C4 especially: it is a race, and
+a test for a race that never fails is worth nothing.
 
 ---
 
@@ -213,9 +214,9 @@ so the response does not depend on whether the route happens to have a schema.
 
 ---
 
-## Stage C — Lifecycle and public API
+## Stage C — Lifecycle and public API — **done 2026-07-20**
 
-### [ ] C1 — Wire up `onAbort` and client-disconnect detection
+### [x] C1 — Wire up `onAbort` and client-disconnect detection
 
 `onAbort` is registrable but never fires, and `c.req.signal` only aborts on timeout
 despite being documented as "timeout/disconnect" (`js/context.ts:111`).
@@ -228,7 +229,20 @@ despite being documented as "timeout/disconnect" (`js/context.ts:111`).
 - Gate the subscription on `chain.onAbort.length > 0` or a new `config.detectDisconnect`
   so there is no pending promise per request by default.
 
-### [ ] C2 — Remove `onConnect` / `onClose` — **decided: remove**
+Done, with one correction to the plan. A signal that fires *only* on abort would leave the
+`waitAbort()` promise pending forever on every successfully served request — a leak per
+request. So `AbortSignal` (`src/stream.rs`) always fires and carries a boolean: `true` when
+hyper dropped the future, `false` on normal completion. The guard is armed by default and
+disarmed by producing a response, so "dropped part-way" is the default reading.
+
+The guard lives in `dispatch` rather than `handle`: the whole chain is one future, so a
+drop anywhere is observed identically, and placing it after the last early return means a
+415/413/408 is not misreported as a disconnect.
+
+Known limit: this covers the window up to the response being produced. A client vanishing
+*mid-stream* is not an `onAbort` — the response pump already sees a write failure there.
+
+### [x] C2 — Remove `onConnect` / `onClose` — **decided: remove**
 
 Both are registrable and never fire. Implementing them honestly means waking JS per
 connection, which contradicts the core design (connections are served in Rust). No test
@@ -241,7 +255,10 @@ references them.
 
 Breaking: both methods disappear from the public API.
 
-### [ ] C3 — Guard against a second `listen()`
+Done as planned, with a note in DESIGN.md recording *why* they are absent, so the gap does
+not read as an oversight to be filled back in later.
+
+### [x] C3 — Guard against a second `listen()`
 
 `*self.state.lock().unwrap() = Some(...)` (`src/lib.rs:435`) silently drops the previous
 `Running`, destroying a tokio Runtime on Node's event-loop thread and cutting the first
@@ -250,7 +267,9 @@ server's connections without a graceful drain.
 - Return an error from `listen` (`src/lib.rs:214`) when `state` is already `Some`.
 - Check `#listening` and `#closed` in the wrapper (`js/index.ts:552`).
 
-### [ ] C4 — One signal handler per process
+Done as planned. Guarded on both sides, so a direct addon call is covered too.
+
+### [x] C4 — One signal handler per process
 
 Every `Server` instance installs its own SIGTERM handler calling `process.exit(0)`
 (`js/index.ts:763`), so with several servers the first one to finish kills the process
@@ -259,7 +278,14 @@ before the others drain.
 - Use a module-level registry: install a single handler that closes every live instance,
   then exits.
 
-### [ ] C5 — Stop swallowing unrelated unhandled rejections
+Done as planned. The handler snapshots the registry before draining, since `close()`
+removes each server from it as it finishes. Exit code is 1 if any drain rejected.
+
+Covered by a new two-server fixture (`__test__/fixtures/two-servers-sigterm.ts`) with
+deliberately different drain durations — the fast server finishing must not cut the slow
+one short.
+
+### [x] C5 — Stop swallowing unrelated unhandled rejections
 
 `installSafetyNet` (`js/index.ts:220`) intercepts every unhandled rejection in the
 process and replaces Node's default crash with a stderr line, so an application can keep
@@ -268,12 +294,20 @@ running with broken logic.
 - Make it configurable (`config.installSafetyNet`, default `true` for compatibility) and
   skip installation when the application already registered its own handler.
 
-### [ ] C6 — `route(prefix, sub)` snapshots instead of referencing
+Done as planned. Not covered by a test: the install flag is process-global and set by the
+first `listen()` in a file, so an in-process assertion would depend on test ordering. It
+would need its own subprocess fixture — cheap to add if this ever regresses.
+
+### [x] C6 — `route(prefix, sub)` snapshots instead of referencing
 
 Routes are copied at call time (`js/index.ts:524`), so anything added to the sub-app
 afterwards is silently lost.
 
 - Keep a reference to the sub-app and expand it during `listen()`.
+
+Done. `#applyMounts` is recursive so nested mounts compose, and it clears the pending list
+before recursing, which makes an accidental mount cycle terminate instead of hanging.
+`route()` also now rejects mounting a server into itself.
 
 ---
 
@@ -343,7 +377,11 @@ Acceptable on 0.x, but they all need a CHANGELOG entry (D9):
    `400`; both used to surface as `500` (B5).
 7. `schema.body` on a multipart route now fails `listen()` (B1).
 8. `onConnect` / `onClose` removed from the public API (C2).
-9. A second `listen()` on the same instance now throws (C3).
+9. A second `listen()` on the same instance now throws, as does `listen()` after
+   `close()` (C3).
+10. `route(prefix, sub)` folds the sub-app in at `listen()` rather than at call time, so
+    late registrations on a sub-app now take effect (C6). Code relying on the old
+    snapshot behaviour changes meaning.
 
 New runtime dependencies: `flate2` and `brotli`, both pure Rust (B1).
 

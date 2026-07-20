@@ -126,12 +126,22 @@ app.preSerialization(fn); // the "after" hooks always run
 app.onSend(fn);           // the last place to adjust headers
 app.onResponse(fn);       // observation
 app.onTimeout(fn);
+app.onAbort(fn);          // the client disconnected before the response
 app.onError((err, c) => c.json({ error: String(err) }, 500));
 ```
 
 Order: `onRequest → preParsing → preValidation → preHandler → [middleware → handler] →
 preSerialization → onSend → onResponse`. Any "before" hook that produces a response stops
 the chain; the "after" hooks always run.
+
+`onAbort` fires when the client goes away before a response is produced, and `c.req.signal`
+is aborted with it. Watching for that costs a pending promise per request, so it is only
+active when an `onAbort` hook is registered — set `detectDisconnect: true` to abort
+`c.req.signal` without one. There are no connection-level hooks: honouring them would mean
+waking JS once per connection, which is what serving connections in Rust avoids.
+
+Sub-apps mounted with `app.route(prefix, sub)` are folded in at `listen()`, so routes and
+hooks registered on the sub-app after the `route()` call are still picked up.
 
 ## Schemas
 
@@ -193,7 +203,10 @@ so a zip bomb is refused with `413` rather than expanded. An encoding we do not 
 is `415`, a corrupt stream `400`, and malformed JSON in `c.req.json()` is `400`.
 
 **Lifecycle:** `shutdownTimeout` (default `'10s'`), `preShutdownDelay`,
-`handleSignals` (SIGTERM/SIGINT are handled by default).
+`handleSignals` (SIGTERM/SIGINT are handled by default; one handler per process drains
+every server before exiting), `installSafetyNet` (the process-wide `unhandledRejection`
+logger — on by default, skipped when the application registers its own handler).
+`listen()` may only be called once per instance.
 
 **Network:** `backlog`, `reusePort`, `noDelay`, `maxConnections`, `proxyProtocol`,
 `workerThreads: number | 'auto'` (auto reads the pod's cgroup quota, not the node's cores).
