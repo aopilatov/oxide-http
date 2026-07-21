@@ -1,6 +1,6 @@
 {
   "name": "@oxide-ts/http",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fast HTTP/1.1 + HTTP/2 server for Node.js built on Rust (napi-rs)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
