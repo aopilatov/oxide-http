@@ -5,6 +5,7 @@
 //! See DESIGN.md.
 
 mod bridge;
+mod cache;
 mod compress;
 mod cors;
 mod cpu;
@@ -61,6 +62,21 @@ pub struct RouteDef {
     pub query_schema: Option<String>,
     pub params_schema: Option<String>,
     pub multipart: Option<MultipartOptions>,
+    /// Native response cache for this route (§18). Absent = not cached.
+    pub cache: Option<CacheOptions>,
+}
+
+/// Per-route response cache options (§18; normalized by the wrapper).
+#[napi(object)]
+pub struct CacheOptions {
+    /// Entry lifetime in ms. Must be > 0.
+    pub ttl_ms: i64,
+    /// Request headers (lowercase) whose values become part of the cache key.
+    pub vary: Option<Vec<String>>,
+    /// Entry cap per route; defaults to 1024.
+    pub max_entries: Option<i64>,
+    /// Bodies larger than this are not stored; defaults to 1 MiB.
+    pub max_body_bytes: Option<i64>,
 }
 
 /// Per-route multipart options (normalized by the wrapper; limits in bytes/counts).
@@ -273,6 +289,7 @@ impl RustServer {
             (0..n).map(|_| None).collect();
         let mut mp_slots: Vec<Option<crate::multipart::MultipartConfig>> =
             (0..n).map(|_| None).collect();
+        let mut cache_slots: Vec<Option<crate::cache::LeafCache>> = (0..n).map(|_| None).collect();
         for r in routes {
             // A multipart body is a stream of parts, not one JSON document, so a body
             // schema there can never match — every request would 400. Say so at startup.
@@ -289,10 +306,49 @@ impl RustServer {
                 params: r.params_schema,
             })
             .map_err(napi::Error::from_reason)?;
+            // Only safe methods are ever served from the cache, so a cache option on an
+            // unsafe one is a config mistake — reject it instead of ignoring it.
+            if let Some(c) = &r.cache {
+                let m = r.method.to_uppercase();
+                if !matches!(m.as_str(), "GET" | "HEAD" | "QUERY" | "ALL") {
+                    return Err(napi::Error::from_reason(format!(
+                        "route {} {}: cache is only supported on GET/HEAD/QUERY (and ALL, \
+                         where only safe methods are served from it)",
+                        r.method, r.path
+                    )));
+                }
+                if c.ttl_ms <= 0 {
+                    return Err(napi::Error::from_reason(format!(
+                        "route {} {}: cache.ttl must be > 0",
+                        r.method, r.path
+                    )));
+                }
+            }
             let idx = r.leaf_id as usize;
             if idx < n {
                 schema_slots[idx] = Some(leaf);
                 mp_slots[idx] = r.multipart.map(multipart_config);
+                cache_slots[idx] = r.cache.map(|c| {
+                    crate::cache::LeafCache::new(crate::cache::CacheConfig {
+                        ttl: Duration::from_millis(c.ttl_ms as u64),
+                        vary: c
+                            .vary
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|s| s.to_lowercase())
+                            .collect(),
+                        max_entries: c
+                            .max_entries
+                            .filter(|&x| x > 0)
+                            .map(|x| x as usize)
+                            .unwrap_or(1024),
+                        max_body_bytes: c
+                            .max_body_bytes
+                            .filter(|&x| x > 0)
+                            .map(|x| x as usize)
+                            .unwrap_or(1024 * 1024),
+                    })
+                });
             }
             route_defs.push(RRouteDef {
                 method: r.method,
@@ -514,6 +570,7 @@ impl RustServer {
             }),
             schemas,
             multipart: mp_slots,
+            cache: cache_slots,
             tuning,
             metrics: Arc::new(crate::metrics::Metrics::new()),
             readiness: crate::health::Readiness::default(),
@@ -621,6 +678,20 @@ impl RustServer {
             Ok(Err(e)) => Err(napi::Error::from_reason(e)),
             Err(_) => Err(napi::Error::from_reason("inject: task aborted")),
         }
+    }
+
+    /// Purge the native response cache (§18): all routes, or entries whose request path
+    /// equals `path` exactly (any query/vary variant). Returns how many entries were
+    /// removed. Before `listen()` this is a no-op — there is no cache yet.
+    #[napi]
+    pub fn purge_cache(&self, path: Option<String>) -> Result<u32> {
+        let mut purged = 0usize;
+        if let Some(running) = self.state.lock().unwrap().as_ref() {
+            for leaf in running.shared.cache.iter().flatten() {
+                purged += leaf.purge(path.as_deref());
+            }
+        }
+        Ok(purged as u32)
     }
 
     /// Set readiness from JS (§11): `app.setReady(false)` removes the pod from the

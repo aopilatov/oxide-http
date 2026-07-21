@@ -101,14 +101,32 @@ a Buffer/stream → `c.body`.
 
 ```ts
 app.get(path, handler);
-app.get(path, options, handler);          // schemas, multipart, route hooks
+app.get(path, options, handler);          // schemas, multipart, cache, route hooks
 app.get(path, mw1, mw2, handler);         // route middleware
-// post / put / patch / delete / head / options / all — same shape
+// post / put / patch / delete / head / options / query / all — same shape
+// query = HTTP QUERY (draft-ietf-httpbis-safe-method-w-body): a safe method with a body
 
 const api = new Server();
 api.get('/ping', (c) => c.text('pong'));
 app.route('/api/v1', api);                // mounting under a prefix
 ```
+
+### Native response cache
+
+```ts
+app.get('/hot', { cache: '5s' }, handler);                            // ttl shorthand
+app.get('/t', { cache: { ttl: '30s', vary: ['x-tenant'] } }, handler);
+app.query('/search', { cache: '10s' }, handler);  // QUERY: the body joins the key
+app.purgeCache('/hot');                           // invalidate one path
+app.purgeCache();                                 // invalidate everything
+```
+
+The first response is stored in Rust; identical requests are then answered **without
+waking JS** — at native-endpoint speed, with the event loop left completely idle
+(ELU 0.000 under a hit-only load). Safe methods only (`GET`/`HEAD`/`QUERY`); stored only
+when the response is a plain `200` without `Set-Cookie` or `Cache-Control:
+no-store/private`. Hits carry `x-cache: hit`; `/metrics` counts
+`http_cache_hits_total`/`http_cache_misses_total`. Details in DESIGN.md §18.
 
 ⚠️ One parameter per segment: `/:id` works, `/{id}.{ext}` does not (a router limitation).
 Work around it by matching the whole segment and splitting inside the handler.

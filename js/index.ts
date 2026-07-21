@@ -7,6 +7,7 @@ import fs from 'node:fs';
 
 import { RustServer } from '../index.js';
 import type {
+  CacheOptions as NativeCacheOptions,
   CorsOptions as NativeCorsOptions,
   Http2Options as NativeHttp2Options,
   ListenOptions as NativeListenOptions,
@@ -153,10 +154,26 @@ export interface ServerConfig {
   overloadShedAfter?: Duration;
 }
 
-/** Route options: schemas, multipart and route-level hooks. */
+/** Native response cache for a route (§18). */
+export interface RouteCacheConfig {
+  /** Entry lifetime. Required. */
+  ttl: Duration;
+  /** Request headers whose values become part of the cache key (e.g. `['x-tenant']`). */
+  vary?: string[];
+  /** Entry cap per route; defaults to 1024. */
+  maxEntries?: number;
+  /** Responses with a larger body are not stored; defaults to `'1mb'`. */
+  maxBodyBytes?: ByteSize;
+}
+
+/** Route options: schemas, multipart, native response cache and route-level hooks. */
 export type RouteOptions = {
   schema?: RouteSchema;
   multipart?: boolean | MultipartConfig;
+  /** Native response cache (§18): after the first response, identical requests are
+   *  answered in Rust without waking JS. GET/HEAD/QUERY only. A bare duration is
+   *  shorthand for `{ ttl }`. */
+  cache?: Duration | RouteCacheConfig;
 } & Partial<Record<StageName, Hook | Hook[]>>;
 
 /** `listen()` arguments: TCP or a Unix socket. */
@@ -219,6 +236,7 @@ interface RouteEntry {
   hooks: Partial<Record<StageName, Array<Hook | ErrorHook>>>;
   schema: RouteSchema | null;
   multipart: NativeMultipartOptions | null;
+  cache: NativeCacheOptions | null;
   handler: Handler;
   /** The synthetic valibot preValidation hook is already in `hooks` — see
    *  `injectValidation`. Guards against a second copy when `listen()` is retried after a
@@ -442,6 +460,7 @@ export class Server {
     let hooks: Partial<Record<StageName, Array<Hook | ErrorHook>>> = {};
     let schema: RouteSchema | null = null;
     let multipart: NativeMultipartOptions | null = null;
+    let cache: NativeCacheOptions | null = null;
 
     if (list.length > 1 && typeof list[0] === 'object' && list[0] !== null) {
       const opts = list.shift() as RouteOptions;
@@ -453,6 +472,7 @@ export class Server {
         opts.multipart != null && opts.multipart !== false
           ? normalizeMultipart(opts.multipart)
           : null;
+      cache = opts.cache != null ? normalizeCache(opts.cache, method, path) : null;
     }
     const handler = list.pop();
     if (typeof handler !== 'function') {
@@ -465,6 +485,7 @@ export class Server {
       hooks,
       schema, // { body?, query?, params?, response? } — valibot | JSON Schema
       multipart, // normalized multipart options | null
+      cache, // normalized native-cache options | null (§18)
       handler: handler as Handler,
     });
     return this;
@@ -520,6 +541,16 @@ export class Server {
   options(path: string, ...a: Array<RouteOptions | Middleware | Handler>): this;
   options(path: string, ...a: Array<RouteOptions | Middleware | Handler>): this {
     return this.#add('OPTIONS', path, a);
+  }
+
+  /** HTTP `QUERY` (draft-ietf-httpbis-safe-method-w-body): a safe method whose request
+   *  body describes the query — "GET with a body". Works with `schema.body` (validated
+   *  in Rust) and with the native response cache. */
+  query(path: string, handler: Handler): this;
+  query(path: string, options: RouteOptions, handler: Handler): this;
+  query(path: string, ...a: Array<RouteOptions | Middleware | Handler>): this;
+  query(path: string, ...a: Array<RouteOptions | Middleware | Handler>): this {
+    return this.#add('QUERY', path, a);
   }
 
   all(path: string, handler: Handler): this;
@@ -634,6 +665,13 @@ export class Server {
     return this;
   }
 
+  /** Purge the native response cache (§18): everything, or entries whose request path
+   *  equals `path` exactly (every query/vary variant of it). Returns the number of
+   *  entries removed. The path includes `baseUrl`, exactly as the client sends it. */
+  purgeCache(path?: string): number {
+    return this.#native.purgeCache(path ?? null);
+  }
+
   // --- startup ---
 
   /** Listen on TCP (`{ port, host }`) or a Unix socket (`{ path }`) — §6c B9. */
@@ -691,6 +729,7 @@ export class Server {
         if (p) entry.paramsSchema = p;
       }
       if (r.multipart) entry.multipart = r.multipart;
+      if (r.cache) entry.cache = r.cache;
       return entry;
     });
 
@@ -969,7 +1008,7 @@ export class Server {
   }
 }
 
-const DEFAULT_CORS_METHODS = ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'];
+const DEFAULT_CORS_METHODS = ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS', 'QUERY'];
 
 /** Normalize config.cors into native CorsOptions (§6a).
  *  napi's Option<Vec> fields reject null → omit the key when unset. */
@@ -1035,6 +1074,29 @@ function normalizeMultipart(mp: true | MultipartConfig): NativeMultipartOptions 
   // napi's Option<Vec> rejects null → set the key only when provided.
   if (o.allowedMimeTypes) out.allowedMimeTypes = o.allowedMimeTypes;
   if (o.allowedExtensions) out.allowedExtensions = o.allowedExtensions;
+  return out;
+}
+
+/** Normalize the route cache option (§18): a bare duration is `{ ttl }` shorthand.
+ *  Rust checks too, but failing at registration points at the exact route call site. */
+function normalizeCache(
+  v: Duration | RouteCacheConfig,
+  method: string,
+  path: string,
+): NativeCacheOptions {
+  if (method !== 'GET' && method !== 'HEAD' && method !== 'QUERY' && method !== 'ALL') {
+    throw new TypeError(
+      `${method} ${path}: cache is only supported on GET/HEAD/QUERY routes ` +
+        `(and ALL, where only safe methods are served from it)`,
+    );
+  }
+  const cfg: RouteCacheConfig = typeof v === 'object' ? v : { ttl: v };
+  const ttlMs = parseDuration(cfg.ttl);
+  if (!(ttlMs > 0)) throw new TypeError(`${method} ${path}: cache.ttl must be > 0`);
+  const out: NativeCacheOptions = { ttlMs };
+  if (cfg.vary && cfg.vary.length > 0) out.vary = cfg.vary.map((h) => h.toLowerCase());
+  if (cfg.maxEntries != null) out.maxEntries = count('cache.maxEntries', cfg.maxEntries);
+  if (cfg.maxBodyBytes != null) out.maxBodyBytes = parseBytes(cfg.maxBodyBytes);
   return out;
 }
 

@@ -540,3 +540,45 @@ http-rust/
 - ~~baseUrl, customIpHeaders, customCountryHeaders, multipart~~ → added (§4, §9a).
 - ~~The completeness audit (A1–A6, B1–B10, WebSocket, schemas)~~ → decided: A1–A4 + A6 + all
   of B in v1; WebSocket is not supported; schemas go valibot → JSON Schema → Rust.
+
+## 18. The native response cache and the QUERY method
+
+Where the architecture objectively wins is the paths where JS never wakes (§6a, §11).
+The response cache extends that zone to regular routes: the route opts in, the first
+request runs the JS handler, and every identical request until the TTL expires is
+answered entirely from Rust — at native-endpoint speed, with the main thread left idle
+(measured ELU on a hit-only load: 0.000 versus ~0.97 for the same route uncached).
+
+```ts
+app.get('/hot', { cache: '5s' }, handler);
+app.get('/tenant', { cache: { ttl: '30s', vary: ['x-tenant'] } }, handler);
+app.query('/search', { cache: '10s' }, handler); // keyed by the body hash too
+app.purgeCache('/hot');   // drop the entries of one path (all query/vary variants)
+app.purgeCache();         // drop everything
+```
+
+Semantics (deliberately conservative):
+
+- **Opt-in per route**; only safe methods are served from the cache: `GET`, `HEAD`
+  (auto-HEAD shares the GET entries), `QUERY`. Registering `cache` on an unsafe method
+  is a startup error.
+- **Key** = method + path + query string (+ the raw body hash for `QUERY`) + the values
+  of the configured `vary` request headers.
+- **Stored** only when the response is status `200`, not streamed, has no `Set-Cookie`,
+  no `Cache-Control: no-store/private`, and the body is within `maxBodyBytes`
+  (default 1 MiB). Entry count per route is capped by `maxEntries` (default 1024;
+  expired entries are swept first, then arbitrary ones — the cap is a memory guard,
+  not an LRU policy).
+- A hit skips middleware, hooks and validation. That is safe: the key covers
+  path/query/body, so a hit proves this exact request passed validation when the entry
+  was stored. `x-request-id` is per-request (never replayed); hits carry `x-cache: hit`.
+- Misses on a cache-enabled route and hits are counted in `/metrics`
+  (`http_cache_hits_total` / `http_cache_misses_total`).
+- Concurrent misses of the same key are **not** coalesced: on expiry, several identical
+  requests may run the handler simultaneously (thundering herd). Acceptable for v1;
+  request coalescing is a possible follow-up.
+
+`QUERY` (draft-ietf-httpbis-safe-method-w-body) is registered via `app.query()` and
+behaves like a safe POST: the body streams/validates/limits exactly like a POST body,
+`405`/`Allow` and auto-`OPTIONS` advertise it, CORS default methods include it, and the
+cache treats it as safe with the body folded into the key.

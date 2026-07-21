@@ -83,7 +83,7 @@ impl Routes {
 
         // ALL matches the path ⇒ every standard method is allowed.
         if self.all.as_ref().is_some_and(|r| r.at(path).is_ok()) {
-            for m in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            for m in ["GET", "POST", "PUT", "PATCH", "DELETE", "QUERY"] {
                 if !methods.iter().any(|x| x == m) {
                     methods.push(m.to_string());
                 }

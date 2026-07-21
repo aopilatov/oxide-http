@@ -181,3 +181,20 @@ The server's baseline RSS is about 190 MB on a 16-core machine: tokio worker sta
 count comes from the cgroup quota, see §6c A3) plus hyper buffers and the V8 heap. In a
 container with `limits.cpu: 1` there will be fewer workers and correspondingly less
 baseline memory.
+
+## The native response cache (§18)
+
+The same JS route measured with and without `cache` (release build, 64 connections,
+the same client-bound harness as above; ELU sampled in the server process):
+
+| Route | RPS | µs/request | ELU |
+|---|---:|---:|---:|
+| `GET /plain` — JS handler every request | 66,639 | 15.01 | **0.97** |
+| `GET /cached` — `cache: '60s'`, hits after the first request | 69,678 | 14.35 | **0.000** |
+
+Both numbers sit at the client's ceiling, so the RPS difference understates the effect.
+The real signal is ELU: the uncached route saturates the JS main thread, while the
+cached one leaves it **completely idle** — hits are answered in Rust like the native
+endpoint. On a route whose responses can tolerate a TTL, the cache converts JS-handler
+throughput into native-path throughput and frees the main thread for the routes that
+genuinely need JS.

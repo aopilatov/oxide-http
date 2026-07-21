@@ -101,6 +101,8 @@ pub struct Shared {
     pub schemas: Vec<crate::schema::LeafSchema>,
     /// Multipart configs by leaf_id. None = the route is not multipart.
     pub multipart: Vec<Option<crate::multipart::MultipartConfig>>,
+    /// Native response caches by leaf_id (§18). None = the route is not cached.
+    pub cache: Vec<Option<crate::cache::LeafCache>>,
     /// Protocol/TLS/timeouts.
     pub tuning: Tuning,
     /// Prometheus counters (§11). Arc because body-reading tasks need a 'static clone.
@@ -949,6 +951,39 @@ async fn dispatch(
         None
     };
 
+    // Native response cache (§18). Only safe methods are served from it; auto-HEAD
+    // shares the GET entries (the stored body is simply not sent).
+    let cache_leaf = if leaf_id >= 0 {
+        shared.cache.get(leaf_id as usize).and_then(|o| o.as_ref())
+    } else {
+        None
+    };
+    let effective_method: &str = if head { "GET" } else { &data.method };
+    let cacheable = cache_leaf.is_some()
+        && multipart_cfg.is_none()
+        && matches!(effective_method, "GET" | "HEAD" | "QUERY");
+
+    // For GET/HEAD the key is complete before any body work — the hit path returns
+    // here, ahead of buffering, validation and the JS boundary. A QUERY key includes
+    // the raw body hash, so its lookup happens right after buffering below.
+    let mut cache_key: Option<String> = None;
+    if cacheable && effective_method != "QUERY" {
+        let leaf = cache_leaf.unwrap();
+        let key = leaf.key(
+            effective_method,
+            &data.path,
+            data.query_string.as_deref(),
+            &data.headers,
+            None,
+        );
+        if let Some(hit) = leaf.lookup(&key) {
+            shared.metrics.cache_hit();
+            return cached_response(hit, head, &id, &shared.request_id_header, &shared.metrics);
+        }
+        shared.metrics.cache_miss();
+        cache_key = Some(key);
+    }
+
     let mut incoming = Some(incoming);
     let mut mp_rx = None;
 
@@ -980,6 +1015,8 @@ async fn dispatch(
     let encoding = content_encoding(&data.headers);
     let buffer_for_schema =
         multipart_cfg.is_none() && schema.is_some_and(|s| s.has_body()) && has_body;
+    // The QUERY cache key needs the raw body hash, so a cached QUERY buffers too (§18).
+    let buffer_for_cache = cacheable && effective_method == "QUERY" && has_body;
 
     // `buffered` is what JS will receive — always the bytes the client actually sent.
     // `decoded` is the plain form and exists only for the schema check: handing the
@@ -987,7 +1024,7 @@ async fn dispatch(
     // than on an identical route without one.
     let mut buffered: Option<Bytes> = None;
     let mut decoded: Option<Bytes> = None;
-    if buffer_for_schema {
+    if buffer_for_schema || buffer_for_cache {
         let raw = match buffer_body(
             incoming.take().unwrap(),
             shared.body_limit,
@@ -1001,23 +1038,46 @@ async fn dispatch(
             Err(BodyErr::Timeout) => return status_text(408, "Request Timeout"),
             Err(BodyErr::Aborted) => return status_text(400, "Bad Request"),
         };
-        decoded = Some(match &encoding {
-            // Cheap: Bytes is refcounted, so this shares the buffer rather than copying.
-            None => raw.clone(),
-            Some(enc) => match crate::compress::decode(enc, &raw, shared.body_limit) {
-                Ok(plain) => plain,
-                Err(crate::compress::DecodeErr::Unsupported) => {
-                    return status_text(415, "Unsupported Media Type")
-                }
-                Err(crate::compress::DecodeErr::TooLarge) => {
-                    return status_text(413, "Payload Too Large")
-                }
-                Err(crate::compress::DecodeErr::Invalid) => {
-                    return status_text(400, "Invalid compressed body")
-                }
-            },
-        });
+        if buffer_for_schema {
+            decoded = Some(match &encoding {
+                // Cheap: Bytes is refcounted, so this shares the buffer rather than copying.
+                None => raw.clone(),
+                Some(enc) => match crate::compress::decode(enc, &raw, shared.body_limit) {
+                    Ok(plain) => plain,
+                    Err(crate::compress::DecodeErr::Unsupported) => {
+                        return status_text(415, "Unsupported Media Type")
+                    }
+                    Err(crate::compress::DecodeErr::TooLarge) => {
+                        return status_text(413, "Payload Too Large")
+                    }
+                    Err(crate::compress::DecodeErr::Invalid) => {
+                        return status_text(400, "Invalid compressed body")
+                    }
+                },
+            });
+        }
         buffered = Some(raw);
+    }
+
+    // QUERY lookup (§18): the key is ready once the body is buffered. A hit here means
+    // this exact body passed validation when the entry was stored, so skipping the
+    // schema check below cannot let an invalid request through.
+    if cacheable && effective_method == "QUERY" {
+        let leaf = cache_leaf.unwrap();
+        let body_hash = buffered.as_ref().map(|b| crate::cache::hash_bytes(b));
+        let key = leaf.key(
+            effective_method,
+            &data.path,
+            data.query_string.as_deref(),
+            &data.headers,
+            body_hash,
+        );
+        if let Some(hit) = leaf.lookup(&key) {
+            shared.metrics.cache_hit();
+            return cached_response(hit, head, &id, &shared.request_id_header, &shared.metrics);
+        }
+        shared.metrics.cache_miss();
+        cache_key = Some(key);
     }
 
     // Structural validation in Rust → 400 without waking JS (§6b). Body: non-multipart only.
@@ -1061,6 +1121,9 @@ async fn dispatch(
     let _abort_guard = AbortGuard(abort.clone());
     let body_io = BodyIo::new(req_rx, Some(resp_tx), mp_rx, abort.clone());
 
+    // What the store step needs after JS returns (§18); `data.path` moves out below.
+    let cache_ctx = cache_key.map(|key| (key, data.path.clone()));
+
     let req = MatchedRequest {
         leaf_id,
         method: data.method,
@@ -1080,7 +1143,13 @@ async fn dispatch(
 
     let response = match shared.tsfn.call_async((req, body_io)).await {
         Ok(promise) => match promise.await {
-            Ok(res) => build_response(res, head, resp_rx, &shared.metrics),
+            Ok(res) => {
+                // Store an eligible response for the next identical request (§18).
+                if let (Some(leaf), Some((key, path))) = (cache_leaf, cache_ctx) {
+                    leaf.maybe_store(key, path, &res, &shared.request_id_header);
+                }
+                build_response(res, head, resp_rx, &shared.metrics)
+            }
             Err(_) => status_text(500, "Internal Server Error"),
         },
         Err(_) => status_text(500, "Internal Server Error"),
@@ -1317,6 +1386,38 @@ fn parse_query(q: Option<&str>) -> Vec<KvPair> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// Replay a cached entry (§18): stored status/headers/body plus the current request-id
+/// and an `x-cache: hit` marker. Honours auto-HEAD the same way `build_response` does.
+fn cached_response(
+    hit: crate::cache::Hit,
+    head: bool,
+    request_id: &str,
+    id_header: &str,
+    metrics: &Arc<Metrics>,
+) -> Response<ResBody> {
+    let mut builder = Response::builder().status(hit.status);
+    for (k, v) in hit.headers {
+        builder = builder.header(k, v);
+    }
+    builder = builder
+        .header(id_header, request_id)
+        .header("x-cache", "hit");
+
+    if head {
+        if let Some(headers) = builder.headers_mut() {
+            if !headers.contains_key("content-length") {
+                if let Ok(v) = hit.body.len().to_string().parse() {
+                    headers.insert("content-length", v);
+                }
+            }
+        }
+        return builder_or_500(builder, empty());
+    }
+
+    metrics.add_response_bytes(hit.body.len() as u64);
+    builder_or_500(builder, Full::new(hit.body).boxed())
 }
 
 fn build_response(

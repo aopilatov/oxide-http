@@ -7,10 +7,10 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 /// Methods with their own counters; everything else falls into `other`.
-const METHODS: [&str; 8] = [
-    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "other",
+const METHODS: [&str; 9] = [
+    "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY", "other",
 ];
-const OTHER_METHOD: usize = 7;
+const OTHER_METHOD: usize = 8;
 
 /// Status classes: 1xx..5xx.
 const CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
@@ -35,6 +35,9 @@ pub struct Metrics {
     /// Body bytes read/written.
     request_bytes: AtomicU64,
     response_bytes: AtomicU64,
+    /// Native response cache (§18): hits answered in Rust / misses that ran JS.
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -54,6 +57,8 @@ impl Metrics {
             connections: AtomicI64::new(0),
             request_bytes: AtomicU64::new(0),
             response_bytes: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
         }
     }
 
@@ -71,6 +76,12 @@ impl Metrics {
     }
     pub fn add_response_bytes(&self, n: u64) {
         self.response_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Request finished: drop in-flight, fold into counters and the histogram.
@@ -157,6 +168,16 @@ impl Metrics {
                 "http_response_body_bytes_total",
                 "Response body bytes written.",
                 self.response_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "http_cache_hits_total",
+                "Native response cache hits (answered without waking JS).",
+                self.cache_hits.load(Ordering::Relaxed),
+            ),
+            (
+                "http_cache_misses_total",
+                "Native response cache misses on cache-enabled routes.",
+                self.cache_misses.load(Ordering::Relaxed),
             ),
         ];
         for (name, help, value) in counters {

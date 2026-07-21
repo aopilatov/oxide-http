@@ -49,6 +49,12 @@ export declare class RustServer {
    */
   inject(method: string, path: string, headers: Array<KvPair>, body?: Buffer | undefined | null): Promise<InjectResponse>
   /**
+   * Purge the native response cache (§18): all routes, or entries whose request path
+   * equals `path` exactly (any query/vary variant). Returns how many entries were
+   * removed. Before `listen()` this is a no-op — there is no cache yet.
+   */
+  purgeCache(path?: string | undefined | null): number
+  /**
    * Set readiness from JS (§11): `app.setReady(false)` removes the pod from the
    * endpoints without touching liveness. The periodic `readinessCheck` pushes its
    * verdict here too. Before `listen()` this is a no-op (there is no state yet).
@@ -68,6 +74,18 @@ export declare class RustServer {
    * event loop) stay alive — the Node process never exits.
    */
   close(): Promise<void>
+}
+
+/** Per-route response cache options (§18; normalized by the wrapper). */
+export interface CacheOptions {
+  /** Entry lifetime in ms. Must be > 0. */
+  ttlMs: number
+  /** Request headers (lowercase) whose values become part of the cache key. */
+  vary?: Array<string>
+  /** Entry cap per route; defaults to 1024. */
+  maxEntries?: number
+  /** Bodies larger than this are not stored; defaults to 1 MiB. */
+  maxBodyBytes?: number
 }
 
 /** CORS options from the JS side (normalized by the wrapper). Absent = CORS off. */
@@ -248,6 +266,8 @@ export interface RouteDef {
   querySchema?: string
   paramsSchema?: string
   multipart?: MultipartOptions
+  /** Native response cache for this route (§18). Absent = not cached. */
+  cache?: CacheOptions
 }
 
 /** TLS certificates (PEM strings; the wrapper resolves path/Buffer). */

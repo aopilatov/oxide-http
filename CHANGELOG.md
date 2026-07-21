@@ -3,6 +3,23 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning follows [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Native response cache** (DESIGN §18): `app.get('/hot', { cache: '5s' }, handler)` —
+  the first response is stored in Rust and identical requests are answered without
+  waking JS until the TTL expires (ELU on a hit-only load: 0.000). Key = method + path +
+  query (+ body hash for `QUERY`) + optional `vary` request headers. Only `200`,
+  non-streamed responses without `Set-Cookie`/`no-store`/`private` are stored;
+  `maxEntries` (1024) and `maxBodyBytes` (1 MiB) bound the memory. Hits carry
+  `x-cache: hit` and keep their own `x-request-id`. `app.purgeCache(path?)` invalidates;
+  `/metrics` gains `http_cache_hits_total`/`http_cache_misses_total`.
+- **The HTTP `QUERY` method** (draft-ietf-httpbis-safe-method-w-body): `app.query(path,
+  ...)`. The body works exactly like a POST body (streaming, native schema validation,
+  limits); `405`/`Allow`, auto-`OPTIONS` and the CORS defaults advertise it; the cache
+  treats it as safe with the body folded into the key.
+
 ## [0.2.0] — 2026-07-20
 
 A security and correctness pass over the whole codebase ([FIXES.md](FIXES.md) tracks the
