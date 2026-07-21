@@ -1,6 +1,6 @@
 {
   "name": "@oxide-ts/http",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Fast HTTP/1.1 + HTTP/2 server for Node.js built on Rust (napi-rs)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -24,7 +24,7 @@
     "build": "napi build --platform",
     "build:release": "napi build --platform --release",
     "artifacts": "napi artifacts",
-    "prepublishOnly": "tsc && napi prepublish -t npm",
+    "prepublishOnly": "tsc",
     "format": "cargo fmt",
     "lint": "cargo clippy -- -D warnings && npm run typecheck",
     "test": "node --test \"__test__/**/*.test.ts\"",
@@ -41,6 +41,7 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "*.node",
     "dist/",
     "README.md",
     "CHANGELOG.md"

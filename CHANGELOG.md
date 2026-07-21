@@ -3,6 +3,19 @@
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning follows [SemVer](https://semver.org/).
 
+## [0.3.1] — 2026-07-21
+
+### Changed
+
+- **Self-contained package: every prebuilt binary now ships inside `@oxide-ts/http`
+  itself.** The per-platform packages (`@oxide-ts/http-darwin-arm64` and friends) and
+  `optionalDependencies` are gone from the install flow — the generated loader picks the
+  bundled binary for the current platform. This removes the whole class of
+  lockfile/optional-deps drift issues (broken `npm ci` with `--no-optional`, stripped
+  optional deps in CI images) at the cost of a larger download: the tarball now carries
+  all six targets (~7 MB each before compression). The `0.3.x` platform packages remain
+  on the registry for older versions but are no longer referenced.
+
 ## [0.3.0] — 2026-07-21
 
 ### Performance

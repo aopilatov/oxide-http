@@ -3,7 +3,7 @@
 # build   — a .node per platform, uploaded as an artifact;
 # test    — JS tests on every LTS Node against the built binary;
 # images  — installation into clean images (Ubuntu/UBI/Alpine) without a Rust toolchain;
-# publish — platform packages and the npm release on a git tag.
+# publish — the self-contained npm release (all binaries bundled) on a git tag.
 name: CI
 
 on:
@@ -207,12 +207,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { path: artifacts }
 
-      - name: Distribute binaries into the platform packages
+      # Fat package (since 0.3.1): every prebuilt binary ships inside the root package
+      # and the generated index.js picks the local one — no optionalDependencies, no
+      # per-platform packages, no lockfile drift between them.
+      - name: Collect binaries into the package root
         run: |
           find artifacts -name '*.node' -exec mv {} . \;
           ls -la *.node
-          npx napi create-npm-dirs
-          npx napi artifacts
+          COUNT=$(ls *.node | wc -l)
+          test "$COUNT" -eq 6 || { echo "::error::expected 6 binaries, got $COUNT"; exit 1; }
 
       - name: Build TypeScript
         run: npm run build:ts
@@ -227,16 +230,6 @@ jobs:
 
       - name: Smoke test before publishing
         run: node scripts/smoke.cjs
-
-      - name: Publish the platform packages
-        run: |
-          # Every platform package is published separately; the root package pulls them
-          # via optionalDependencies, so they must reach the registry first.
-          for dir in npm/*/; do
-            npm publish "$dir" --access public --provenance
-          done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish the root package
         run: npm publish --access public --provenance
