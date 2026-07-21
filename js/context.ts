@@ -34,6 +34,8 @@ export interface BodyIo {
 
 /** A matched request received from Rust. */
 export interface NativeRequest {
+  /** Ticket for `takeBody`/`respond` on the native bridge (§19). */
+  reqId: number;
   leafId: number;
   method: string;
   path: string;
@@ -504,12 +506,36 @@ class ReqLogger implements Logger {
 const CT_JSON = 'application/json; charset=utf-8';
 const CT_TEXT = 'text/plain; charset=utf-8';
 
+/** A `BodyIo` or a thunk fetching it from the native registry (§19). */
+export type BodyIoSource = BodyIo | (() => BodyIo | null);
+
+/** Lazily resolved `BodyIo`, shared between `c` and `c.req` so the native `takeBody`
+ *  runs at most once. A bodyless request that never touches the body pays nothing. */
+class BodyRef {
+  #src: BodyIoSource;
+  #io: BodyIo | undefined;
+
+  constructor(src: BodyIoSource) {
+    this.#src = src;
+  }
+
+  get(): BodyIo {
+    if (this.#io === undefined) {
+      const io = typeof this.#src === 'function' ? this.#src() : this.#src;
+      // Only reachable after respond() already completed the request — a wrapper bug.
+      if (io == null) throw new Error('request body is no longer available');
+      this.#io = io;
+    }
+    return this.#io;
+  }
+}
+
 /** The request side of `c`: methods live on the prototype, per-request state in fields.
  *  Derived views (header map, query records, cookies, valid values) are built on first
  *  access — a handler that never touches them pays nothing (§17). */
 class OxideRequest implements ContextRequest {
   readonly #nreq: NativeRequest;
-  readonly #bodyIo: BodyIo;
+  readonly #body: BodyRef;
   readonly #baseUrl: string;
   readonly #bodyLimit: number | undefined;
   #path: string | undefined;
@@ -522,14 +548,9 @@ class OxideRequest implements ContextRequest {
   #rustValid: Record<ValidLocation, unknown> | undefined;
   #valid: Record<string, unknown> | undefined;
 
-  constructor(
-    nreq: NativeRequest,
-    bodyIo: BodyIo,
-    baseUrl: string,
-    bodyLimit: number | undefined,
-  ) {
+  constructor(nreq: NativeRequest, body: BodyRef, baseUrl: string, bodyLimit: number | undefined) {
     this.#nreq = nreq;
-    this.#bodyIo = bodyIo;
+    this.#body = body;
     this.#baseUrl = baseUrl;
     this.#bodyLimit = bodyLimit;
   }
@@ -616,11 +637,11 @@ class OxideRequest implements ContextRequest {
   }
   get stream(): ReadableStream<Uint8Array> {
     this.#useBody();
-    return makeReqStream(this.#bodyIo);
+    return makeReqStream(this.#body.get());
   }
   async arrayBuffer(): Promise<ArrayBuffer> {
     this.#useBody();
-    const raw = await collectRaw(this.#bodyIo, this.#bodyLimit);
+    const raw = await collectRaw(this.#body.get(), this.#bodyLimit);
     // Uniform: the channel always carries what the client sent, schema or not.
     const buf = decompress(raw, this.header('content-encoding'), this.#bodyLimit);
     return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
@@ -643,14 +664,14 @@ class OxideRequest implements ContextRequest {
   // multipart: streaming iterator over parts (§9a)
   parts(): AsyncGenerator<MultipartPart, void, void> {
     this.#useBody();
-    return partsIterator(this.#bodyIo);
+    return partsIterator(this.#body.get());
   }
   async formData(): Promise<FormData> {
     const ct = this.header('content-type') ?? '';
     const fd = new FormData();
     if (ct.startsWith('multipart/form-data')) {
       this.#useBody();
-      for await (const part of partsIterator(this.#bodyIo)) {
+      for await (const part of partsIterator(this.#body.get())) {
         if (part.filename != null) {
           const buf = Buffer.from(await part.arrayBuffer());
           const opts = part.contentType ? { type: part.contentType } : {};
@@ -710,19 +731,26 @@ class OxideContext implements Context {
   aborted = false; // true on disconnect/timeout
   error: unknown = undefined; // the last error (for onError and the "after" hooks)
   _responseStrip: ResponseStrip | null;
-  _bodyIo: BodyIo;
   _body: string | undefined = undefined;
   _stream: BodySource | undefined = undefined;
   _finalized = false;
   _settled = false; // the response is already fixed → mutators are ignored
+  readonly #bodyRef: BodyRef;
   #store: Map<string, unknown> | undefined;
   #log: Logger | undefined;
 
-  constructor(nreq: NativeRequest, bodyIo: BodyIo, opts: BuildContextOptions) {
-    this.req = new OxideRequest(nreq, bodyIo, opts.baseUrl ?? '', opts.bodyLimit);
+  constructor(nreq: NativeRequest, body: BodyIoSource, opts: BuildContextOptions) {
+    const bodyRef = new BodyRef(body);
+    this.req = new OxideRequest(nreq, bodyRef, opts.baseUrl ?? '', opts.bodyLimit);
     this.res = new OxideResponse(opts.requestIdHeader ?? 'x-request-id', nreq.id);
     this._responseStrip = opts.responseStrip ?? null;
-    this._bodyIo = bodyIo;
+    this.#bodyRef = bodyRef;
+  }
+
+  /** Resolved on first use (§19): a request that never touches the body skips the
+   *  native takeBody call entirely. */
+  get _bodyIo(): BodyIo {
+    return this.#bodyRef.get();
   }
 
   get log(): Logger {
@@ -795,10 +823,11 @@ class OxideContext implements Context {
   }
 }
 
-/** Build the context `c` from a native request. */
+/** Build the context `c` from a native request. `bodyIo` may be a thunk fetching the
+ *  native BodyIo lazily (§19) — it is resolved at most once, on first body use. */
 export function buildContext(
   nreq: NativeRequest,
-  bodyIo: BodyIo,
+  bodyIo: BodyIoSource,
   opts: BuildContextOptions = {},
 ): Context {
   return new OxideContext(nreq, bodyIo, opts);

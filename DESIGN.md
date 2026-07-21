@@ -582,3 +582,35 @@ Semantics (deliberately conservative):
 behaves like a safe POST: the body streams/validates/limits exactly like a POST body,
 `405`/`Allow` and auto-`OPTIONS` advertise it, CORS default methods include it, and the
 cache treats it as safe with the body folded into the key.
+
+## 19. The batched bridge
+
+The original bridge crossed the boundary once per request: a TSFN call carrying
+`(MatchedRequest, BodyIo)`, a `Promise<JsResponse>` awaited from Rust. Profiling (§17,
+BENCHMARKS.md) showed that with the wrapper already near-free, this per-request
+machinery was most of the remaining main-thread cost — and it is not intrinsic.
+
+The batched shape:
+
+- **Queue + doorbell.** Ready requests go into a queue inside `Bridge`; a payload-free
+  TSFN (the doorbell) fires only on the empty → non-empty transition. The JS dispatcher
+  drains with `takeBatch()` in a loop until empty — requests that arrive mid-drain ride
+  along without another wakeup. Adaptive by construction: batch size is 1 under light
+  load (no added latency, no flush timer), and grows exactly when there is something to
+  amortize.
+- **Synchronous `respond(reqId, res)`.** The handler's result crosses the boundary as a
+  plain native call; Rust completes the request through a per-request `oneshot`. No
+  `Promise` is ever awaited across threads. `respond` is idempotent (double calls and
+  unknown ids are no-ops), which also serves as the dispatcher's last-resort 500 guard.
+- **Lazy `BodyIo` via `takeBody(reqId)`.** The napi class is built only when a handler
+  actually touches the body/stream/abort — a bodyless GET pays nothing. The parts move
+  out of the registry at most once; `respond` cleans the entry up.
+- **Shutdown:** `close()` takes the server state immediately, but the bridge stays
+  reachable until the drain deadline — in-flight responses must keep flowing while
+  connections finish (the `active` handle in `RustServer`).
+
+Result (§17): the `bridge`/`ctx`/`full` profile layers are indistinguishable from the
+native path on the client-bound harness, and a JS-handler route reaches `node:http`
+parity (~13.6 µs main-thread per request versus ~14). The low-level `RustServer` API
+changed accordingly (`listen` takes a doorbell; `takeBatch`/`takeBody`/`respond` are
+new) — the public `Server` API is untouched.

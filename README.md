@@ -20,15 +20,16 @@ await app.listen({ port: 3000 });
 
 Let's start with what usually goes unmentioned.
 
-**On routes that end up in a JS handler this library is slower than the built-in
-`node:http`** — roughly 40k versus 69k RPS in our measurements. The reason is
-architectural: every such request crosses the napi boundary (a ThreadsafeFunction call
-plus a `Promise` across the boundary), and that crossing alone costs ~17 µs of main-thread
-time, while `node:http` handles an entire request in ~14.5 µs. Optimizing the JS wrapper
-will not close that gap — the floor is known and measured.
+**On routes that end up in a JS handler this library is at parity with the built-in
+`node:http`** — 69.9k versus 69.0k RPS on our client-bound harness, with slightly less
+main-thread time per request (~13.6 µs versus ~14). It took work to get here: the
+context lives on prototypes with lazy allocations, and the napi boundary is batched —
+one wakeup drains every queued request, responses return through a synchronous native
+call, no `Promise` ever crosses the boundary (DESIGN §19). Earlier versions were 15–40%
+slower on JS routes; the history is in [BENCHMARKS.md](BENCHMARKS.md).
 
 **The win is where JS never wakes at all.** Everything below is answered from Rust without
-taking a single microsecond from the event loop (ELU = 0.000 versus 1.0 on JS routes):
+taking a single microsecond from the event loop (ELU = 0.000 versus ~0.95 on JS routes):
 
 | What | Effect |
 |---|---|
@@ -38,8 +39,9 @@ taking a single microsecond from the event loop (ELU = 0.000 versus 1.0 on JS ro
 | `413` (body limit), `415` (type), `431` (headers), `408` (read timeout) | cut off at the edge |
 | `503` on overload + `Retry-After` | before a slot is taken |
 | `/healthz`, `/readyz`, `/metrics` | answer under load and during drain |
+| Response cache hits (`cache: '5s'`) | served from Rust at native speed |
 
-So the point is not "faster than Node" but that **junk and housekeeping traffic never
+So the point is not raw RPS parity but that **junk and housekeeping traffic never
 reaches your event loop**, while production plumbing (graceful shutdown, backpressure,
 metrics, limits) comes built in and runs outside JS.
 

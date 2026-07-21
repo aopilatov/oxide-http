@@ -5,6 +5,19 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+
+- **Batched bridge (DESIGN §19): JS-handler routes reach `node:http` parity.** One
+  doorbell wakeup now drains the whole request queue (`takeBatch`), responses leave
+  through a synchronous `respond(reqId)` instead of a `Promise` awaited across the
+  boundary, and `BodyIo` is created lazily only when a handler touches the body. On the
+  reference benchmark the JS route went 60.7k → 69.9k RPS (`node:http`: 69.0k) and every
+  bridge profile layer is now inside the native path's noise band. Main-thread cost per
+  JS request: ~16.3 µs → ~13.6 µs.
+- **Breaking (low-level only):** the raw `RustServer` API changed — `listen` takes a
+  payload-free doorbell callback; `takeBatch`/`takeBody`/`respond` are new;
+  `MatchedRequest` gained `reqId`. The public `Server` API is unchanged.
+
 ### Added
 
 - **Native response cache** (DESIGN §18): `app.get('/hot', { cache: '5s' }, handler)` —

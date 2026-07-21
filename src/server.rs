@@ -26,7 +26,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{watch, Notify};
 use tokio_rustls::TlsAcceptor;
 
-use crate::bridge::{Handler, JsResponse, KvPair, MatchedRequest};
+use crate::bridge::{Bridge, JsResponse, KvPair, MatchedRequest};
 use crate::cors::Cors;
 use crate::health::{HealthPaths, Readiness};
 use crate::idle::{watch_idle, Activity, ActivityIo};
@@ -35,7 +35,7 @@ use crate::metrics::Metrics;
 use crate::overload::{Limiter, Slot};
 use crate::proxy_protocol;
 use crate::router::Routes;
-use crate::stream::{AbortSignal, BodyIo, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
+use crate::stream::{AbortSignal, BodyMsg, ChannelBody, BODY_CHANNEL_CAP};
 
 /// Protocol/security parameters (TLS, h2, read timeouts) — §12, §6c A1/A2.
 pub struct Tuning {
@@ -87,7 +87,7 @@ type ResBody = BoxBody<Bytes, Infallible>;
 
 /// Shared state common to all connections.
 pub struct Shared {
-    pub tsfn: Handler,
+    pub bridge: Bridge,
     pub routes: Routes,
     pub has_not_found: bool,
     pub custom_ip_headers: Vec<String>,
@@ -1119,12 +1119,13 @@ async fn dispatch(
     // drop from now on means hyper gave up on the connection.
     let abort = Arc::new(AbortSignal::new());
     let _abort_guard = AbortGuard(abort.clone());
-    let body_io = BodyIo::new(req_rx, Some(resp_tx), mp_rx, abort.clone());
 
     // What the store step needs after JS returns (§18); `data.path` moves out below.
     let cache_ctx = cache_key.map(|key| (key, data.path.clone()));
 
+    let req_id = shared.bridge.next_req_id();
     let req = MatchedRequest {
+        req_id,
         leaf_id,
         method: data.method,
         path: data.path,
@@ -1141,17 +1142,31 @@ async fn dispatch(
         valid_params: validated.params,
     };
 
-    let response = match shared.tsfn.call_async((req, body_io)).await {
-        Ok(promise) => match promise.await {
-            Ok(res) => {
-                // Store an eligible response for the next identical request (§18).
-                if let (Some(leaf), Some((key, path))) = (cache_leaf, cache_ctx) {
-                    leaf.maybe_store(key, path, &res, &shared.request_id_header);
-                }
-                build_response(res, head, resp_rx, &shared.metrics)
-            }
-            Err(_) => status_text(500, "Internal Server Error"),
+    // Into the batch queue (§19): the doorbell wakes JS only when the queue was empty;
+    // the JS dispatcher finishes us via respond(req_id) → the oneshot below.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<JsResponse>();
+    shared.bridge.enqueue(
+        req,
+        crate::bridge::Pending {
+            body: Some(crate::bridge::BodyParts {
+                req_rx,
+                resp_tx: Some(resp_tx),
+                mp_rx,
+                abort: abort.clone(),
+            }),
+            done: done_tx,
         },
+    );
+
+    let response = match done_rx.await {
+        Ok(res) => {
+            // Store an eligible response for the next identical request (§18).
+            if let (Some(leaf), Some((key, path))) = (cache_leaf, cache_ctx) {
+                leaf.maybe_store(key, path, &res, &shared.request_id_header);
+            }
+            build_response(res, head, resp_rx, &shared.metrics)
+        }
+        // The sender vanished (server closing / dispatcher died) — never hang the request.
         Err(_) => status_text(500, "Internal Server Error"),
     };
     // Reached only if the future was never dropped, i.e. the request really finished.

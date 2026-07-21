@@ -37,25 +37,33 @@ h2load -n 200000 -c 64 -m 32 https://<host>:<port>/json   # HTTP/2
 ## Results
 
 Hardware: Apple M-series, 16 cores, macOS (darwin-arm64), Node v24.16.0.
-Run: `--duration=8 --connections=64`, after the prototype-context rewrite (see below).
+Run: `--duration=8 --connections=64`, after the batched bridge (§19; see the history
+below).
 
 | Server | RPS | p50 | p99 |
 |---|---:|---:|---:|
-| `node:http` | 71,622 | 0.87 ms | 1.74 ms |
-| `@oxide-ts/http`, native endpoint (no JS) | 76,192 | 0.79 ms | 1.71 ms |
-| `@oxide-ts/http`, JS handler | 60,657 | 0.88 ms | 3.2 ms |
+| `node:http` | 68,987 | 0.89 ms | 1.78 ms |
+| `@oxide-ts/http`, native endpoint (no JS) | 69,227 | 0.89 ms | 1.76 ms |
+| `@oxide-ts/http`, JS handler | 69,920 | 0.86 ms | 1.82 ms |
 
 The same run with `--connections=192`:
 
 | Server | RPS | p50 | p99 |
 |---|---:|---:|---:|
-| `node:http` | 67,245 | 2.83 ms | 3.27 ms |
-| `@oxide-ts/http`, native endpoint | 69,413 | 2.74 ms | 3.25 ms |
-| `@oxide-ts/http`, JS handler | 59,974 | 2.85 ms | 16.29 ms |
+| `node:http` | 66,103 | 2.90 ms | 3.35 ms |
+| `@oxide-ts/http`, native endpoint | 65,301 | 2.93 ms | 3.44 ms |
+| `@oxide-ts/http`, JS handler | 68,458 | 2.75 ms | 3.44 ms |
 
-Before the rewrite the JS-handler row was 39,896 RPS (p50 1.40 ms, p99 4.14 ms) at 64
-connections — the wrapper rework bought **+52%** on JS routes and closed the gap to
-`node:http` from −42% to −15%.
+History of the JS-handler row at 64 connections:
+
+| Stage | RPS | vs `node:http` |
+|---|---:|---:|
+| per-request TSFN + `Promise`, closure-based context | 39,896 | −42% |
+| prototype context, lazy allocations (0.2.0) | 60,657 | −15% |
+| batched bridge + synchronous `respond` (§19) | 69,920 | **at parity / slightly ahead** |
+
+All three servers now sit at the load generator's ceiling, and the JS-handler p99 tail
+that batching used to trade away is gone (1.82 ms versus `node:http`'s 1.78 ms).
 
 `fastify` and `hono` were not part of this run — they are not installed in the measurement
 environment.
@@ -67,18 +75,19 @@ environment.
 192 (they even dip slightly). That is saturated-client behaviour. The real ceiling of the
 Rust path is not visible here — an external generator is needed.
 
-**2. The dominant cost is crossing into JS.** After the prototype-context rewrite the
-difference between the native endpoint and a JS handler on the same server is
-76.2k → 60.7k RPS, i.e. **≈3.4 µs per request** (16.5 µs versus 13.1 µs) — down from
-≈10.6 µs before it. What remains is essentially the TSFN call and the `Promise` across
-the boundary; the wrapper itself is now nearly free (see the profile below).
+**2. The boundary cost has been engineered away in two steps.** The prototype-context
+rewrite removed the wrapper's own ~6.5 µs; the batched bridge (§19) then removed the
+per-request TSFN call and the `Promise` across the boundary. After both, the `bridge`,
+`ctx` and `full` layers are indistinguishable from `native` on this harness (±0.3 µs,
+inside noise) — the boundary no longer has a measurable per-request price at this load.
 
-**3. JS-handler routes still do not beat `node:http`, and will not.** With a JS handler
-`@oxide-ts/http` reaches 60.7k versus 71.6k for `node:http` (−15%; before the rewrite it
-was −42%). The remaining gap is the boundary round trip itself — the floor measured by
-the `bridge` layer (~16.9 µs) sits above `node:http`'s entire request (~14 µs). The win
-exists where JS never wakes at all: routing, `404`/`405`, CORS preflight, a schema
-rejection, probes, `413`/`415` — all answered from Rust at native-endpoint speed.
+**3. JS-handler routes now match `node:http`.** 69.9k versus 69.0k at 64 connections,
+68.5k versus 66.1k at 192 — parity to slightly ahead, where before batching the gap was
+−15% and originally −42%. Main-thread cost per JS request dropped from ~16.3 µs to
+~13.6 µs (ELU 0.955 at 70k RPS), which puts the single-thread JS ceiling at ~73k on this
+hardware — the load generator saturates first. And this parity is only the *worst case*:
+routing, `404`/`405`, CORS preflight, schema rejection, probes, `413`/`415` and cache
+hits (§18) never wake JS at all and scale on the tokio side.
 
 ## Profiling the boundary crossing
 
@@ -113,6 +122,24 @@ request and calls the standalone `buildContext`, while the public server passes
 per-leaf options precompiled at `listen()` — the anomaly measures the harness, not the
 library.
 
+After the batched bridge (§19: one doorbell wakeup drains the whole queue via
+`takeBatch()`, responses leave through a synchronous `respond()` — no per-request TSFN
+call, no `Promise` across the boundary, `BodyIo` created lazily only when a handler
+touches the body):
+
+| Layer | RPS | µs/request | Δ vs `native` |
+|---|---:|---:|---:|
+| `native` | 68,705–69,420 | ~14.5 | — |
+| `bridge` | 70,740–71,126 | ~14.1 | ≈0 |
+| `ctx` | 70,196–70,406 | ~14.2 | ≈0 |
+| `full` | 69,926–70,422 | ~14.2 | ≈0 |
+
+Every JS layer is now **inside the noise band of the native path**: the boundary is no
+longer measurable on this client-bound harness. Under this load the batches are small
+(the 64-connection client waits synchronously), so the gain comes from removing the
+promise machinery and the per-call TSFN overhead; under harder concurrency the batches
+grow and the amortization only improves.
+
 ### What this means
 
 **1. Any route with a JS handler is bound by a single thread.** As soon as JS is involved,
@@ -136,16 +163,14 @@ view lazy (header map, query records, cookies, logger, store, `ResHeaders`,
 `AbortController`), precompiled per-leaf context options at `listen()` and skips the
 onion for routes without middleware — after which the whole wrapper costs **~0.6 µs**.
 
-**4. Strategic conclusion: optimizing the wrapper will not make JS routes faster than
-`node:http`.** The round trip across the boundary alone is 17.4 µs of main-thread time, and
-that is the floor. `node:http` handles an entire request in ~14.5 µs. Even a zero-cost
-wrapper would leave us slower on JS routes.
-
-The architecture wins where JS never wakes: routing, `404`/`405`, `Allow`, CORS preflight,
-schema rejection, probes, `413`/`415`/`431`, limits and timeouts. On a route that ends up in
-a JS handler anyway there is no speed advantage and there will not be one — the advantages
-there are different (validation and limits before the event loop wakes, backpressure,
-graceful shutdown, metrics without JS).
+**4. Strategic conclusion (updated after §19): the 17.4 µs "floor" was not a floor.**
+It was the price of the per-request TSFN + `Promise` shape of the bridge, and replacing
+that shape with a batched queue + synchronous `respond` removed it. JS routes now sit at
+parity with `node:http` on this harness while spending *less* main-thread time per
+request (~13.6 µs versus `node:http`'s ~14). The architecture's compounding advantages
+remain where JS never wakes: routing, `404`/`405`, `Allow`, CORS preflight, schema
+rejection, probes, `413`/`415`/`431`, limits, timeouts and cache hits (§18) — all served
+on the tokio side while the main thread stays free for the handlers that need it.
 
 ## What to measure and fix next
 

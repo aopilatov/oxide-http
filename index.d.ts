@@ -38,7 +38,7 @@ export declare class RustServer {
    * Routing/`404`/`405`/auto-`OPTIONS` happen in Rust; hitting a leaf calls
    * `dispatch(req) => Promise<res>`. Non-blocking (the accept loop runs in background).
    */
-  listen(port: number, host: string, routes: Array<RouteDef>, hasNotFound: boolean, options: ListenOptions, dispatch: (arg: [MatchedRequest, BodyIo]) => Promise<JsResponse>): void
+  listen(port: number, host: string, routes: Array<RouteDef>, hasNotFound: boolean, options: ListenOptions, dispatch: () => void): void
   /**
    * Run a request through the pipeline without a socket (§17, `app.inject`).
    *
@@ -48,6 +48,21 @@ export declare class RustServer {
    * request itself never travels over a socket.
    */
   inject(method: string, path: string, headers: Array<KvPair>, body?: Buffer | undefined | null): Promise<InjectResponse>
+  /**
+   * Everything queued for the JS dispatcher right now (§19). Called from the
+   * doorbell callback in a loop until it returns an empty array.
+   */
+  takeBatch(): Array<MatchedRequest>
+  /**
+   * The `BodyIo` of one request (§19) — at most once per request; `null` afterwards
+   * or for an unknown id. Lazy on purpose: a bodyless GET never pays for the class.
+   */
+  takeBody(reqId: number): BodyIo | null
+  /**
+   * Complete a request (§19): the response crosses the boundary through this
+   * synchronous call — no `Promise` is awaited across threads. Idempotent.
+   */
+  respond(reqId: number, res: JsResponse): void
   /**
    * Purge the native response cache (§18): all routes, or entries whose request path
    * equals `path` exactly (any query/vary variant). Returns how many entries were
@@ -113,7 +128,7 @@ export interface InjectResponse {
 }
 
 /**
- * The response a JS handler returns (inside a `Promise`).
+ * The response a JS handler passes to `respond()`.
  *
  * `headers` — ordered pairs, duplicates allowed (multiple `set-cookie`).
  * `streamed = true` → the body flows through `BodyIo::write` (a channel-backed
@@ -210,13 +225,15 @@ export interface ListenOptions {
 }
 
 /**
- * A matched request handed to the JS dispatcher (one boundary crossing per request).
+ * A matched request handed to the JS dispatcher inside a batch (§19).
  *
+ * `req_id` — the ticket for `takeBody`/`respond`.
  * `leaf_id` — index of the route leaf in the JS handler registry; `-1` = notFound.
  * `path` — full path (including baseUrl); the wrapper strips the prefix for `c.req.path`.
  * `ip`/`ips`/`country`/`id` are computed in Rust (§7, §6d B2).
  */
 export interface MatchedRequest {
+  reqId: number
   leafId: number
   method: string
   path: string

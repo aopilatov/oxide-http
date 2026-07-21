@@ -17,12 +17,10 @@ import type {
 
 import { buildContext, buildNativeResponse, HttpError } from './context.ts';
 import type {
-  BodyIo,
   BuildContextOptions,
   Context,
   KvPair,
   NativeRequest,
-  NativeResponse,
   ResponseStrip,
   RouteSchema,
 } from './context.ts';
@@ -740,8 +738,9 @@ export class Server {
         table,
         this.#notFound != null,
         this.#options,
-        // napi passes the (MatchedRequest, BodyIo) tuple as a single array argument.
-        ([req, bodyIo]: [NativeRequest, BodyIo]) => this.#dispatch(req, bodyIo),
+        // The doorbell (§19): one wakeup per empty→non-empty queue transition; the
+        // batch itself is pulled synchronously in #drainBatch.
+        () => this.#drainBatch(),
       );
     } catch (err) {
       // Bind fails synchronously (EADDRINUSE and friends) — we surface it both as an
@@ -933,15 +932,46 @@ export class Server {
     unregisterFromSignals(this);
   }
 
-  async #dispatch(nreq: NativeRequest, bodyIo: BodyIo): Promise<NativeResponse> {
+  /** Drain the native batch queue (§19): one doorbell wakeup serves everything queued
+   *  since the previous drain; requests arriving mid-drain ride along without another
+   *  wakeup. #dispatch never rejects, so `void` is safe here. */
+  #drainBatch(): void {
+    for (;;) {
+      const batch = this.#native.takeBatch();
+      if (batch.length === 0) break;
+      for (const req of batch) void this.#dispatch(req);
+    }
+  }
+
+  async #dispatch(nreq: NativeRequest): Promise<void> {
+    try {
+      await this.#handleRequest(nreq);
+    } catch {
+      // Last-resort guard: respond() is idempotent, so if a response already went out
+      // this is a no-op; otherwise the request must not hang.
+      this.#native.respond(nreq.reqId, {
+        status: 500,
+        headers: [],
+        body: 'Internal Server Error',
+      });
+    }
+  }
+
+  async #handleRequest(nreq: NativeRequest): Promise<void> {
     const chain = nreq.leafId < 0 ? this.#notFoundChain : this.#chains[nreq.leafId];
     if (!chain) {
       // Unreachable: the route table and the chains are built from the same array.
-      return { status: 500, headers: [], body: 'Internal Server Error' };
+      this.#native.respond(nreq.reqId, {
+        status: 500,
+        headers: [],
+        body: 'Internal Server Error',
+      });
+      return;
     }
     const c = buildContext(
       nreq,
-      bodyIo,
+      // Lazy (§19): BodyIo is fetched from the native registry on first body use.
+      () => this.#native.takeBody(nreq.reqId),
       nreq.leafId < 0 ? this.#ctxOptsBase : (this.#ctxOpts[nreq.leafId] ?? this.#ctxOptsBase),
     );
 
@@ -955,7 +985,7 @@ export class Server {
     if (chain.onAbort.length > 0 || this.#detectDisconnect) {
       const ctrl = (controller = new AbortController());
       c.req.signal = ctrl.signal;
-      void bodyIo.waitAbort().then(
+      void c._bodyIo.waitAbort().then(
         async (aborted) => {
           if (!aborted || c._settled) return;
           c.aborted = true;
@@ -994,7 +1024,9 @@ export class Server {
       }
     }
 
-    const response = buildNativeResponse(c);
+    // The response leaves through the synchronous native call (§19) — before
+    // onResponse: the hook is observation-only, the client should not wait for it.
+    this.#native.respond(nreq.reqId, buildNativeResponse(c));
 
     // onResponse is observation only and always runs; its errors are swallowed.
     if (chain.onResponse.length > 0) {
@@ -1004,7 +1036,6 @@ export class Server {
         // onResponse must not break the response
       }
     }
-    return response;
   }
 }
 

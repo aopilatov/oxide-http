@@ -44,17 +44,25 @@ const variants = {
     await app.listen({ port, host: '127.0.0.1' });
   },
 
-  // The boundary is there but the wrapper is not: the callback returns a ready response.
+  // The boundary is there but the wrapper is not: the doorbell drains the batch and
+  // responds with a ready constant (§19).
   async bridge() {
     const native = new RustServer();
     alive.push(native);
+    const RESPONSE = { status: 200, headers: JSON_HEADERS, body: BODY };
     native.listen(
       port,
       '127.0.0.1',
       [{ method: 'GET', path: '/json', leafId: 0 }],
       false,
       baseOptions,
-      () => Promise.resolve({ status: 200, headers: JSON_HEADERS, body: BODY }),
+      () => {
+        for (;;) {
+          const batch = native.takeBatch();
+          if (batch.length === 0) break;
+          for (const req of batch) native.respond(req.reqId, RESPONSE);
+        }
+      },
     );
   },
 
@@ -63,20 +71,27 @@ const variants = {
   async touch() {
     const native = new RustServer();
     alive.push(native);
+    const RESPONSE = { status: 200, headers: JSON_HEADERS, body: BODY };
     native.listen(
       port,
       '127.0.0.1',
       [{ method: 'GET', path: '/json', leafId: 0 }],
       false,
       baseOptions,
-      ([req]) => {
-        let sink = 0;
-        for (const { key, value } of req.headers) sink += key.length + value.length;
-        for (const { key, value } of req.query) sink += key.length + value.length;
-        sink += req.method.length + req.path.length + req.ip.length + req.id.length;
-        sink += req.ips.length + (req.country ? 1 : 0) + (req.validBody ? 1 : 0);
-        if (sink < 0) throw new Error('unreachable');
-        return Promise.resolve({ status: 200, headers: JSON_HEADERS, body: BODY });
+      () => {
+        for (;;) {
+          const batch = native.takeBatch();
+          if (batch.length === 0) break;
+          for (const req of batch) {
+            let sink = 0;
+            for (const { key, value } of req.headers) sink += key.length + value.length;
+            for (const { key, value } of req.query) sink += key.length + value.length;
+            sink += req.method.length + req.path.length + req.ip.length + req.id.length;
+            sink += req.ips.length + (req.country ? 1 : 0) + (req.validBody ? 1 : 0);
+            if (sink < 0) throw new Error('unreachable');
+            native.respond(req.reqId, RESPONSE);
+          }
+        }
       },
     );
   },
@@ -85,21 +100,28 @@ const variants = {
   async ctx() {
     const native = new RustServer();
     alive.push(native);
+    const ctxOpts = {
+      baseUrl: '',
+      requestIdHeader: 'x-request-id',
+      bodyLimit: 10 * 1024 * 1024,
+      responseStrip: null,
+    };
     native.listen(
       port,
       '127.0.0.1',
       [{ method: 'GET', path: '/json', leafId: 0 }],
       false,
       baseOptions,
-      ([req, bodyIo]) => {
-        const c = buildContext(req, bodyIo, {
-          baseUrl: '',
-          requestIdHeader: 'x-request-id',
-          bodyLimit: 10 * 1024 * 1024,
-          responseStrip: null,
-        });
-        c.json(PAYLOAD);
-        return Promise.resolve(buildNativeResponse(c));
+      () => {
+        for (;;) {
+          const batch = native.takeBatch();
+          if (batch.length === 0) break;
+          for (const req of batch) {
+            const c = buildContext(req, () => native.takeBody(req.reqId), ctxOpts);
+            c.json(PAYLOAD);
+            native.respond(req.reqId, buildNativeResponse(c));
+          }
+        }
       },
     );
   },

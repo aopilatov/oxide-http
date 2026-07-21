@@ -25,7 +25,7 @@ mod tls;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use napi::bindgen_prelude::{Function, Promise};
+use napi::bindgen_prelude::Function;
 use napi::Result;
 use napi_derive::napi;
 use tokio::runtime::Runtime;
@@ -33,7 +33,7 @@ use tokio::sync::{watch, Notify};
 
 use bytes::Bytes;
 
-use crate::bridge::{Handler, JsResponse, MatchedRequest};
+use crate::bridge::{Bridge, Doorbell, JsResponse, MatchedRequest};
 use crate::cors::{Cors, CorsOptions as RCorsOptions};
 use crate::listener::Bound;
 use crate::router::{RouteDef as RRouteDef, Routes};
@@ -247,6 +247,10 @@ struct Running {
 #[napi]
 pub struct RustServer {
     state: Mutex<Option<Running>>,
+    /// The live `Shared` for the bridge/cache methods. Present from `listen()` until
+    /// the drain in `close()` finishes — `close()` takes `state` immediately, but
+    /// `respond()` must keep delivering in-flight responses while the drain runs.
+    active: Mutex<Option<Arc<Shared>>>,
 }
 
 #[napi]
@@ -256,6 +260,7 @@ impl RustServer {
     pub fn new() -> Self {
         RustServer {
             state: Mutex::new(None),
+            active: Mutex::new(None),
         }
     }
 
@@ -271,7 +276,7 @@ impl RustServer {
         routes: Vec<RouteDef>,
         has_not_found: bool,
         options: ListenOptions,
-        dispatch: Function<(MatchedRequest, BodyIo), Promise<JsResponse>>,
+        dispatch: Function<(), ()>,
     ) -> Result<()> {
         // Overwriting a running server used to drop the previous `Running` silently: that
         // destroys a tokio Runtime on Node's event-loop thread and cuts the first server's
@@ -368,9 +373,10 @@ impl RustServer {
             .collect();
         let routes = Routes::build(route_defs).map_err(napi::Error::from_reason)?;
 
-        // Build the TSFN synchronously while the JS function is alive; afterwards it is
-        // 'static + Send.
-        let tsfn: Handler = dispatch.build_threadsafe_function().build()?;
+        // Build the doorbell TSFN synchronously while the JS function is alive;
+        // afterwards it is 'static + Send. It carries no payload — the JS dispatcher
+        // drains the queue itself with takeBatch() (§19).
+        let doorbell: Doorbell = dispatch.build_threadsafe_function().build()?;
 
         // TLS acceptor (PEM parsing may fail → an early error before bind).
         let tls = match options.tls {
@@ -549,7 +555,7 @@ impl RustServer {
         let overload_shed_after = timeout_ms("overloadShedAfter", options.overload_shed_after, 0)?;
 
         let shared = Arc::new(Shared {
-            tsfn,
+            bridge: Bridge::new(doorbell),
             routes,
             has_not_found,
             custom_ip_headers: options.custom_ip_headers.unwrap_or_default(),
@@ -614,6 +620,7 @@ impl RustServer {
             serve(bound, shared, shutdown_rx, done_srv).await;
         });
 
+        *self.active.lock().unwrap() = Some(readiness_handle.clone());
         *self.state.lock().unwrap() = Some(Running {
             runtime,
             shutdown,
@@ -680,14 +687,46 @@ impl RustServer {
         }
     }
 
+    /// Everything queued for the JS dispatcher right now (§19). Called from the
+    /// doorbell callback in a loop until it returns an empty array.
+    #[napi]
+    pub fn take_batch(&self) -> Result<Vec<MatchedRequest>> {
+        Ok(match self.active.lock().unwrap().as_ref() {
+            Some(shared) => shared.bridge.take_batch(),
+            None => Vec::new(),
+        })
+    }
+
+    /// The `BodyIo` of one request (§19) — at most once per request; `null` afterwards
+    /// or for an unknown id. Lazy on purpose: a bodyless GET never pays for the class.
+    #[napi]
+    pub fn take_body(&self, req_id: u32) -> Result<Option<BodyIo>> {
+        Ok(self
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|shared| shared.bridge.take_body(req_id)))
+    }
+
+    /// Complete a request (§19): the response crosses the boundary through this
+    /// synchronous call — no `Promise` is awaited across threads. Idempotent.
+    #[napi]
+    pub fn respond(&self, req_id: u32, res: JsResponse) -> Result<()> {
+        if let Some(shared) = self.active.lock().unwrap().as_ref() {
+            shared.bridge.respond(req_id, res);
+        }
+        Ok(())
+    }
+
     /// Purge the native response cache (§18): all routes, or entries whose request path
     /// equals `path` exactly (any query/vary variant). Returns how many entries were
     /// removed. Before `listen()` this is a no-op — there is no cache yet.
     #[napi]
     pub fn purge_cache(&self, path: Option<String>) -> Result<u32> {
         let mut purged = 0usize;
-        if let Some(running) = self.state.lock().unwrap().as_ref() {
-            for leaf in running.shared.cache.iter().flatten() {
+        if let Some(shared) = self.active.lock().unwrap().as_ref() {
+            for leaf in shared.cache.iter().flatten() {
                 purged += leaf.purge(path.as_deref());
             }
         }
@@ -737,6 +776,10 @@ impl RustServer {
         // Wait for the drain. Our own deadline covers the case where the `done` signal
         // never arrives (a panic in the accept loop): close() must not hang forever.
         let _ = tokio::time::timeout(running.close_deadline, running.done.notified()).await;
+
+        // Only now do the bridge methods stop: respond() had to keep delivering
+        // in-flight responses for the whole drain (§19).
+        *self.active.lock().unwrap() = None;
 
         std::thread::spawn(move || {
             running
